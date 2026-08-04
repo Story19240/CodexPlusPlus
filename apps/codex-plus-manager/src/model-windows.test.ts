@@ -38,6 +38,7 @@ const _profileTypeCheck: RelayProfile = {
   userAgent: "",
   sub2apiEnabled: false,
   sub2apiMultiplier: "",
+  standardOpenaiProtocol: false,
 };
 
 void _profileTypeCheck;
