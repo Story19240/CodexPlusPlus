@@ -190,12 +190,12 @@ fn relay_profile_from_request(
         protocol: relay_protocol(&request.wire_api),
         relay_mode: relay_mode(&request.relay_mode),
         official_mix_api_key: false,
+        no_auth: false,
+        hide_official_usage_alert: false,
         test_model: String::new(),
         config_contents: request.config_contents.clone(),
         auth_contents: request.auth_contents.clone(),
         use_common_config: true,
-        context_selection: crate::settings::RelayContextSelection::default(),
-        context_selection_initialized: false,
         context_window: String::new(),
         auto_compact_limit: String::new(),
         model_insert_mode: Default::default(),
@@ -208,6 +208,7 @@ fn relay_profile_from_request(
         user_agent: String::new(),
         sub2api_enabled: false,
         sub2api_multiplier: String::new(),
+        model_routes: Vec::new(),
     }
 }
 

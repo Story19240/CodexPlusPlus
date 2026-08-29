@@ -11,8 +11,13 @@ const BAIKEWEI_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-ba
 const CUBENCE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-cubence.png");
 const DEEPKEY_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-deepkey.png");
 const ERGOU_API_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-ergou-api.png");
+const APIMART_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apimart.png");
+const FENNO_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-fenno-ai.png");
+const QINIU_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-qiniu-ai.png");
 const BUILTIN_SPONSOR_EXPIRES_AT: &str = "2026-08-02T23:59:59+08:00";
 const DEEPKEY_SPONSOR_EXPIRES_AT: &str = "2026-08-25T23:59:59+08:00";
+const APIMART_SPONSOR_EXPIRES_AT: &str = "2026-09-27T23:59:59+08:00";
+const NEW_SPONSOR_EXPIRES_AT: &str = "2026-11-27T23:59:59+08:00";
 
 pub const DEFAULT_AD_LIST_URLS: [&str; 2] = [
     "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
@@ -75,6 +80,9 @@ fn known_remote_logo(id: &str) -> Option<(&'static str, &'static [u8])> {
         "runapi-openrouter-alternative" => Some(("image/png", RUNAPI_IMAGE)),
         "baikewei-ai" => Some(("image/jpeg", BAIKEWEI_AI_IMAGE)),
         "deepkey-api-key" => Some(("image/png", DEEPKEY_IMAGE)),
+        "apimart" => Some(("image/png", APIMART_IMAGE)),
+        "fenno-ai" => Some(("image/png", FENNO_AI_IMAGE)),
+        "qiniu-ai" => Some(("image/png", QINIU_AI_IMAGE)),
         _ => None,
     }
 }
@@ -89,46 +97,76 @@ fn append_builtin_sponsors(ads: &mut Vec<Value>) {
         builtin_sponsor(
             "cubence",
             "Cubence",
-            "感谢 Cubence 对本项目的支持。Cubence 是一家致力为客户提供稳定、高效的 API 中转服务商。从 25 年 9 月运营至今，提供了 Claude Code、Codex、Gemini 等多种模型支持。Cubence 为本开源项目多用户提供了特别的专属优惠 CODEXPLUSPLUS，在首次购买时享受 8.8 折优惠！",
+            "稳定、高效的 API 中转服务，支持 Claude Code、Codex、Gemini 等模型，适合日常开发和团队使用。",
             "https://cubence.com?source=codexplusplus",
             CUBENCE_IMAGE,
             "image/png",
-            &["Claude Code", "Codex / Gemini", "CODEXPLUSPLUS 8.8 折"],
+            &["Claude Code", "Codex / Gemini", "稳定接入"],
             BUILTIN_SPONSOR_EXPIRES_AT,
         ),
         builtin_sponsor(
             "quya-cloud-bridge",
             "quya.org 云桥",
-            "quya.org 云桥（原 0029.org）是一个集成 Claude Code、Codex 以及 Gemini 最新模型的一站式中转平台，为你提供稳定、高效且高性价比的 AI 中转服务。本站提供灵活的包月套餐/按量计费计划，国内直连，无需魔法，极速响应。支持个人和企业接入，价格最低为官方 0.12 折。",
+            "一站式 AI 中转平台，集成 Claude Code、Codex、Gemini 等模型，提供包月和按量计费方案。",
             "https://www.quya.org/?promo=CODEX",
             TOKEN_BRIDGE_IMAGE,
             "image/svg+xml",
             &[
                 "Claude Code / Codex / Gemini",
                 "国内直连",
-                "最低官方 0.12 折",
+                "包月 / 按量计费",
             ],
             BUILTIN_SPONSOR_EXPIRES_AT,
         ),
         builtin_sponsor(
             "deepkey-api-key",
             "deepkey｜API KEY",
-            "感谢 deepkey 赞助本项目！deepkey 起初只是连接顶级算力的上游供应商，凭借稳定低价的接口被学生群体发现并口口相传。随着开发者与学子的涌入，这里不再只是 API 的搬运工，而是共同探讨提示词工程、分享创新应用的温暖社区。从工具到伙伴，deepkey 见证了无数灵感的诞生与落地。通过链接注册进入群聊，可享受福利并与小伙伴们一起探讨。",
+            "面向开发者与学生群体的 API KEY 服务，提供稳定接口和提示词工程交流社区。",
             "https://deepkey.top/register?aff=DNVc",
             DEEPKEY_IMAGE,
             "image/png",
-            &["稳定低价", "提示词工程社区", "注册进群享福利"],
+            &["稳定接口", "开发者社区", "提示词交流"],
             DEEPKEY_SPONSOR_EXPIRES_AT,
         ),
         builtin_sponsor(
             "ergou-api",
             "二狗 API",
-            "二狗，稳如老狗的 AI API 中转站。全站 0.1x~0.2x 超低倍率，提供 Claude/GPT/Gemini 等多个国内外 100% 纯血大模型接口，顶级 IPLC 线路 + 住宅双 ISP 冗余，确保全国范围稳定低延迟访问。欢迎各位开发者、工作室注册使用。",
+            "AI API 中转服务，覆盖 Claude、GPT、Gemini 等模型，提供低延迟线路和备用链路。",
             "https://ergouapi.com/r/gh-codexplusplus",
             ERGOU_API_IMAGE,
             "image/png",
-            &["0.1x~0.2x", "Claude / GPT / Gemini", "IPLC + 双 ISP"],
+            &["Claude / GPT / Gemini", "低延迟线路", "备用链路"],
             BUILTIN_SPONSOR_EXPIRES_AT,
+        ),
+        builtin_sponsor(
+            "apimart",
+            "API Mart",
+            "专注 AI 图片和视频生成的低价 API 平台，一套异步 API 覆盖图片与视频任务，支持大批量生成和按量付费。",
+            "https://go.apimart.ai/gh-codexplusplus",
+            APIMART_IMAGE,
+            "image/png",
+            &["图片 / 视频", "异步任务 API", "按量付费"],
+            APIMART_SPONSOR_EXPIRES_AT,
+        ),
+        builtin_sponsor(
+            "fenno-ai",
+            "FennoAI",
+            "稳定高效的 Codex API 中转服务，兼容 OpenAI 与 Anthropic 协议，支持企业级调用、公对公结算和开票。",
+            "https://api.fenno.ai/s/ZZM7",
+            FENNO_AI_IMAGE,
+            "image/png",
+            &["Codex 中转", "企业级调用", "公对公结算"],
+            NEW_SPONSOR_EXPIRES_AT,
+        ),
+        builtin_sponsor(
+            "qiniu-ai",
+            "七牛云",
+            "七牛云旗下企业级大模型 MaaS 平台，一站式调用全球 150 多个主流模型，覆盖文本、图像、音频、视频等全模态能力。",
+            "https://s.qiniu.com/7zUJri",
+            QINIU_AI_IMAGE,
+            "image/png",
+            &["150+ 主流模型", "全模态能力", "企业免费额度"],
+            NEW_SPONSOR_EXPIRES_AT,
         ),
     ];
     let mut cursor = insert_at;
