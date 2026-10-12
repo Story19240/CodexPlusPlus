@@ -60,6 +60,7 @@ pub mod user_scripts;
 pub mod version;
 pub mod vision;
 pub mod watcher;
+pub mod web_search;
 pub mod whale;
 pub mod whale_full;
 // 不加 `#[cfg(windows)]`：模块内部各项已各自标注平台门控，在非 Windows 平台上

@@ -497,10 +497,60 @@ impl DictationSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchProvider {
+    #[default]
+    Exa,
+    Tavily,
+}
+
+/// 服务端 Web 搜索配置。默认关闭，不影响既有 Chat/Responses 行为。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WebSearchSettings {
+    pub enabled: bool,
+    pub provider: WebSearchProvider,
+    pub exa_api_key: String,
+    pub exa_api_key_env: String,
+    pub tavily_api_key: String,
+    pub tavily_api_key_env: String,
+    pub result_limit: u8,
+    pub timeout_seconds: u64,
+}
+
+impl Default for WebSearchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: String::new(),
+            exa_api_key_env: "EXA_API_KEY".to_string(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: "TAVILY_API_KEY".to_string(),
+            result_limit: 5,
+            timeout_seconds: 20,
+        }
+    }
+}
+
+impl WebSearchSettings {
+    pub fn normalize(&mut self) {
+        self.exa_api_key = self.exa_api_key.trim().to_string();
+        self.exa_api_key_env = self.exa_api_key_env.trim().to_string();
+        self.tavily_api_key = self.tavily_api_key.trim().to_string();
+        self.tavily_api_key_env = self.tavily_api_key_env.trim().to_string();
+        self.result_limit = self.result_limit.clamp(1, 20);
+        self.timeout_seconds = self.timeout_seconds.clamp(1, 60);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
     #[serde(default)]
     pub dictation: DictationSettings,
+    #[serde(rename = "webSearch", default)]
+    pub web_search: WebSearchSettings,
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
     #[serde(rename = "codexExtraArgs", default)]
@@ -715,6 +765,7 @@ impl Default for BackendSettings {
     fn default() -> Self {
         Self {
             dictation: DictationSettings::default(),
+            web_search: WebSearchSettings::default(),
             codex_app_path: String::new(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
@@ -961,7 +1012,9 @@ impl BackendSettings {
             || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
-            || self.active_relay_profile().web_search_history_compat_enabled()
+            || self
+                .active_relay_profile()
+                .web_search_history_compat_enabled()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -1622,6 +1675,43 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         }
         target.insert("dictation".to_string(), Value::Object(dictation));
     }
+    if let Some(patch) = source.get("webSearch").and_then(Value::as_object) {
+        let mut web_search = target
+            .get("webSearch")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        merge_bool_setting(&mut web_search, patch, "enabled");
+        if let Some(value @ ("exa" | "tavily")) = patch.get("provider").and_then(Value::as_str) {
+            web_search.insert("provider".to_string(), Value::String(value.to_string()));
+        }
+        for key in [
+            "exaApiKey",
+            "exaApiKeyEnv",
+            "tavilyApiKey",
+            "tavilyApiKeyEnv",
+        ] {
+            if let Some(value) = patch.get(key).and_then(Value::as_str) {
+                web_search.insert(key.to_string(), Value::String(value.trim().to_string()));
+            }
+        }
+        if let Some(value) = patch.get("resultLimit").and_then(Value::as_u64) {
+            web_search.insert("resultLimit".to_string(), Value::from(value.clamp(1, 20)));
+        }
+        if let Some(value) = patch.get("timeoutSeconds").and_then(Value::as_u64) {
+            web_search.insert(
+                "timeoutSeconds".to_string(),
+                Value::from(value.clamp(1, 60)),
+            );
+        }
+        let mut normalized: WebSearchSettings =
+            serde_json::from_value(Value::Object(web_search)).unwrap_or_default();
+        normalized.normalize();
+        target.insert(
+            "webSearch".to_string(),
+            serde_json::to_value(normalized).unwrap_or_default(),
+        );
+    }
     target.remove("codexAppPluginAutoExpand");
     target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
@@ -1680,8 +1770,9 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppWhaleWidgetEnabled");
-    if let Some(value @ ("auto" | "custom" | "off")) =
-        source.get("codexAppWhaleBalanceProtocol").and_then(Value::as_str)
+    if let Some(value @ ("auto" | "custom" | "off")) = source
+        .get("codexAppWhaleBalanceProtocol")
+        .and_then(Value::as_str)
     {
         target.insert(
             "codexAppWhaleBalanceProtocol".to_string(),
@@ -2092,6 +2183,7 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
 
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
     settings.dictation.normalize();
+    settings.web_search.normalize();
     settings.codex_app_whale_balance_protocol =
         match settings.codex_app_whale_balance_protocol.trim() {
             "custom" => "custom",
@@ -2099,8 +2191,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
             _ => "auto",
         }
         .to_string();
-    settings.codex_app_whale_balance_path = settings.codex_app_whale_balance_path.trim().to_string();
-    settings.codex_app_whale_balance_field = settings.codex_app_whale_balance_field.trim().to_string();
+    settings.codex_app_whale_balance_path =
+        settings.codex_app_whale_balance_path.trim().to_string();
+    settings.codex_app_whale_balance_field =
+        settings.codex_app_whale_balance_field.trim().to_string();
     settings.codex_app_whale_balance_currency = settings
         .codex_app_whale_balance_currency
         .trim()
@@ -2421,6 +2515,10 @@ mod tests {
         assert_eq!(settings.codex_app_stepwise_max_input_chars, 6000);
         assert_eq!(settings.codex_app_stepwise_max_output_tokens, 500);
         assert_eq!(settings.codex_app_stepwise_timeout_ms, 8000);
+        assert!(!settings.web_search.enabled);
+        assert_eq!(settings.web_search.provider, WebSearchProvider::Exa);
+        assert_eq!(settings.web_search.result_limit, 5);
+        assert_eq!(settings.web_search.timeout_seconds, 20);
         assert!(!settings.weixin_connect_enabled);
         assert_eq!(
             settings.weixin_connect_base_url,
@@ -2428,6 +2526,66 @@ mod tests {
         );
         assert!(settings.weixin_connect_token.is_empty());
         assert_eq!(settings.weixin_connect_sandbox, "read-only");
+    }
+
+    #[test]
+    fn web_search_settings_default_off_and_round_trip_per_provider() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Tavily,
+            exa_api_key: " exa-key ".to_string(),
+            exa_api_key_env: "EXA_TEST_KEY".to_string(),
+            tavily_api_key: "tavily-key".to_string(),
+            tavily_api_key_env: "TAVILY_TEST_KEY".to_string(),
+            result_limit: 99,
+            timeout_seconds: 0,
+        };
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert!(loaded.web_search.enabled);
+        assert_eq!(loaded.web_search.provider, WebSearchProvider::Tavily);
+        assert_eq!(loaded.web_search.exa_api_key, "exa-key");
+        assert_eq!(loaded.web_search.exa_api_key_env, "EXA_TEST_KEY");
+        assert_eq!(loaded.web_search.tavily_api_key, "tavily-key");
+        assert_eq!(loaded.web_search.tavily_api_key_env, "TAVILY_TEST_KEY");
+        assert_eq!(loaded.web_search.result_limit, 20);
+        assert_eq!(loaded.web_search.timeout_seconds, 1);
+    }
+
+    #[test]
+    fn web_search_update_patch_merges_without_resetting_other_settings() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let initial = BackendSettings::default();
+        store.save(&initial).unwrap();
+
+        let updated = store
+            .update(json!({
+                "webSearch": {
+                    "enabled": true,
+                    "provider": "tavily",
+                    "tavilyApiKey": "tavily-key",
+                    "resultLimit": 99,
+                    "timeoutSeconds": 61
+                }
+            }))
+            .unwrap();
+        let raw = store.load_raw_object().unwrap();
+        assert_eq!(raw["webSearch"]["enabled"], json!(true));
+
+        assert!(updated.web_search.enabled);
+        assert_eq!(updated.web_search.provider, WebSearchProvider::Tavily);
+        assert_eq!(updated.web_search.tavily_api_key, "tavily-key");
+        assert_eq!(updated.web_search.tavily_api_key_env, "TAVILY_API_KEY");
+        assert_eq!(updated.web_search.result_limit, 20);
+        assert_eq!(updated.web_search.timeout_seconds, 60);
+        assert_eq!(updated.codex_app_path, initial.codex_app_path);
+        assert_eq!(updated.relay_profiles, initial.relay_profiles);
     }
 
     #[test]
@@ -4080,8 +4238,14 @@ experimental_bearer_token = "sk-existing""#
         let mut settings = BackendSettings {
             active_relay_id: "off".to_string(),
             relay_profiles: vec![
-                RelayProfile { id: "off".to_string(), ..RelayProfile::default() },
-                RelayProfile { id: "on".to_string(), ..enabled },
+                RelayProfile {
+                    id: "off".to_string(),
+                    ..RelayProfile::default()
+                },
+                RelayProfile {
+                    id: "on".to_string(),
+                    ..enabled
+                },
             ],
             ..BackendSettings::default()
         };
@@ -4106,7 +4270,12 @@ experimental_bearer_token = "sk-existing""#
             (RelayMode::Official, RelayProtocol::Responses, false, false),
             (RelayMode::Official, RelayProtocol::Responses, true, true),
             (RelayMode::Aggregate, RelayProtocol::Responses, false, false),
-            (RelayMode::PureApi, RelayProtocol::ChatCompletions, false, false),
+            (
+                RelayMode::PureApi,
+                RelayProtocol::ChatCompletions,
+                false,
+                false,
+            ),
             (RelayMode::PureApi, RelayProtocol::Responses, false, true),
         ] {
             let profile = RelayProfile {

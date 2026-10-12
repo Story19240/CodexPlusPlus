@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::{Map, Value, json};
@@ -52,7 +52,11 @@ impl ExtraContentCache {
         if call_id.is_empty() {
             return;
         }
-        if self.entries.insert(call_id.to_string(), extra_content).is_none() {
+        if self
+            .entries
+            .insert(call_id.to_string(), extra_content)
+            .is_none()
+        {
             self.order.push_back(call_id.to_string());
         }
         while self.order.len() > self.capacity {
@@ -322,7 +326,10 @@ pub(crate) struct UnsupportedEncryptedAgentContent;
 
 impl std::fmt::Display for UnsupportedEncryptedAgentContent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "unsupported_encrypted_agent_content: Chat Completions 上游无法处理加密的 agent 消息内容，请使用支持该协议的 Responses 上游")
+        write!(
+            formatter,
+            "unsupported_encrypted_agent_content: Chat Completions 上游无法处理加密的 agent 消息内容，请使用支持该协议的 Responses 上游"
+        )
     }
 }
 
@@ -344,7 +351,10 @@ pub(crate) struct UnsupportedNativeWebSearch;
 
 impl std::fmt::Display for UnsupportedNativeWebSearch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "unsupported_native_web_search: Chat 路由不执行服务端原生搜索，请使用客户端搜索工具或支持原生搜索的 Responses 上游")
+        write!(
+            formatter,
+            "unsupported_native_web_search: Chat 路由不执行服务端原生搜索，请使用客户端搜索工具或支持原生搜索的 Responses 上游"
+        )
     }
 }
 
@@ -361,21 +371,45 @@ impl UnsupportedNativeWebSearch {
 
 fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     let choice = body.get("tool_choice");
-    if choice.and_then(|choice| choice.get("type")).and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "web_search" | "web_search_preview")) {
+    if choice
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "web_search" | "web_search_preview"))
+    {
         return Err(UnsupportedNativeWebSearch.into());
     }
     let required = choice.and_then(Value::as_str) == Some("required");
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         let before = tools.len();
         // 同名 function/custom 和命名空间工具由客户端执行，必须保留。
-        tools.retain(|tool| !matches!(tool.get("type").and_then(Value::as_str),
-            Some("web_search" | "web_search_preview")));
+        tools.retain(|tool| {
+            !matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("web_search" | "web_search_preview")
+            )
+        });
         if before != tools.len() && required && tools.is_empty() {
             return Err(UnsupportedNativeWebSearch.into());
         }
     }
     Ok(())
+}
+
+fn request_has_native_web_search(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                )
+            })
+        })
+        || matches!(
+            body.pointer("/tool_choice/type").and_then(Value::as_str),
+            Some("web_search" | "web_search_preview")
+        )
 }
 
 fn input_has_encrypted_agent_content(input: &Value) -> bool {
@@ -385,7 +419,9 @@ fn input_has_encrypted_agent_content(input: &Value) -> bool {
                 Value::Array(parts) => parts.iter().any(|part| {
                     part.get("type").and_then(Value::as_str) == Some("encrypted_content")
                 }),
-                Value::Object(_) => content.get("type").and_then(Value::as_str) == Some("encrypted_content"),
+                Value::Object(_) => {
+                    content.get("type").and_then(Value::as_str) == Some("encrypted_content")
+                }
                 _ => false,
             })
     }
@@ -401,17 +437,30 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
 }
 
 pub fn responses_to_chat_completions_with_options(
-    mut body: Value,
+    body: Value,
     standard: bool,
 ) -> anyhow::Result<Value> {
-    remove_unsupported_native_search(&mut body)?;
+    responses_to_chat_completions_with_web_search(body, standard, false)
+}
+
+pub(crate) fn responses_to_chat_completions_with_web_search(
+    mut body: Value,
+    standard: bool,
+    execute_web_search: bool,
+) -> anyhow::Result<Value> {
+    if !execute_web_search {
+        remove_unsupported_native_search(&mut body)?;
+    }
     expand_local_compaction_history(&mut body);
     if input_has_native_compaction(&body) {
         return Err(NativeCompactionUnsupported::history().into());
     }
     // agent 加密内容没有 Chat 文本映射。发送前明确拒绝；不按字段名猜测明文，
     // 也不遍历工具参数/输出里的用户 JSON。reasoning 和 compaction 保持原契约。
-    if body.get("input").is_some_and(input_has_encrypted_agent_content) {
+    if body
+        .get("input")
+        .is_some_and(input_has_encrypted_agent_content)
+    {
         return Err(UnsupportedEncryptedAgentContent.into());
     }
     let mut result = json!({});
@@ -487,7 +536,7 @@ pub fn responses_to_chat_completions_with_options(
     let mut has_chat_tools = false;
     let mut converted = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        converted = responses_tools_to_chat_tools(tools, &tool_context);
+        converted = responses_tools_to_chat_tools(tools, &tool_context, execute_web_search);
     }
     for namespace_tool in &harvested_namespaces {
         converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
@@ -499,10 +548,9 @@ pub fn responses_to_chat_completions_with_options(
     }
 
     if has_chat_tools {
-        if let Some(tool_choice) = body
-            .get("tool_choice")
-            .and_then(|value| responses_tool_choice_to_chat(value, &tool_context))
-        {
+        if let Some(tool_choice) = body.get("tool_choice").and_then(|value| {
+            responses_tool_choice_to_chat(value, &tool_context, execute_web_search)
+        }) {
             result["tool_choice"] = tool_choice;
         }
         if let Some(value) = body.get("parallel_tool_calls") {
@@ -749,9 +797,14 @@ impl NativeResponsesSseObserver {
 
     fn observe_event(&mut self) {
         let prefix = String::from_utf8_lossy(&self.event_prefix);
-        let event_name = prefix.lines().find_map(|line| strip_sse_field(line, "event"));
-        let data = prefix.lines().filter_map(|line| strip_sse_field(line, "data"))
-            .collect::<Vec<_>>().join("\n");
+        let event_name = prefix
+            .lines()
+            .find_map(|line| strip_sse_field(line, "event"));
+        let data = prefix
+            .lines()
+            .filter_map(|line| strip_sse_field(line, "data"))
+            .collect::<Vec<_>>()
+            .join("\n");
         // 只观察已完整解析的顶层 type；后续大 payload 超过前缀上限时，
         // 忽略其解析错误，保留此前读到的类型。它不是原生响应的有效性校验器。
         struct EventType<'a>(&'a mut Option<String>);
@@ -760,7 +813,10 @@ impl NativeResponsesSseObserver {
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("an SSE event object")
             }
-            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
                 while let Some(key) = map.next_key::<String>()? {
                     if key == "type" {
                         *self.0 = Some(map.next_value::<String>()?);
@@ -776,8 +832,12 @@ impl NativeResponsesSseObserver {
         let _ = serde::Deserializer::deserialize_map(&mut deserializer, EventType(&mut event_type));
         match event_type.as_deref().or(event_name.map(str::trim)) {
             Some("response.completed") => self.completed = true,
-            Some("response.failed") => self.failure = Some("原生 Responses 上游返回 response.failed"),
-            Some("response.incomplete") => self.failure = Some("原生 Responses 上游返回 response.incomplete"),
+            Some("response.failed") => {
+                self.failure = Some("原生 Responses 上游返回 response.failed")
+            }
+            Some("response.incomplete") => {
+                self.failure = Some("原生 Responses 上游返回 response.incomplete")
+            }
             Some("error") => self.failure = Some("原生 Responses 上游返回 error 事件"),
             None if self.event_too_large => self.unclassified_large_event = true,
             _ => {}
@@ -786,21 +846,23 @@ impl NativeResponsesSseObserver {
 
     pub(crate) fn finish(self) -> Option<String> {
         // failed/incomplete 优先于 completed；[DONE] 或 HTTP EOF 都不能证明成功。
-        self.failure.or_else(|| {
-            if self.completed {
-                None
-            } else if self.unclassified_large_event {
-                Some("原生 Responses 流终止状态未知（诊断事件超限），未观察到完成事件")
-            } else {
-                Some("原生 Responses 上游在完成事件前结束了响应流")
-            }
-        }).map(str::to_string)
+        self.failure
+            .or_else(|| {
+                if self.completed {
+                    None
+                } else if self.unclassified_large_event {
+                    Some("原生 Responses 流终止状态未知（诊断事件超限），未观察到完成事件")
+                } else {
+                    Some("原生 Responses 上游在完成事件前结束了响应流")
+                }
+            })
+            .map(str::to_string)
     }
 }
 
 #[cfg(test)]
 mod native_responses_observer_tests {
-    use super::{NativeResponsesSseObserver, NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT};
+    use super::{NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT, NativeResponsesSseObserver};
 
     #[test]
     fn fragmented_crlf_and_data_only_terminal_events_are_observed() {
@@ -818,7 +880,10 @@ mod native_responses_observer_tests {
 
     #[test]
     fn large_payloads_keep_diagnostic_memory_bounded_and_allow_terminal_observation() {
-        for prefix in ["event: response.completed\ndata: {\"output\":\"", "data: {\"type\":\"response.completed\",\"output\":\""] {
+        for prefix in [
+            "event: response.completed\ndata: {\"output\":\"",
+            "data: {\"type\":\"response.completed\",\"output\":\"",
+        ] {
             let mut observer = NativeResponsesSseObserver::default();
             observer.push_bytes(prefix.as_bytes());
             observer.push_bytes(&vec![b'x'; NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT * 2]);
@@ -832,7 +897,10 @@ mod native_responses_observer_tests {
     fn failed_event_after_completed_still_reports_fixed_failure_without_payload() {
         let mut observer = NativeResponsesSseObserver::default();
         observer.push_bytes(b"data: {\"type\":\"response.completed\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"private-payload\"}\n\n");
-        assert_eq!(observer.finish().as_deref(), Some("原生 Responses 上游返回 response.failed"));
+        assert_eq!(
+            observer.finish().as_deref(),
+            Some("原生 Responses 上游返回 response.failed")
+        );
     }
 
     #[test]
@@ -1923,6 +1991,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             let channel_key = crate::channel_protection::key_for_relay(&relay);
             let mut channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
             let model_override = aggregate_upstream_model_override(&settings, &relay);
+            let web_search_execution = settings.web_search.enabled
+                && relay.protocol == RelayProtocol::ChatCompletions
+                && request_has_native_web_search(&request_json)
+                && !request_has_compaction_trigger(&request_json)
+                && !is_responses_compact_proxy_path(request_path);
             let preserve_native_request = relay.protocol == RelayProtocol::Responses
                 && (request_has_compaction_trigger(&request_json)
                     || is_responses_compact_proxy_path(request_path));
@@ -1936,6 +2009,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     request_path,
                     model_override.as_deref(),
                     preserve_native_request,
+                    web_search_execution,
                 )
                 .await
                 {
@@ -2164,6 +2238,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     request_path,
                     model_override.as_deref(),
                     false,
+                    web_search_execution,
                 )
                 .await;
                 let (fallback_endpoint, fallback_body, fallback_wire, _) = match fallback {
@@ -2280,6 +2355,32 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         .split(';')
                         .next()
                         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+                if web_search_execution && (200..300).contains(&status_code) {
+                    return execute_web_search_round(
+                        UpstreamProxyResponse {
+                            status_code,
+                            is_stream: (is_stream && !json_compaction)
+                                || content_type.contains("text/event-stream"),
+                            content_type,
+                            wire_api,
+                            compaction: is_compaction_request,
+                            native_compaction_passthrough: false,
+                            buffered_body: None,
+                            response: Some(upstream),
+                            _channel_permit: Some(channel_permit),
+                        },
+                        relay.clone(),
+                        endpoint,
+                        upstream_body.clone(),
+                        &request_json,
+                        &settings,
+                        original_user_agent,
+                        beta_features,
+                        session_headers,
+                        None,
+                    )
+                    .await;
+                }
                 return Ok(UpstreamProxyResponse {
                     status_code,
                     is_stream: (is_stream && !json_compaction)
@@ -2312,6 +2413,354 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             );
         }
         anyhow::bail!("未找到可用的聚合供应商成员")
+    }
+}
+
+async fn execute_web_search_round(
+    mut upstream: UpstreamProxyResponse,
+    relay: crate::settings::RelayProfile,
+    endpoint: String,
+    chat_request: Value,
+    original_request: &Value,
+    settings: &crate::settings::BackendSettings,
+    original_user_agent: Option<&str>,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+    search_endpoint: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let first_content_type = upstream.content_type.clone();
+    let first_is_stream = upstream.is_stream;
+    let first_body = match upstream.read_body().await {
+        Ok(body) => body,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    drop(upstream);
+
+    let first_response =
+        match crate::web_search::parse_chat_response(&first_body, &first_content_type) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(web_search_failure_response(
+                    original_request,
+                    error.to_string(),
+                ));
+            }
+        };
+    let search_calls = match first_response.web_search_calls() {
+        Ok(calls) => calls,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    if search_calls.is_empty() {
+        return converted_chat_response(
+            &first_body,
+            &first_content_type,
+            first_is_stream,
+            original_request,
+        );
+    }
+
+    let search_outputs = match crate::web_search::execute_web_search_calls_at(
+        &settings.web_search,
+        &search_calls,
+        search_endpoint,
+    )
+    .await
+    {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    let followup_request = match crate::web_search::build_web_search_followup_request(
+        &chat_request,
+        &first_response,
+        &search_outputs,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+
+    let channel_key = crate::channel_protection::key_for_relay(&relay);
+    let channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
+    let mut followup = match send_responses_upstream_request(
+        &relay,
+        &endpoint,
+        &followup_request,
+        UpstreamWireApi::ChatCompletions,
+        true,
+        original_user_agent,
+        beta_features,
+        session_headers,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            drop(channel_permit);
+            crate::relay_rotation::record_relay_request_failure(settings);
+            return Ok(web_search_failure_response(
+                original_request,
+                format!("Web 搜索后的模型请求失败: {error}"),
+            ));
+        }
+    };
+    let status_code = followup.status().as_u16();
+    let content_type = followup
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    crate::relay_rotation::record_relay_request_event(
+        settings,
+        if (200..300).contains(&status_code) {
+            RotationEvent::Success
+        } else {
+            RotationEvent::Failure
+        },
+    );
+    if !(200..300).contains(&status_code) {
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: false,
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(followup),
+            _channel_permit: Some(channel_permit),
+        });
+    }
+
+    let target_stream = request_wants_stream(original_request);
+    if target_stream && content_type.contains("text/event-stream") {
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: true,
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(followup),
+            _channel_permit: Some(channel_permit),
+        });
+    }
+
+    let followup_body =
+        match read_limited_upstream_body(&mut followup, MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES)
+            .await
+        {
+            Ok(body) => body.to_vec(),
+            Err(error) => {
+                drop(channel_permit);
+                return Ok(web_search_failure_response(
+                    original_request,
+                    format!("读取搜索后的模型响应失败: {error}"),
+                ));
+            }
+        };
+    drop(channel_permit);
+    let parsed = match crate::web_search::parse_chat_response(&followup_body, &content_type) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    let response_json = match chat_completion_to_response_with_request(
+        chat_json_from_parsed(&parsed),
+        original_request,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    if target_stream {
+        Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(responses_json_as_sse(&response_json)),
+            response: None,
+            _channel_permit: None,
+        })
+    } else {
+        Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&response_json)?),
+            response: None,
+            _channel_permit: None,
+        })
+    }
+}
+
+fn converted_chat_response(
+    body: &[u8],
+    content_type: &str,
+    is_stream: bool,
+    original_request: &Value,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let target_stream = request_wants_stream(original_request);
+    if is_stream && target_stream {
+        let text = String::from_utf8_lossy(body);
+        return Ok(UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(
+                chat_sse_to_responses_sse_with_request(&text, original_request).into_bytes(),
+            ),
+            response: None,
+            _channel_permit: None,
+        });
+    }
+
+    let parsed = crate::web_search::parse_chat_response(body, content_type)?;
+    let response_json =
+        chat_completion_to_response_with_request(chat_json_from_parsed(&parsed), original_request)?;
+    if target_stream {
+        Ok(UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(responses_json_as_sse(&response_json)),
+            response: None,
+            _channel_permit: None,
+        })
+    } else {
+        Ok(UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&response_json)?),
+            response: None,
+            _channel_permit: None,
+        })
+    }
+}
+
+fn request_wants_stream(request: &Value) -> bool {
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn chat_json_from_parsed(parsed: &crate::web_search::ParsedChatResponse) -> Value {
+    json!({
+        "id": parsed.id,
+        "model": parsed.model,
+        "choices": [{
+            "finish_reason": parsed.finish_reason,
+            "message": parsed.message
+        }],
+        "usage": parsed.usage
+    })
+}
+
+fn responses_json_as_sse(response: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    push_sse(
+        &mut output,
+        "response.completed",
+        json!({ "type": "response.completed", "response": response }),
+    );
+    output.push_str("data: [DONE]\n\n");
+    output.into_bytes()
+}
+
+fn web_search_failure_response(original_request: &Value, message: String) -> UpstreamProxyResponse {
+    let mut response = json!({
+        "id": "resp_web_search_failed",
+        "object": "response",
+        "created_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0),
+        "status": "failed",
+        "model": original_request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "output": [],
+        "usage": default_responses_usage(),
+        "error": {
+            "type": "web_search_failed",
+            "message": message
+        }
+    });
+    copy_response_request_fields(&mut response, Some(original_request));
+    let target_stream = request_wants_stream(original_request);
+    let (content_type, body) = if target_stream {
+        let mut output = String::new();
+        push_sse(
+            &mut output,
+            "response.failed",
+            json!({ "type": "response.failed", "response": response }),
+        );
+        (
+            "text/event-stream; charset=utf-8".to_string(),
+            output.into_bytes(),
+        )
+    } else {
+        (
+            "application/json; charset=utf-8".to_string(),
+            serde_json::to_vec(&response).unwrap_or_default(),
+        )
+    };
+    UpstreamProxyResponse {
+        status_code: 200,
+        is_stream: target_stream,
+        content_type,
+        wire_api: UpstreamWireApi::Responses,
+        compaction: false,
+        native_compaction_passthrough: false,
+        buffered_body: Some(body),
+        response: None,
+        _channel_permit: None,
     }
 }
 
@@ -2703,6 +3152,7 @@ async fn upstream_request_parts(
     request_path: &str,
     model_override: Option<&str>,
     preserve_compaction_trigger: bool,
+    web_search_execution: bool,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
     let compact = is_responses_compact_proxy_path(request_path)
         || request_has_compaction_trigger(&request_json);
@@ -2728,9 +3178,10 @@ async fn upstream_request_parts(
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
+        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_web_search(
             request_json,
             relay.standard_openai_protocol,
+            web_search_execution,
         )?,
     };
     if relay.protocol == RelayProtocol::Responses {
@@ -5255,7 +5706,11 @@ fn add_namespace_tools_to_context(context: &mut CodexToolContext, namespace_tool
     }
 }
 
-fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) -> Vec<Value> {
+fn responses_tools_to_chat_tools(
+    tools: &[Value],
+    context: &CodexToolContext,
+    execute_web_search: bool,
+) -> Vec<Value> {
     let mut converted = Vec::new();
     for tool in tools {
         if let Some(name) = tool.as_str().filter(|name| !name.is_empty()) {
@@ -5267,6 +5722,9 @@ fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) ->
                 if let Some(tool) = responses_function_tool_to_chat_tool(tool) {
                     converted.push(tool);
                 }
+            }
+            "web_search" | "web_search_preview" if execute_web_search => {
+                converted.push(web_search_chat_tool());
             }
             "custom" | "web_search" | "local_shell" | "computer_use" => {
                 let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
@@ -5334,6 +5792,24 @@ fn detect_codex_custom_tool_kind(tool: &Value, name: &str) -> CodexCustomToolKin
     } else {
         CodexCustomToolKind::Raw
     }
+}
+
+fn web_search_chat_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn responses_function_tool_to_chat_tool(tool: &Value) -> Option<Value> {
@@ -5476,10 +5952,12 @@ fn flatten_top_level_combinators(schema: Value) -> Value {
     let Some(object) = schema.as_object() else {
         return schema;
     };
-    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS
-        .iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_array).map(|a| (*key, a)))
-    else {
+    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_array)
+            .map(|a| (*key, a))
+    }) else {
         return schema;
     };
     if branches.is_empty() {
@@ -5545,10 +6023,7 @@ fn flatten_top_level_combinators(schema: Value) -> Value {
     if !flattenable || properties.is_empty() {
         // 降级：把分支原样塞进一个带说明的字段，schema 依然合法。
         let mut fallback = object.clone();
-        fallback.insert(
-            "type".to_string(),
-            json!("object"),
-        );
+        fallback.insert("type".to_string(), json!("object"));
         fallback.insert("properties".to_string(), json!({}));
         let mut description: Vec<String> = Vec::new();
         for branch in branches {
@@ -5580,10 +6055,7 @@ fn flatten_top_level_combinators(schema: Value) -> Value {
     flattened.insert("properties".to_string(), Value::Object(properties));
     flattened.insert(
         "required".to_string(),
-        json!(required
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>()),
+        json!(required.unwrap_or_default().into_iter().collect::<Vec<_>>()),
     );
     Value::Object(flattened)
 }
@@ -5607,7 +6079,12 @@ fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value:
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    for (child_name, child_value) in right.get("properties").and_then(Value::as_object).into_iter().flatten() {
+    for (child_name, child_value) in right
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
         merge_schema_property(&mut merged_properties, child_name, child_value);
     }
     merged.insert("properties".to_string(), Value::Object(merged_properties));
@@ -5615,19 +6092,33 @@ fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value:
     let left_required: BTreeSet<String> = left
         .get("required")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let right_required: BTreeSet<String> = right
         .get("required")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     merged.insert(
         "required".to_string(),
-        json!(left_required
-            .intersection(&right_required)
-            .cloned()
-            .collect::<Vec<_>>()),
+        json!(
+            left_required
+                .intersection(&right_required)
+                .cloned()
+                .collect::<Vec<_>>()
+        ),
     );
     *existing = Value::Object(merged);
 }
@@ -6029,8 +6520,21 @@ fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     }
 }
 
-fn responses_tool_choice_to_chat(tool_choice: &Value, context: &CodexToolContext) -> Option<Value> {
+fn responses_tool_choice_to_chat(
+    tool_choice: &Value,
+    context: &CodexToolContext,
+    execute_web_search: bool,
+) -> Option<Value> {
     match tool_choice {
+        Value::Object(object)
+            if execute_web_search
+                && matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                ) =>
+        {
+            Some(json!({ "type": "function", "function": { "name": "web_search" } }))
+        }
         Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str) {
                 let name = object.get("name").and_then(Value::as_str).unwrap_or("");
@@ -6490,11 +6994,9 @@ fn web_search_action_has_target(action: &Value) -> bool {
             .get("queries")
             .and_then(Value::as_array)
             .is_some_and(|queries| {
-                queries.iter().any(|query| {
-                    query
-                        .as_str()
-                        .is_some_and(|value| !value.trim().is_empty())
-                })
+                queries
+                    .iter()
+                    .any(|query| query.as_str().is_some_and(|value| !value.trim().is_empty()))
             })
         || action
             .get("url")
@@ -7617,13 +8119,18 @@ mod response_compatibility_tests {
             json!({"type":"tool_search", "execution":"client"}),
             json!({"type":"namespace", "name":"search", "tools":[]}),
         ] {
-            let mut body = json!({"tools":[native.clone(),client.clone()],"tool_choice":"required"});
+            let mut body =
+                json!({"tools":[native.clone(),client.clone()],"tool_choice":"required"});
             remove_unsupported_native_search(&mut body).unwrap();
             assert_eq!(body["tools"], json!([client]));
         }
         for choice in [json!("required"), json!({"type":"web_search"})] {
             let mut body = json!({"tools":[native.clone()],"tool_choice":choice});
-            assert!(remove_unsupported_native_search(&mut body).unwrap_err().is::<UnsupportedNativeWebSearch>());
+            assert!(
+                remove_unsupported_native_search(&mut body)
+                    .unwrap_err()
+                    .is::<UnsupportedNativeWebSearch>()
+            );
         }
         let mut automatic = json!({"tools":[native],"tool_choice":"auto"});
         remove_unsupported_native_search(&mut automatic).unwrap();
@@ -7633,26 +8140,223 @@ mod response_compatibility_tests {
     #[test]
     fn native_search_with_query_is_still_not_executed_by_chat_converter() {
         let request = json!({"tools":[{"type":"web_search"}]});
-        let response = chat_completion_to_response_with_request(json!({
-            "choices":[{"message":{"tool_calls":[{"id":"call_search", "function":{
-                "name":"web_search", "arguments":"{\"query\":\"Codex\"}"
-            }}]},"finish_reason":"tool_calls"}]
-        }), &request).unwrap();
+        let response = chat_completion_to_response_with_request(
+            json!({
+                "choices":[{"message":{"tool_calls":[{"id":"call_search", "function":{
+                    "name":"web_search", "arguments":"{\"query\":\"Codex\"}"
+                }}]},"finish_reason":"tool_calls"}]
+            }),
+            &request,
+        )
+        .unwrap();
         assert_eq!(response["status"], "failed");
         assert_eq!(response["output"][0]["status"], "failed");
     }
 
     #[test]
+    fn enabled_web_search_maps_native_tool_to_chat_function() {
+        let converted = responses_to_chat_completions_with_web_search(
+            json!({
+                "model": "fixture-model",
+                "input": "hi",
+                "stream": true,
+                "tools": [{ "type": "web_search" }],
+                "tool_choice": { "type": "web_search" }
+            }),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(converted["tools"][0]["function"]["name"], "web_search");
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
+        assert_eq!(converted["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    #[tokio::test]
+    async fn web_search_round_executes_search_and_builds_streamed_followup() {
+        use crate::settings::{RelayProfile, WebSearchProvider, WebSearchSettings};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(header("x-api-key", "exa-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-upstream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&model_server)
+            .await;
+
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let endpoint = chat_completions_url(&relay.base_url);
+        let first_chat_response = json!({
+            "id": "chatcmpl-search",
+            "model": "fixture-model",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\":\"Codex\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&first_chat_response).unwrap()),
+            response: None,
+            _channel_permit: None,
+        };
+        let chat_request = json!({
+            "model": "fixture-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": { "name": "web_search", "parameters": { "type": "object" } }
+            }]
+        });
+        let original_request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [{ "type": "web_search" }]
+        });
+
+        let mut response = execute_web_search_round(
+            upstream,
+            relay,
+            endpoint,
+            chat_request,
+            &original_request,
+            &settings,
+            None,
+            None,
+            ProxySessionHeaders::default(),
+            Some(&format!("{}/search", search_server.uri())),
+        )
+        .await
+        .unwrap();
+        let body = response.read_body().await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!response.is_stream);
+        assert_eq!(response.wire_api, UpstreamWireApi::Responses);
+        assert_eq!(response_json["status"], "completed");
+        assert_eq!(
+            response_json["output"][0]["content"][0]["text"],
+            "final answer"
+        );
+
+        let model_request = model_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let model_body: Value = serde_json::from_slice(&model_request.body).unwrap();
+        assert_eq!(model_body["stream"], true);
+        let messages = model_body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "web_search"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_search");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Codex content")
+        );
+
+        let search_request = search_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let search_body: Value = serde_json::from_slice(&search_request.body).unwrap();
+        assert_eq!(search_body["query"], "Codex");
+    }
+
+    #[test]
     fn gemini_reasoning_conversion_respects_standard_protocol_opt_in() {
         for standard in [false, true] {
-            let body = responses_to_chat_completions_with_options(json!({
-                "model":"gemini-3.8-flash", "input":"hi", "reasoning":{"effort":"high"}
-            }), standard).unwrap();
+            let body = responses_to_chat_completions_with_options(
+                json!({
+                    "model":"gemini-3.8-flash", "input":"hi", "reasoning":{"effort":"high"}
+                }),
+                standard,
+            )
+            .unwrap();
             assert_eq!(body["reasoning_effort"], "high");
         }
-        let request = json!({"model":"google/gemini-other", "input":"hi", "reasoning":{"effort":"high"}});
-        assert!(responses_to_chat_completions(request.clone()).unwrap().get("reasoning_effort").is_none());
-        assert_eq!(responses_to_chat_completions_with_options(request, true).unwrap()["reasoning_effort"], "high");
+        let request =
+            json!({"model":"google/gemini-other", "input":"hi", "reasoning":{"effort":"high"}});
+        assert!(
+            responses_to_chat_completions(request.clone())
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert_eq!(
+            responses_to_chat_completions_with_options(request, true).unwrap()["reasoning_effort"],
+            "high"
+        );
     }
 
     #[test]
@@ -7685,11 +8389,12 @@ mod response_compatibility_tests {
         });
 
         let response = chat_completion_to_response_with_request(upstream, &request).unwrap();
-        assert_eq!(response.get("status").and_then(Value::as_str), Some("failed"));
         assert_eq!(
-            response
-                .pointer("/error/type")
-                .and_then(Value::as_str),
+            response.get("status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            response.pointer("/error/type").and_then(Value::as_str),
             Some("invalid_upstream_tool_call")
         );
     }
