@@ -133,8 +133,25 @@ async fn execute_web_search_at(
         }
     };
 
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.provider_request",
+        json!({
+            "provider": provider_label(settings.provider),
+            "queryLength": query.chars().count(),
+            "resultLimit": result_limit,
+            "timeoutSeconds": timeout.as_secs()
+        }),
+    );
     let mut response = request.send().await.context("Web 搜索请求失败")?;
     let status = response.status();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.provider_status",
+        json!({
+            "provider": provider_label(settings.provider),
+            "statusCode": status.as_u16(),
+            "queryLength": query.chars().count()
+        }),
+    );
     if !status.is_success() {
         let body = read_limited_body(&mut response).await.unwrap_or_default();
         bail!(
@@ -149,6 +166,13 @@ async fn execute_web_search_at(
         WebSearchProvider::Exa => parse_exa_results(&body)?,
         WebSearchProvider::Tavily => parse_tavily_results(&body)?,
     };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.result_count",
+        json!({
+            "provider": provider_label(settings.provider),
+            "resultCount": results.len()
+        }),
+    );
     Ok(results
         .into_iter()
         .take(result_limit)
@@ -373,6 +397,25 @@ pub fn build_web_search_followup_request(
     outputs: &[WebSearchToolOutput],
 ) -> anyhow::Result<Value> {
     let mut request = chat_request.clone();
+    // 二段不再暴露服务端搜索工具，避免模型连续发起未编排的搜索调用。
+    let should_remove_tools = if let Some(tools) =
+        request.get_mut("tools").and_then(Value::as_array_mut)
+    {
+        tools.retain(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                != Some("web_search")
+        });
+        tools.is_empty()
+    } else {
+        false
+    };
+    if should_remove_tools
+        && let Some(request_object) = request.as_object_mut()
+    {
+        request_object.remove("tools");
+        request_object.remove("tool_choice");
+    }
     let messages = request
         .get_mut("messages")
         .and_then(Value::as_array_mut)
@@ -671,6 +714,10 @@ mod tests {
                 "model": "fixture-model",
                 "messages": [{ "role": "user", "content": "hi" }],
                 "stream": false,
+                "tools": [
+                    { "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } },
+                    { "type": "function", "function": { "name": "other_tool", "parameters": { "type": "object" } } }
+                ],
                 "tool_choice": { "type": "web_search" },
             }),
             &parsed,
@@ -681,6 +728,9 @@ mod tests {
         assert_eq!(followup["stream"], true);
         assert_eq!(followup["stream_options"]["include_usage"], true);
         assert_eq!(followup["tool_choice"], "auto");
+        let tools = followup["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "other_tool");
         let messages = followup["messages"].as_array().unwrap();
         assert_eq!(
             messages[1]["tool_calls"][0]["function"]["name"],
