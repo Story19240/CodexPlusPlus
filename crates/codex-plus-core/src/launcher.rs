@@ -2001,6 +2001,21 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
+        // Web 搜索编排会先读完第一轮 Chat 流再判断是否出现工具调用。
+        // 没有工具调用时，protocol_proxy 已经把完整 Responses SSE 放进缓冲；
+        // 这里必须直接下发，不能再要求一个仍可流式读取的 reqwest response。
+        if upstream.buffered_body.is_some() {
+            forward_buffered_protocol_proxy_stream(stream, &mut upstream).await?;
+            log_helper_response(
+                "helper.protocol_proxy_stream_ok",
+                method,
+                path,
+                "200 OK",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
         let failure = forward_protocol_proxy_stream(
             stream,
             upstream.take_response()?,
@@ -2583,6 +2598,16 @@ async fn forward_protocol_proxy_stream(
     }
     stream.write_all(&converter.finish()).await?;
     Ok(None)
+}
+
+async fn forward_buffered_protocol_proxy_stream(
+    stream: &mut tokio::net::TcpStream,
+    upstream: &mut crate::protocol_proxy::UpstreamProxyResponse,
+) -> anyhow::Result<()> {
+    let body = upstream.read_body().await?;
+    write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+    stream.write_all(&body).await?;
+    Ok(())
 }
 
 fn log_helper_response(
@@ -5025,8 +5050,8 @@ mod tests {
 
 #[cfg(test)]
 mod proxy_stream_tests {
-    use super::forward_protocol_proxy_stream;
-    use crate::protocol_proxy::UpstreamWireApi;
+    use super::{forward_buffered_protocol_proxy_stream, forward_protocol_proxy_stream};
+    use crate::protocol_proxy::{UpstreamProxyResponse, UpstreamWireApi};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
@@ -5076,6 +5101,41 @@ mod proxy_stream_tests {
                 assert!(output.contains("event: response.failed"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_web_search_response_is_sent_without_live_response() {
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_vec()),
+            response: None,
+            _channel_permit: None,
+        };
+
+        let forwarded = tokio::spawn(async move {
+            forward_buffered_protocol_proxy_stream(&mut writer, &mut upstream)
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/event-stream; charset=utf-8"));
+        assert!(response.contains("event: response.completed"));
     }
 
     #[tokio::test]
