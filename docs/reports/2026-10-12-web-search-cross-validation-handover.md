@@ -270,7 +270,263 @@ web_search tool call
 4. 明确客户端可见协议：第一轮 reasoning 是否显示、搜索过程是否显示、二段输出如何衔接
 5. 协议行为定住后，再做真实 Exa / Tavily 链路
 
-## 9. 当前测试的有效边界
+## 9. 第一轮思考保留方案
+
+### 9.1 目标行为
+
+保留服务端 Web Search 的同时，第一轮思考必须实时下发给 Codex。目标时间线如下：
+
+```text
+Codex 请求 stream=true
+-> helper 立即返回 SSE 响应头
+-> 第一轮 Chat 上游开始流式返回
+-> reasoning delta 实时转换并下发给 Codex
+-> 如果第一轮没有 web_search：
+   按原 Chat -> Responses 流式转换继续，正常 response.completed
+-> 如果第一轮出现 web_search tool call：
+   1. 已经出现的 reasoning / text 继续保留在同一个 SSE 流中
+   2. 下发服务端执行的 web_search_call 状态
+   3. SSE 不结束
+   4. 执行 Exa / Tavily
+   5. 把搜索结果追加进二段模型请求
+   6. 二段响应继续流式下发
+   7. 最终只发送一个 response.completed
+```
+
+验收重点是：**第一轮 reasoning 必须在上游 EOF 前到达 Codex**。搜索结束后一次性补发 reasoning 只能算内容保留，不算流式体验合格。
+
+### 9.2 必须保留的第一轮输出
+
+进入搜索分支后，以下第一轮内容不能丢弃：
+
+```text
+reasoning_content
+已出现的普通文本 content
+web_search tool call 的可见状态
+```
+
+推荐处理规则：
+
+- reasoning delta：边收到边转换为 Responses reasoning 事件
+- text delta：边收到边转换为 Responses text 事件
+- tool call arguments：必须缓冲到完整，因为只有完整 JSON 才能确定 query
+- tool call 完整后：执行搜索，并给客户端一个明确的服务端执行状态
+- 二段 reasoning / text：继续追加输出，不得覆盖第一轮 item
+
+### 9.3 编排位置必须调整
+
+当前 `execute_web_search_round()` 位于 `protocol_proxy`，但它没有 Codex TCP stream 的写入权，因此只能先 `read_body()` 全量缓冲。这是架构问题。
+
+推荐把第一轮 Web Search 编排移动到 launcher 层，或让 `protocol_proxy` 返回一个可由 launcher 执行的流式编排计划。
+
+目标职责划分：
+
+```text
+protocol_proxy
+-> 选择 relay
+-> 生成第一轮 Chat 请求
+-> 返回 live upstream response + relay/request context
+
+launcher
+-> 立即写 SSE 响应头
+-> 增量解析第一轮 Chat SSE
+-> 实时下发 reasoning / text
+-> 检测 web_search tool call
+-> 执行搜索
+-> 发起二段请求
+-> 续接 output_index
+-> 合并最终 response.completed
+```
+
+不允许继续使用这个模式作为最终方案：
+
+```rust
+let first_body = upstream.read_body().await?;
+```
+
+它最多只能作为短期兼容分支，不能作为 Web Search 的验收实现。
+
+### 9.4 SSE 续接契约
+
+第一轮和二段必须在同一个 Responses SSE 流中续接，不能简单拼接两个完整响应。
+
+必须满足：
+
+```text
+只有一个 response.created
+只有一个 response.completed
+output_index 单调递增且不重复
+item id 不冲突
+最终 response.completed.response.output 包含完整输出
+```
+
+最终 `output` 至少应包含：
+
+```text
+第一轮 reasoning
+第一轮已出现文本（如存在）
+web_search_call
+二段 reasoning（如存在）
+二段最终 message
+```
+
+示例结构：
+
+```text
+output_index 0: 第一轮 reasoning
+output_index 1: 第一轮文本（如存在）
+output_index 2: web_search_call
+output_index 3: 二段 reasoning（如存在）
+output_index 4: 二段 message
+```
+
+二段转换器不能从 `output_index=0` 重新开始。它必须继承第一轮转换器的：
+
+```text
+next_output_index
+已完成的 output items
+response id
+model
+usage 汇总规则
+```
+
+### 9.5 搜索等待期间的 keepalive
+
+从检测到 tool call 到二段响应开始输出之间，下游不能长时间无字节。
+
+至少覆盖三个等待阶段：
+
+```text
+Exa / Tavily 请求
+二段模型响应头
+二段首个增量事件
+```
+
+keepalive 必须使用 Codex 客户端已确认可接受的事件；实现前先用协议测试确认，不允许发明未知事件类型。
+
+如果搜索或二段失败，且第一轮内容已经下发，不能把已完成的 reasoning / text item 改成失败。应保持已完成 item，然后追加一个显式失败事件或失败 item。
+
+### 9.6 需要新增的流式状态
+
+第一轮转换器需要新增状态，而不是只有最终 JSON：
+
+```text
+reasoning item 是否已开始
+reasoning item 是否已结束
+text item 是否已开始
+text item 是否已结束
+web_search tool call 是否完整
+web_search call_id
+web_search arguments
+下一个 output_index
+已生成的 output items
+是否已经发送 response.created
+是否已经发送 response.completed
+```
+
+这些状态要能传递给二段转换器，用于续接同一个 SSE 流。
+
+### 9.7 方案级别
+
+可以分两步落地，但验收必须以第二步为准。
+
+#### 第一步：内容保留（不满足最终验收）
+
+在当前全量缓冲实现中，把第一轮 reasoning / text / web_search_call 合并进最终 `response.completed.output`。
+
+效果：
+
+```text
+用户最终能看到第一轮思考
+```
+
+仍然不合格：
+
+```text
+不是流式
+长时间无输出
+大上下文下仍可能重连
+```
+
+#### 第二步：真流式编排（验收目标）
+
+第一轮 reasoning / text 实时下发，搜索和二段续接同一个 SSE 流。
+
+验收必须做到：
+
+```text
+第一轮 reasoning 在上游 EOF 前到达 Codex
+搜索等待期间有 keepalive
+二段输出继续流式
+最终只有一个 response.completed
+最终 output 合并第一轮与二段内容
+```
+
+### 9.8 必须新增的测试
+
+#### 测试 A：reasoning 后触发搜索
+
+第一轮 mock SSE：
+
+```text
+reasoning delta
+web_search tool call
+[DONE]
+```
+
+下游断言顺序：
+
+```text
+第一轮 reasoning delta
+web_search_call 状态
+二段 answer delta
+response.completed
+```
+
+并且断言 reasoning 事件在第一轮 mock EOF 前已经写出。
+
+#### 测试 B：reasoning 后不触发搜索
+
+第一轮 mock SSE：
+
+```text
+reasoning delta
+text delta
+[DONE]
+```
+
+下游断言：
+
+```text
+reasoning / text 均为实时增量
+不调用 Exa / Tavily
+只有一个 response.completed
+```
+
+#### 测试 C：output_index 续接
+
+构造第一轮两个输出 item，再让二段返回 message，断言：
+
+```text
+第一轮 item 使用 index 0/1
+二段 message 使用 index 2
+最终 completed.output 顺序完整
+```
+
+#### 测试 D：部分输出后搜索失败
+
+第一轮 reasoning 已下发后，让 Exa / Tavily 失败。
+
+断言：
+
+```text
+已下发 reasoning 不被撤回
+后续有显式失败事件
+SSE 正常关闭
+客户端不需要重连才能知道失败
+```
+
+## 10. 当前测试的有效边界
 
 已通过：
 
@@ -297,7 +553,7 @@ cargo test -p codex-plus-core --lib web_search
 - 真实 Exa / Tavily 可用
 - 真实 Codex 客户端体验正常
 
-## 10. 最终结论
+## 11. 最终结论
 
 当前版本的核心缺陷是服务端编排模型：
 
