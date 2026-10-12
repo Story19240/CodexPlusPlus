@@ -121,7 +121,7 @@ test("unified enhancements use the master switch and Chinese suggestion labels",
 
 test("complete voice and Stepwise panels share the enhancement form and save action", () => {
   const enhance = component("EnhanceScreen");
-  for (const name of ["DictationSettingsPanel", "StepwiseSettingsPanel"]) {
+  for (const name of ["DictationSettingsPanel", "WebSearchSettingsPanel", "StepwiseSettingsPanel"]) {
     const panel = elements(enhance).find((element) => element.tagName.getText(app) === name);
     assert.ok(panel, `${name} belongs in Codex enhancements`);
     assert.equal(attribute(panel, "form"), "form");
@@ -131,9 +131,9 @@ test("complete voice and Stepwise panels share the enhancement form and save act
   assert.ok(calls.some((node) => node.expression.getText(app) === "actions.saveSettings"), "enhancements must retain their save action");
 
   const settings = component("SettingsScreen");
-  assert.ok(!elements(settings).some((element) => ["DictationSettingsPanel", "StepwiseSettingsPanel"].includes(element.tagName.getText(app))));
+  assert.ok(!elements(settings).some((element) => ["DictationSettingsPanel", "WebSearchSettingsPanel", "StepwiseSettingsPanel"].includes(element.tagName.getText(app))));
   assert.ok(!descendants(settings).some((node) => ts.isPropertyAccessExpression(node)
-    && (/^form\.dictation(?:\.|$)/.test(node.getText(app)) || /^form\.codexApp(?:Stepwise|AnswerOutline)/.test(node.getText(app)))));
+    && (/^form\.(?:dictation|webSearch)(?:\.|$)/.test(node.getText(app)) || /^form\.codexApp(?:Stepwise|AnswerOutline)/.test(node.getText(app)))));
 });
 
 test("local speech download requires a configuration button click and mount only reads status", () => {
@@ -165,6 +165,11 @@ test("enhancement panels retain every service field, private key input and Stepw
     "codexAppStepwiseMaxItems", "codexAppStepwiseMaxInputChars", "codexAppStepwiseMaxOutputTokens", "codexAppStepwiseTimeoutMs",
   ]) fieldControl(stepwise, `form.${field}`);
   assert.equal(attribute(fieldControl(stepwise, "form.codexAppStepwiseApiKey"), "type"), "password");
+  const webSearch = component("WebSearchSettingsPanel");
+  for (const field of ["enabled", "provider", "resultLimit", "timeoutSeconds"]) {
+    fieldControl(webSearch, `form.webSearch.${field}`);
+  }
+  assert.equal(attribute(fieldControl(webSearch, "providerKey"), "type"), "password");
   const connectionTest = descendants(stepwise).find((node) => ts.isCallExpression(node)
     && node.expression.getText(app) === "actions.testStepwiseSettings");
   assert.ok(connectionTest && ts.isCallExpression(connectionTest));
@@ -189,14 +194,14 @@ test("manager deep links select their enhancement tab before displaying the page
 test("all enhancement panes stay mounted while tab selection only changes visibility", () => {
   const enhance = component("EnhanceScreen");
   const panes = elements(enhance).filter((element) => attribute(element, "role") === "tabpanel");
-  assert.equal(panes.length, 3);
-  for (const tab of ["general", "dictation", "stepwise"]) {
+  assert.equal(panes.length, 4);
+  for (const tab of ["general", "dictation", "webSearch", "stepwise"]) {
     const pane = panes.find((element) => attribute(element, "hidden") === `activeTab !== "${tab}"`);
     assert.ok(pane, `missing visibility control for ${tab}`);
     assert.equal(isConditional(pane, enhance), false, `${tab} must retain local form UI state when hidden`);
     assert.ok(attribute(pane, "id"));
   }
-  assert.equal(new Set(panes.map((pane) => attribute(pane, "id"))).size, 3);
+  assert.equal(new Set(panes.map((pane) => attribute(pane, "id"))).size, 4);
   assert.ok(elements(enhance).some((element) => attribute(element, "role") === "tablist"));
   const tabs = elements(enhance).filter((element) => attribute(element, "role") === "tab");
   assert.ok(tabs.length > 0);

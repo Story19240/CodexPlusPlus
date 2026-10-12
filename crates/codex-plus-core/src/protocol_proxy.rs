@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::{Map, Value, json};
@@ -373,6 +373,23 @@ fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn request_has_native_web_search(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                )
+            })
+        })
+        || matches!(
+            body.pointer("/tool_choice/type").and_then(Value::as_str),
+            Some("web_search" | "web_search_preview")
+        )
+}
+
 fn input_has_encrypted_agent_content(input: &Value) -> bool {
     fn item_has_encrypted_content(item: &Value) -> bool {
         item.get("type").and_then(Value::as_str) == Some("encrypted_content")
@@ -398,10 +415,20 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
 }
 
 pub fn responses_to_chat_completions_with_options(
-    mut body: Value,
+    body: Value,
     standard: bool,
 ) -> anyhow::Result<Value> {
-    remove_unsupported_native_search(&mut body)?;
+    responses_to_chat_completions_with_web_search(body, standard, false)
+}
+
+pub(crate) fn responses_to_chat_completions_with_web_search(
+    mut body: Value,
+    standard: bool,
+    execute_web_search: bool,
+) -> anyhow::Result<Value> {
+    if !execute_web_search {
+        remove_unsupported_native_search(&mut body)?;
+    }
     expand_local_compaction_history(&mut body);
     if input_has_native_compaction(&body) {
         return Err(NativeCompactionUnsupported::history().into());
@@ -487,7 +514,7 @@ pub fn responses_to_chat_completions_with_options(
     let mut has_chat_tools = false;
     let mut converted = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        converted = responses_tools_to_chat_tools(tools, &tool_context);
+        converted = responses_tools_to_chat_tools(tools, &tool_context, execute_web_search);
     }
     for namespace_tool in &harvested_namespaces {
         converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
@@ -499,10 +526,9 @@ pub fn responses_to_chat_completions_with_options(
     }
 
     if has_chat_tools {
-        if let Some(tool_choice) = body
-            .get("tool_choice")
-            .and_then(|value| responses_tool_choice_to_chat(value, &tool_context))
-        {
+        if let Some(tool_choice) = body.get("tool_choice").and_then(|value| {
+            responses_tool_choice_to_chat(value, &tool_context, execute_web_search)
+        }) {
             result["tool_choice"] = tool_choice;
         }
         if let Some(value) = body.get("parallel_tool_calls") {
@@ -617,7 +643,22 @@ pub struct UpstreamProxyResponse {
     /// 响应体已经读完。为 Some 时不要再读 response。
     pub buffered_body: Option<Vec<u8>>,
     pub response: Option<reqwest::Response>,
+    /// live 上游响应需要由 launcher 做服务端 Web Search 流式编排时携带。
+    pub(crate) web_search_context: Option<WebSearchExecutionContext>,
     pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
+}
+
+/// launcher 继续执行 Web Search 所需的请求上下文；不包含客户端鉴权头。
+#[derive(Debug, Clone)]
+pub(crate) struct WebSearchExecutionContext {
+    pub(crate) relay: crate::settings::RelayProfile,
+    pub(crate) endpoint: String,
+    pub(crate) chat_request: Value,
+    pub(crate) original_request: Value,
+    pub(crate) settings: crate::settings::BackendSettings,
+    pub(crate) original_user_agent: Option<String>,
+    pub(crate) beta_features: Option<String>,
+    pub(crate) search_endpoint: Option<String>,
 }
 
 /// 客户端会话头白名单；不接受鉴权或任意其他客户端请求头。
@@ -712,6 +753,8 @@ pub struct ChatSseToResponsesConverter {
     utf8_remainder: Vec<u8>,
     state: ChatSseState,
     failed: bool,
+    defer_completion: bool,
+    saw_done: bool,
 }
 
 /// 原生 Responses 只旁路观察终止事件，不改写任何响应字节，也不保存诊断正文。
@@ -1239,7 +1282,7 @@ fn output_compaction_count(output: Option<&Value>) -> Option<usize> {
     Some(compactions.count())
 }
 
-async fn read_limited_upstream_body(
+pub(crate) async fn read_limited_upstream_body(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
@@ -1535,6 +1578,7 @@ fn native_compaction_unsupported_result(
             }
         });
         Ok(UpstreamProxyResponse {
+            web_search_context: None,
             status_code: 400,
             content_type: "application/json".to_string(),
             is_stream: false,
@@ -1607,6 +1651,8 @@ impl Default for ChatSseToResponsesConverter {
             utf8_remainder: Vec::new(),
             state: ChatSseState::default(),
             failed: false,
+            defer_completion: false,
+            saw_done: false,
         }
     }
 }
@@ -1625,6 +1671,19 @@ impl ChatSseToResponsesConverter {
             state: ChatSseState::with_request(original_request),
             ..Self::default()
         }
+    }
+
+    /// 服务端 Web Search 需要在 [DONE] 后继续二段模型输出，
+    /// 因此第一轮不能立即发送 response.completed。
+    pub(crate) fn with_web_search_orchestration(original_request: &Value) -> Self {
+        Self {
+            defer_completion: true,
+            ..Self::with_request(original_request)
+        }
+    }
+
+    pub(crate) fn saw_done(&self) -> bool {
+        self.saw_done
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
@@ -1663,6 +1722,71 @@ impl ChatSseToResponsesConverter {
         output.into_bytes()
     }
 
+    /// 从已流式转换的第一轮 Chat SSE 中提取消息，用于构造二段请求。
+    pub(crate) fn parsed_chat_response(&self) -> crate::web_search::ParsedChatResponse {
+        self.state.parsed_chat_response()
+    }
+
+    /// 暂停第一轮流，保留 response.created 与已完成 item；
+    /// web_search_call 保持 in_progress，等待搜索结果后决定完成或失败。
+    pub(crate) fn pause_for_web_search(&mut self) -> Vec<u8> {
+        let mut output = String::new();
+        self.state.pause_for_web_search_into(&mut output);
+        output.into_bytes()
+    }
+
+    pub(crate) fn complete_web_search_calls(&mut self) -> Vec<u8> {
+        let mut output = String::new();
+        self.state
+            .complete_web_search_calls_into(&mut output, "completed");
+        output.into_bytes()
+    }
+
+    /// 搜索失败时也必须把 web_search_call 显式落盘为失败 item，不能静默丢弃。
+    pub(crate) fn fail_web_search_calls(
+        &mut self,
+        message: String,
+        error_type: Option<String>,
+    ) -> Vec<u8> {
+        let mut output = String::new();
+        self.state
+            .complete_web_search_calls_into(&mut output, "failed");
+        let mut bytes = output.into_bytes();
+        bytes.extend(self.fail(message, error_type));
+        bytes
+    }
+
+    /// 二段输出沿用同一个 response id 与 output_index 序列，不再发送 response.created。
+    pub(crate) fn resume_after_web_search(&mut self, first_response_id: &str) {
+        self.state
+            .resume_after_web_search(first_response_id);
+        self.buffer.clear();
+        self.utf8_remainder.clear();
+        self.failed = false;
+        self.defer_completion = false;
+        self.saw_done = false;
+    }
+
+    /// 兼容二段上游返回 JSON：作为单块 Chat SSE 送入同一个续接转换器。
+    pub(crate) fn push_parsed_chat_response(
+        &mut self,
+        parsed: &crate::web_search::ParsedChatResponse,
+    ) -> Vec<u8> {
+        let chat_json = json!({
+            "id": parsed.id,
+            "model": parsed.model,
+            "choices": [{
+                "finish_reason": parsed.finish_reason,
+                "message": parsed.message
+            }],
+            "usage": parsed.usage
+        });
+        let mut block = String::from("data: ");
+        block.push_str(&chat_json.to_string());
+        block.push_str("\n\ndata: [DONE]\n\n");
+        self.push_bytes(block.as_bytes())
+    }
+
     fn handle_block(&mut self, block: &str, output: &mut String) {
         let mut event_name: Option<String> = None;
         let mut data_parts = Vec::new();
@@ -1680,6 +1804,10 @@ impl ChatSseToResponsesConverter {
         }
         let data = data_parts.join("\n");
         if data.trim() == "[DONE]" {
+            self.saw_done = true;
+            if self.defer_completion {
+                return;
+            }
             self.state.finalize_into(output);
             return;
         }
@@ -1943,6 +2071,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             let channel_key = crate::channel_protection::key_for_relay(&relay);
             let mut channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
             let model_override = aggregate_upstream_model_override(&settings, &relay);
+            let web_search_execution = settings.web_search.enabled
+                && relay.protocol == RelayProtocol::ChatCompletions
+                && request_has_native_web_search(&request_json)
+                && !request_has_compaction_trigger(&request_json)
+                && !is_responses_compact_proxy_path(request_path);
             let preserve_native_request = relay.protocol == RelayProtocol::Responses
                 && (request_has_compaction_trigger(&request_json)
                     || is_responses_compact_proxy_path(request_path));
@@ -1956,6 +2089,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     request_path,
                     model_override.as_deref(),
                     preserve_native_request,
+                    web_search_execution,
                 )
                 .await
                 {
@@ -2073,6 +2207,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 if success && upstream_has_terminal_failure(&probed, &content_type) {
                     crate::relay_rotation::record_relay_request_failure(&settings);
                     return Ok(UpstreamProxyResponse {
+                        web_search_context: None,
                         status_code,
                         is_stream: stream_response,
                         content_type,
@@ -2092,6 +2227,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                 RotationEvent::Success,
                             );
                             return Ok(UpstreamProxyResponse {
+                                web_search_context: None,
                                 status_code,
                                 is_stream: true,
                                 content_type,
@@ -2106,6 +2242,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         None => {
                             crate::relay_rotation::record_relay_request_failure(&settings);
                             return Ok(UpstreamProxyResponse {
+                                web_search_context: None,
                                 status_code,
                                 is_stream: true,
                                 content_type: "text/event-stream".to_string(),
@@ -2128,6 +2265,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     );
                     if !is_stream {
                         return Ok(UpstreamProxyResponse {
+                            web_search_context: None,
                             status_code,
                             is_stream: false,
                             content_type,
@@ -2141,6 +2279,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     }
                     if let Some(sse) = render_native_compaction_as_sse(&probed) {
                         return Ok(UpstreamProxyResponse {
+                            web_search_context: None,
                             status_code,
                             is_stream: true,
                             content_type: "text/event-stream".to_string(),
@@ -2159,6 +2298,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         continue;
                     }
                     return Ok(UpstreamProxyResponse {
+                        web_search_context: None,
                         status_code,
                         is_stream: false,
                         content_type,
@@ -2184,6 +2324,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     request_path,
                     model_override.as_deref(),
                     false,
+                    web_search_execution,
                 )
                 .await;
                 let (fallback_endpoint, fallback_body, fallback_wire, _) = match fallback {
@@ -2300,7 +2441,87 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         .split(';')
                         .next()
                         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+                if web_search_execution && (200..300).contains(&status_code) {
+                    let live_stream = is_stream
+                        && content_type.contains("text/event-stream")
+                        && request_wants_stream(&request_json);
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.enabled",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "provider": format!("{:?}", settings.web_search.provider),
+                            "resultLimit": settings.web_search.result_limit,
+                            "timeoutSeconds": settings.web_search.timeout_seconds
+                        }),
+                    );
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.native_tool_detected",
+                        json!({
+                            "relayId": relay.id,
+                            "toolType": "web_search"
+                        }),
+                    );
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.first_response_received",
+                        json!({
+                            "relayId": relay.id,
+                            "statusCode": status_code,
+                            "contentType": content_type,
+                            "stream": live_stream
+                        }),
+                    );
+                    if live_stream {
+                        return Ok(UpstreamProxyResponse {
+                            web_search_context: Some(WebSearchExecutionContext {
+                                relay: relay.clone(),
+                                endpoint: endpoint.clone(),
+                                chat_request: upstream_body.clone(),
+                                original_request: request_json.clone(),
+                                settings,
+                                original_user_agent: original_user_agent.map(str::to_string),
+                                beta_features: beta_features.map(str::to_string),
+                                search_endpoint: None,
+                            }),
+                            status_code,
+                            is_stream: true,
+                            content_type,
+                            wire_api,
+                            compaction: is_compaction_request,
+                            native_compaction_passthrough: false,
+                            buffered_body: None,
+                            response: Some(upstream),
+                            _channel_permit: Some(channel_permit),
+                        });
+                    }
+                    return execute_web_search_round(
+                        UpstreamProxyResponse {
+                            web_search_context: None,
+                            status_code,
+                            is_stream: (is_stream && !json_compaction)
+                                || content_type.contains("text/event-stream"),
+                            content_type,
+                            wire_api,
+                            compaction: is_compaction_request,
+                            native_compaction_passthrough: false,
+                            buffered_body: None,
+                            response: Some(upstream),
+                            _channel_permit: Some(channel_permit),
+                        },
+                        relay.clone(),
+                        endpoint,
+                        upstream_body.clone(),
+                        &request_json,
+                        &settings,
+                        original_user_agent,
+                        beta_features,
+                        session_headers,
+                        None,
+                    )
+                    .await;
+                }
                 return Ok(UpstreamProxyResponse {
+                    web_search_context: None,
                     status_code,
                     is_stream: (is_stream && !json_compaction)
                         || content_type.contains("text/event-stream"),
@@ -2332,6 +2553,447 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             );
         }
         anyhow::bail!("未找到可用的聚合供应商成员")
+    }
+}
+
+async fn execute_web_search_round(
+    mut upstream: UpstreamProxyResponse,
+    relay: crate::settings::RelayProfile,
+    endpoint: String,
+    chat_request: Value,
+    original_request: &Value,
+    settings: &crate::settings::BackendSettings,
+    original_user_agent: Option<&str>,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+    search_endpoint: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let first_content_type = upstream.content_type.clone();
+    let first_is_stream = upstream.is_stream;
+    let first_body = if let Some(body) = upstream.buffered_body.take() {
+        body
+    } else {
+        match upstream.take_response() {
+            Ok(mut response) => {
+                match read_limited_upstream_body(
+                    &mut response,
+                    MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return Ok(web_search_failure_response(
+                            original_request,
+                            error.to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Ok(web_search_failure_response(
+                    original_request,
+                    error.to_string(),
+                ));
+            }
+        }
+    };
+    drop(upstream);
+
+    let first_response =
+        match crate::web_search::parse_chat_response(&first_body, &first_content_type) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(web_search_failure_response(
+                    original_request,
+                    error.to_string(),
+                ));
+            }
+        };
+    let search_calls = match first_response.web_search_calls() {
+        Ok(calls) => calls,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    if search_calls.is_empty() {
+        return converted_chat_response(
+            &first_body,
+            &first_content_type,
+            first_is_stream,
+            original_request,
+        );
+    }
+
+    let search_outputs = match crate::web_search::execute_web_search_calls_at(
+        &settings.web_search,
+        &search_calls,
+        search_endpoint,
+    )
+    .await
+    {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    let followup_request = match crate::web_search::build_web_search_followup_request(
+        &chat_request,
+        &first_response,
+        &search_outputs,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+
+    let channel_key = crate::channel_protection::key_for_relay(&relay);
+    let channel_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
+    let mut followup = match send_responses_upstream_request(
+        &relay,
+        &endpoint,
+        &followup_request,
+        UpstreamWireApi::ChatCompletions,
+        true,
+        original_user_agent,
+        beta_features,
+        session_headers,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            drop(channel_permit);
+            crate::relay_rotation::record_relay_request_failure(settings);
+            return Ok(web_search_failure_response(
+                original_request,
+                format!("Web 搜索后的模型请求失败: {error}"),
+            ));
+        }
+    };
+    let status_code = followup.status().as_u16();
+    let content_type = followup
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    crate::relay_rotation::record_relay_request_event(
+        settings,
+        if (200..300).contains(&status_code) {
+            RotationEvent::Success
+        } else {
+            RotationEvent::Failure
+        },
+    );
+    if !(200..300).contains(&status_code) {
+        return Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code,
+            is_stream: false,
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(followup),
+            _channel_permit: Some(channel_permit),
+        });
+    }
+
+    let target_stream = request_wants_stream(original_request);
+    if target_stream && content_type.contains("text/event-stream") {
+        return Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code,
+            is_stream: true,
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(followup),
+            _channel_permit: Some(channel_permit),
+        });
+    }
+
+    let followup_body =
+        match read_limited_upstream_body(&mut followup, MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES)
+            .await
+        {
+            Ok(body) => body.to_vec(),
+            Err(error) => {
+                drop(channel_permit);
+                return Ok(web_search_failure_response(
+                    original_request,
+                    format!("读取搜索后的模型响应失败: {error}"),
+                ));
+            }
+        };
+    drop(channel_permit);
+    let parsed = match crate::web_search::parse_chat_response(&followup_body, &content_type) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    let response_json = match chat_completion_to_response_with_request(
+        chat_json_from_parsed(&parsed),
+        original_request,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(web_search_failure_response(
+                original_request,
+                error.to_string(),
+            ));
+        }
+    };
+    if target_stream {
+        Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(responses_json_as_sse(&response_json)),
+            response: None,
+            _channel_permit: None,
+        })
+    } else {
+        Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&response_json)?),
+            response: None,
+            _channel_permit: None,
+        })
+    }
+}
+
+/// launcher 已下发第一轮部分输出后，用该函数发起二段模型请求。
+/// 返回值持有 channel permit，调用方读完/流完响应后统一释放。
+pub(crate) async fn send_web_search_followup_request(
+    context: &WebSearchExecutionContext,
+    followup_request: &Value,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let channel_key = crate::channel_protection::key_for_relay(&context.relay);
+    let channel_permit = crate::channel_protection::acquire(&channel_key, &context.relay).await;
+    let followup = match send_responses_upstream_request(
+        &context.relay,
+        &context.endpoint,
+        followup_request,
+        UpstreamWireApi::ChatCompletions,
+        true,
+        context.original_user_agent.as_deref(),
+        context.beta_features.as_deref(),
+        session_headers,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            drop(channel_permit);
+            crate::relay_rotation::record_relay_request_failure(&context.settings);
+            return Err(error);
+        }
+    };
+    let status_code = followup.status().as_u16();
+    let content_type = followup
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    crate::relay_rotation::record_relay_request_event(
+        &context.settings,
+        if (200..300).contains(&status_code) {
+            RotationEvent::Success
+        } else {
+            RotationEvent::Failure
+        },
+    );
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.followup_response",
+        json!({
+            "relayId": context.relay.id,
+            "statusCode": status_code,
+            "contentType": content_type,
+            "stream": content_type.contains("text/event-stream")
+        }),
+    );
+    Ok(UpstreamProxyResponse {
+        web_search_context: None,
+        status_code,
+        is_stream: content_type.contains("text/event-stream"),
+        content_type,
+        wire_api: UpstreamWireApi::ChatCompletions,
+        compaction: false,
+        native_compaction_passthrough: false,
+        buffered_body: None,
+        response: Some(followup),
+        _channel_permit: Some(channel_permit),
+    })
+}
+
+fn converted_chat_response(
+    body: &[u8],
+    content_type: &str,
+    is_stream: bool,
+    original_request: &Value,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let target_stream = request_wants_stream(original_request);
+    if is_stream && target_stream {
+        let text = String::from_utf8_lossy(body);
+        return Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(
+                chat_sse_to_responses_sse_with_request(&text, original_request).into_bytes(),
+            ),
+            response: None,
+            _channel_permit: None,
+        });
+    }
+
+    let parsed = crate::web_search::parse_chat_response(body, content_type)?;
+    let response_json =
+        chat_completion_to_response_with_request(chat_json_from_parsed(&parsed), original_request)?;
+    if target_stream {
+        Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(responses_json_as_sse(&response_json)),
+            response: None,
+            _channel_permit: None,
+        })
+    } else {
+        Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&response_json)?),
+            response: None,
+            _channel_permit: None,
+        })
+    }
+}
+
+fn request_wants_stream(request: &Value) -> bool {
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn chat_json_from_parsed(parsed: &crate::web_search::ParsedChatResponse) -> Value {
+    json!({
+        "id": parsed.id,
+        "model": parsed.model,
+        "choices": [{
+            "finish_reason": parsed.finish_reason,
+            "message": parsed.message
+        }],
+        "usage": parsed.usage
+    })
+}
+
+fn responses_json_as_sse(response: &Value) -> Vec<u8> {
+    let mut output = String::new();
+    push_sse(
+        &mut output,
+        "response.completed",
+        json!({ "type": "response.completed", "response": response }),
+    );
+    output.push_str("data: [DONE]\n\n");
+    output.into_bytes()
+}
+
+fn web_search_failure_response(original_request: &Value, message: String) -> UpstreamProxyResponse {
+    let mut response = json!({
+        "id": "resp_web_search_failed",
+        "object": "response",
+        "created_at": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0),
+        "status": "failed",
+        "model": original_request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "output": [],
+        "usage": default_responses_usage(),
+        "error": {
+            "type": "web_search_failed",
+            "message": message
+        }
+    });
+    copy_response_request_fields(&mut response, Some(original_request));
+    let target_stream = request_wants_stream(original_request);
+    let (content_type, body) = if target_stream {
+        let mut output = String::new();
+        push_sse(
+            &mut output,
+            "response.failed",
+            json!({ "type": "response.failed", "response": response }),
+        );
+        (
+            "text/event-stream; charset=utf-8".to_string(),
+            output.into_bytes(),
+        )
+    } else {
+        (
+            "application/json; charset=utf-8".to_string(),
+            serde_json::to_vec(&response).unwrap_or_default(),
+        )
+    };
+    UpstreamProxyResponse {
+        web_search_context: None,
+        status_code: 200,
+        is_stream: target_stream,
+        content_type,
+        wire_api: UpstreamWireApi::Responses,
+        compaction: false,
+        native_compaction_passthrough: false,
+        buffered_body: Some(body),
+        response: None,
+        _channel_permit: None,
     }
 }
 
@@ -2423,6 +3085,7 @@ pub async fn open_models_proxy_request(
         .to_string();
 
     Ok(UpstreamProxyResponse {
+        web_search_context: None,
         status_code,
         is_stream: false,
         content_type,
@@ -2476,6 +3139,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         .to_string();
 
     Ok(UpstreamProxyResponse {
+        web_search_context: None,
         status_code,
         is_stream: false,
         content_type,
@@ -2611,6 +3275,7 @@ async fn open_image_proxy_request(
         .to_string();
 
     Ok(UpstreamProxyResponse {
+        web_search_context: None,
         status_code,
         is_stream: false,
         content_type,
@@ -2704,6 +3369,7 @@ pub async fn open_chat_completions_proxy_request(
             .to_string();
 
         return Ok(UpstreamProxyResponse {
+            web_search_context: None,
             status_code,
             is_stream: is_stream || content_type.contains("text/event-stream"),
             content_type,
@@ -2723,6 +3389,7 @@ async fn upstream_request_parts(
     request_path: &str,
     model_override: Option<&str>,
     preserve_compaction_trigger: bool,
+    web_search_execution: bool,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
     let compact = is_responses_compact_proxy_path(request_path)
         || request_has_compaction_trigger(&request_json);
@@ -2748,9 +3415,10 @@ async fn upstream_request_parts(
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
+        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_web_search(
             request_json,
             relay.standard_openai_protocol,
+            web_search_execution,
         )?,
     };
     if relay.protocol == RelayProtocol::Responses {
@@ -3310,6 +3978,7 @@ struct ChatSseState {
     response_started: bool,
     completed: bool,
     response_id: String,
+    final_response_id: Option<String>,
     model: String,
     created_at: u64,
     next_output_index: u32,
@@ -3330,6 +3999,7 @@ impl Default for ChatSseState {
             response_started: false,
             completed: false,
             response_id: "resp_compat".to_string(),
+            final_response_id: None,
             model: String::new(),
             created_at: 0,
             next_output_index: 0,
@@ -3773,6 +4443,105 @@ impl ChatSseState {
         self.completed = true;
     }
 
+    fn parsed_chat_response(&self) -> crate::web_search::ParsedChatResponse {
+        let mut message = json!({ "role": "assistant" });
+        if !self.text.text.is_empty() {
+            message["content"] = json!(self.text.text);
+        }
+        if !self.reasoning.text.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning.text);
+        }
+        if !self.tools.is_empty() {
+            let tool_calls = self
+                .tools
+                .values()
+                .map(|state| {
+                    json!({
+                        "id": state.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": state.name,
+                            "arguments": state.arguments
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            message["tool_calls"] = json!(tool_calls);
+        }
+        crate::web_search::ParsedChatResponse {
+            id: self.response_id.clone(),
+            model: self.model.clone(),
+            message,
+            finish_reason: self.finish_reason.clone(),
+            usage: self.latest_usage.clone(),
+        }
+    }
+
+    fn pause_for_web_search_into(&mut self, output: &mut String) {
+        self.ensure_response_started_into(output);
+        self.flush_inline_think_at_boundary_into(output);
+        self.finalize_reasoning_into(output);
+        self.finalize_text_into(output);
+        let keys: Vec<usize> = self.tools.keys().copied().collect();
+        for key in keys {
+            if let Some(state) = self.tools.get(&key) {
+                let output_index = state.output_index.unwrap_or(0);
+                push_tool_call_done_sse(output, state, output_index, &self.tool_context);
+            }
+        }
+    }
+
+    fn complete_web_search_calls_into(&mut self, output: &mut String, status: &str) {
+        let keys: Vec<usize> = self.tools.keys().copied().collect();
+        for key in keys {
+            if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
+                continue;
+            }
+            let output_index = match self
+                .tools
+                .get(&key)
+                .and_then(|state| state.output_index)
+            {
+                Some(index) => index,
+                None => self.next_output_index(),
+            };
+            let state = self.tools.get_mut(&key).expect("tool state exists");
+            if state.output_index.is_none() {
+                state.output_index = Some(output_index);
+            }
+            let item = json!({
+                "id": web_search_item_id(&state.call_id),
+                "type": "web_search_call",
+                "status": status,
+                "call_id": state.call_id,
+                "action": web_search_action_from_arguments(&state.arguments)
+            });
+            state.done = true;
+            self.output_items.push((output_index, item.clone()));
+            push_sse(
+                output,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item
+                }),
+            );
+        }
+    }
+
+    fn resume_after_web_search(&mut self, first_response_id: &str) {
+        self.final_response_id = Some(first_response_id.to_string());
+        self.response_id = format!("{first_response_id}_followup");
+        self.completed = false;
+        self.text = TextItemState::default();
+        self.reasoning = ReasoningItemState::default();
+        self.inline_think = InlineThinkState::default();
+        self.tools.clear();
+        self.finish_reason = None;
+        self.latest_usage = None;
+    }
+
     fn finalize_reasoning_into(&mut self, output: &mut String) {
         if !self.reasoning.added || self.reasoning.done {
             return;
@@ -3937,7 +4706,7 @@ impl ChatSseState {
 
     fn base_response(&self, status: &str, output: Vec<Value>) -> Value {
         json!({
-            "id": self.response_id,
+            "id": self.final_response_id.as_deref().unwrap_or(&self.response_id),
             "object": "response",
             "created_at": self.created_at,
             "status": status,
@@ -5240,7 +6009,11 @@ fn add_namespace_tools_to_context(context: &mut CodexToolContext, namespace_tool
     }
 }
 
-fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) -> Vec<Value> {
+fn responses_tools_to_chat_tools(
+    tools: &[Value],
+    context: &CodexToolContext,
+    execute_web_search: bool,
+) -> Vec<Value> {
     let mut converted = Vec::new();
     for tool in tools {
         if let Some(name) = tool.as_str().filter(|name| !name.is_empty()) {
@@ -5252,6 +6025,9 @@ fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) ->
                 if let Some(tool) = responses_function_tool_to_chat_tool(tool) {
                     converted.push(tool);
                 }
+            }
+            "web_search" | "web_search_preview" if execute_web_search => {
+                converted.push(web_search_chat_tool());
             }
             "custom" | "web_search" | "local_shell" | "computer_use" => {
                 let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
@@ -5323,6 +6099,24 @@ fn detect_codex_custom_tool_kind(tool: &Value, name: &str) -> CodexCustomToolKin
     } else {
         CodexCustomToolKind::Raw
     }
+}
+
+fn web_search_chat_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn responses_function_tool_to_chat_tool(tool: &Value) -> Option<Value> {
@@ -5884,8 +6678,21 @@ fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     }
 }
 
-fn responses_tool_choice_to_chat(tool_choice: &Value, context: &CodexToolContext) -> Option<Value> {
+fn responses_tool_choice_to_chat(
+    tool_choice: &Value,
+    context: &CodexToolContext,
+    execute_web_search: bool,
+) -> Option<Value> {
     match tool_choice {
+        Value::Object(object)
+            if execute_web_search
+                && matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                ) =>
+        {
+            Some(json!({ "type": "function", "function": { "name": "web_search" } }))
+        }
         Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str) {
                 let name = object.get("name").and_then(Value::as_str).unwrap_or("");
@@ -6178,6 +6985,19 @@ fn push_tool_call_done_sse(
     output_index: u32,
     tool_context: &CodexToolContext,
 ) {
+    if tool_context.is_builtin_web_search_proxy(&state.name) {
+        push_sse(
+            output,
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": state.item_id,
+                "output_index": output_index,
+                "arguments": state.arguments
+            }),
+        );
+        return;
+    }
     if tool_context.is_tool_search_proxy(&state.name) {
         push_sse(
             output,
@@ -6353,6 +7173,7 @@ fn web_search_action_has_target(action: &Value) -> bool {
 
 fn invalid_web_search_output_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("web_search_call")
+        && item.get("status").and_then(Value::as_str) != Some("completed")
 }
 
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
@@ -7185,6 +8006,341 @@ mod response_compatibility_tests {
         .unwrap();
         assert_eq!(response["status"], "failed");
         assert_eq!(response["output"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn enabled_web_search_maps_native_tool_to_chat_function() {
+        let converted = responses_to_chat_completions_with_web_search(
+            json!({
+                "model": "fixture-model",
+                "input": "hi",
+                "stream": true,
+                "tools": [{ "type": "web_search" }],
+                "tool_choice": { "type": "web_search" }
+            }),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(converted["tools"][0]["function"]["name"], "web_search");
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["required"],
+            json!(["query"])
+        );
+        assert_eq!(converted["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    fn completed_response_from_sse(sse: &str) -> Value {
+        for block in sse.split("\n\n") {
+            if !block.contains("event: response.completed") {
+                continue;
+            }
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("completed event should carry data");
+            return serde_json::from_str(data).expect("completed event should be JSON");
+        }
+        panic!("SSE should contain one response.completed event");
+    }
+
+    #[test]
+    fn web_search_stream_keeps_first_reasoning_and_continues_output_items() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+
+        let first_reasoning = String::from_utf8(converter.push_bytes(
+            b"data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\"}}]}\n\n",
+        ))
+        .unwrap();
+        assert!(first_reasoning.contains("first thought"));
+        assert!(first_reasoning.contains("response.reasoning_summary_text.delta"));
+        assert!(!first_reasoning.contains("response.completed"));
+
+        let first_rest = converter.push_bytes(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        );
+        assert!(converter.saw_done());
+        let parsed = converter.parsed_chat_response();
+        assert_eq!(parsed.web_search_calls().unwrap().len(), 1);
+
+        let pause = String::from_utf8(converter.pause_for_web_search()).unwrap();
+        let completed_call = String::from_utf8(converter.complete_web_search_calls()).unwrap();
+        assert!(completed_call.contains("\"status\":\"completed\""));
+        assert!(completed_call.contains("\"type\":\"web_search_call\""));
+
+        converter.resume_after_web_search("resp_chatcmpl-first");
+        let second_round = converter.push_bytes(
+            concat!(
+                "data: {\"id\":\"chatcmpl-second\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"second thought\",\"content\":\"final answer\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        );
+        let tail = converter.finish();
+
+        let mut all = first_reasoning;
+        all.push_str(&String::from_utf8_lossy(&first_rest));
+        all.push_str(&pause);
+        all.push_str(&completed_call);
+        all.push_str(&String::from_utf8_lossy(&second_round));
+        all.push_str(&String::from_utf8_lossy(&tail));
+
+        assert_eq!(all.matches("event: response.created").count(), 1);
+        assert_eq!(all.matches("event: response.completed").count(), 1);
+        assert!(all.contains("\"output_index\":2"));
+        assert!(all.contains("\"output_index\":3"));
+
+        let completed = completed_response_from_sse(&all);
+        let output_types = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["reasoning", "web_search_call", "reasoning", "message"]
+        );
+        assert_eq!(completed["response"]["output"][1]["status"], "completed");
+        assert_eq!(completed["response"]["id"], "resp_chatcmpl-first");
+    }
+
+    #[test]
+    fn web_search_stream_without_call_passes_through_without_completed_before_eof() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        let reasoning = String::from_utf8(converter.push_bytes(
+            b"data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+        ))
+        .unwrap();
+        assert!(reasoning.contains("thinking"));
+        assert!(!reasoning.contains("response.completed"));
+
+        let rest = converter.push_bytes(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        );
+        let completed = converter.finish();
+        let mut all = reasoning;
+        all.push_str(&String::from_utf8_lossy(&rest));
+        all.push_str(&String::from_utf8_lossy(&completed));
+
+        assert_eq!(all.matches("event: response.created").count(), 1);
+        assert_eq!(all.matches("event: response.completed").count(), 1);
+        assert!(!all.contains("web_search_call"));
+    }
+
+    #[test]
+    fn web_search_failure_keeps_already_streamed_reasoning() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        converter.push_bytes(
+            concat!(
+                "data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        );
+        let _ = converter.pause_for_web_search();
+        let failed = String::from_utf8(converter.fail_web_search_calls(
+            "provider failed".to_string(),
+            Some("web_search_provider_failed".to_string()),
+        ))
+        .unwrap();
+
+        assert!(failed.contains("first thought"));
+        assert!(failed.contains("\"status\":\"failed\""));
+        assert!(failed.contains("event: response.failed"));
+        assert!(!failed.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn web_search_round_executes_search_and_builds_streamed_followup() {
+        use crate::settings::{RelayProfile, WebSearchProvider, WebSearchSettings};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(header("x-api-key", "exa-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-upstream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .mount(&model_server)
+            .await;
+
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let endpoint = chat_completions_url(&relay.base_url);
+        let first_chat_response = json!({
+            "id": "chatcmpl-search",
+            "model": "fixture-model",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\":\"Codex\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let upstream = UpstreamProxyResponse {
+            web_search_context: None,
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&first_chat_response).unwrap()),
+            response: None,
+            _channel_permit: None,
+        };
+        let chat_request = json!({
+            "model": "fixture-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": { "name": "web_search", "parameters": { "type": "object" } }
+            }]
+        });
+        let original_request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [{ "type": "web_search" }]
+        });
+
+        let mut response = execute_web_search_round(
+            upstream,
+            relay,
+            endpoint,
+            chat_request,
+            &original_request,
+            &settings,
+            None,
+            None,
+            ProxySessionHeaders::default(),
+            Some(&format!("{}/search", search_server.uri())),
+        )
+        .await
+        .unwrap();
+        let body = response.read_body().await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!response.is_stream);
+        assert_eq!(response.wire_api, UpstreamWireApi::Responses);
+        assert_eq!(response_json["status"], "completed", "{response_json}");
+        assert_eq!(
+            response_json["output"][0]["content"][0]["text"],
+            "final answer"
+        );
+
+        let model_request = model_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let model_body: Value = serde_json::from_slice(&model_request.body).unwrap();
+        assert_eq!(model_body["stream"], true);
+        assert!(model_body.get("tools").is_none());
+        assert!(model_body.get("tool_choice").is_none());
+        let messages = model_body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "web_search"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_search");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Codex content")
+        );
+
+        let search_request = search_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let search_body: Value = serde_json::from_slice(&search_request.body).unwrap();
+        assert_eq!(search_body["query"], "Codex");
     }
 
     #[test]

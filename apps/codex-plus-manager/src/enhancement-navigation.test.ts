@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { managerNavigationDestination } from "./enhancement-navigation.ts";
 
 test("existing settings links open their complete enhancement configuration", () => {
-  for (const section of ["stepwise", "dictation"] as const) {
+  for (const section of ["stepwise", "dictation", "webSearch"] as const) {
     const intent = { page: "settings", section } as const;
     assert.deepEqual(managerNavigationDestination(intent), { route: "enhance", section });
     assert.deepEqual(intent, { page: "settings", section });
@@ -12,7 +12,7 @@ test("existing settings links open their complete enhancement configuration", ()
 
 test("enhancement links preserve the requested section", () => {
   assert.deepEqual(managerNavigationDestination({ page: "enhance" }), { route: "enhance", section: null });
-  for (const section of ["stepwise", "dictation"] as const) {
+  for (const section of ["stepwise", "dictation", "webSearch"] as const) {
     assert.deepEqual(managerNavigationDestination({ page: "enhance", section }), { route: "enhance", section });
   }
 });

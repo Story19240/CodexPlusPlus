@@ -103,6 +103,13 @@ import {
   type DictationPreset,
 } from "./dictation-settings";
 import {
+  defaultWebSearchSettings,
+  normalizeWebSearchSettings,
+  webSearchSettingsIssue,
+  type WebSearchSettings,
+  type WebSearchSettingsIssue,
+} from "./web-search-settings";
+import {
   builtinEntryToImportDocument,
   builtinRowBackfillValue,
   clearModelMetadataForSlug,
@@ -273,6 +280,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppPath: string;
   codexExtraArgs: string[];
   dictation: DictationSettings;
+  webSearch: WebSearchSettings;
   providerSyncEnabled: boolean;
   ccsDbPath: string;
   providerSyncSavedProviders: string[];
@@ -1028,6 +1036,7 @@ const defaultSettings: BackendSettings = {
   codexAppPath: "",
   codexExtraArgs: [],
   dictation: defaultDictationSettings(),
+  webSearch: defaultWebSearchSettings(),
   providerSyncEnabled: false,
   ccsDbPath: "",
   providerSyncSavedProviders: [],
@@ -2329,6 +2338,11 @@ export function App() {
       showNotice(t("语音输入"), dictationIssue, "failed");
       return;
     }
+    const webSearchIssue = webSearchSettingsValidationMessage(webSearchSettingsIssue(next.webSearch));
+    if (webSearchIssue) {
+      showNotice(t("Web 搜索"), webSearchIssue, "failed");
+      return;
+    }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
       setSettings(result);
@@ -2347,6 +2361,11 @@ export function App() {
     const dictationIssue = dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
     if (dictationIssue) {
       showNotice(t("语音输入"), dictationIssue, "failed");
+      return null;
+    }
+    const webSearchIssue = webSearchSettingsValidationMessage(webSearchSettingsIssue(normalized.webSearch));
+    if (webSearchIssue) {
+      showNotice(t("Web 搜索"), webSearchIssue, "failed");
       return null;
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
@@ -5170,6 +5189,104 @@ function DictationSettingsPanel({ form, onFormChange }: {
   );
 }
 
+function WebSearchSettingsPanel({ form, onFormChange }: {
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+}) {
+  const updateWebSearch = (patch: Partial<WebSearchSettings>) => onFormChange({
+    ...form,
+    webSearch: { ...form.webSearch, ...patch },
+  });
+  const issue = webSearchSettingsValidationMessage(webSearchSettingsIssue(form.webSearch));
+  const providerKey = form.webSearch.provider === "exa"
+    ? form.webSearch.exaApiKey
+    : form.webSearch.tavilyApiKey;
+  const providerKeyEnv = form.webSearch.provider === "exa"
+    ? form.webSearch.exaApiKeyEnv
+    : form.webSearch.tavilyApiKeyEnv;
+  return (
+    <Panel className="enhance-service-panel">
+      <CardHead title={t("Web 搜索")} detail={t("为 Chat Completions 上游执行原生 web_search。")} />
+      <CardContent className="settings-content">
+        <div className="settings-block enhance-service-block" id={ENHANCEMENT_SECTION_IDS.webSearch}>
+          <FeatureToggle
+            title={t("启用服务端 Web 搜索")}
+            detail={t("模型请求 web_search 时，由 Codex++ 调用搜索服务并把结果回填给模型。")}
+            disabled={!form.enhancementsEnabled}
+            checked={form.webSearch.enabled}
+            onChange={(enabled) => updateWebSearch({ enabled })}
+          />
+          <div className="form-row">
+            <Field label={t("搜索提供商")}>
+              <AppSelect
+                value={form.webSearch.provider}
+                onChange={(value) => updateWebSearch({ provider: value })}
+                options={[
+                  { value: "exa", label: "Exa" },
+                  { value: "tavily", label: "Tavily" },
+                ]}
+              />
+            </Field>
+            <Field label={t("结果数量")}>
+              <Input
+                type="number"
+                min={1}
+                max={20}
+                value={form.webSearch.resultLimit}
+                onChange={(event) => updateWebSearch({ resultLimit: clampNumber(Number(event.currentTarget.value), 1, 20) })}
+              />
+            </Field>
+          </div>
+          <Field label="API Key">
+            <Input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={providerKey}
+              onChange={(event) => updateWebSearch(
+                form.webSearch.provider === "exa"
+                  ? { exaApiKey: event.currentTarget.value }
+                  : { tavilyApiKey: event.currentTarget.value },
+              )}
+            />
+          </Field>
+          <details className="stepwise-advanced enhance-service-advanced">
+            <summary>{t("高级参数")}</summary>
+            <div className="form-row">
+              <Field label={t("API Key 环境变量")}>
+                <Input
+                  value={providerKeyEnv}
+                  spellCheck={false}
+                  placeholder={form.webSearch.provider === "exa" ? "EXA_API_KEY" : "TAVILY_API_KEY"}
+                  onChange={(event) => updateWebSearch(
+                    form.webSearch.provider === "exa"
+                      ? { exaApiKeyEnv: event.currentTarget.value }
+                      : { tavilyApiKeyEnv: event.currentTarget.value },
+                  )}
+                />
+              </Field>
+              <Field label={t("搜索超时（秒）")}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={form.webSearch.timeoutSeconds}
+                  onChange={(event) => updateWebSearch({ timeoutSeconds: clampNumber(Number(event.currentTarget.value), 1, 60) })}
+                />
+              </Field>
+            </div>
+          </details>
+          {issue ? <p className="field-hint" role="alert">{issue}</p> : null}
+          <div className="hint-line enhance-service-note">
+            <Info className="h-4 w-4" />
+            <span>{t("仅 Chat Completions 供应商会使用此能力；Responses 原生搜索仍由上游执行。查询词会发送到所选搜索服务。")}</span>
+          </div>
+        </div>
+      </CardContent>
+    </Panel>
+  );
+}
+
 function StepwiseSettingsPanel({ form, onFormChange, actions }: {
   form: BackendSettings;
   onFormChange: (value: BackendSettings) => void;
@@ -5321,6 +5438,7 @@ function EnhanceScreen({
   const tabs: Array<{ value: EnhancementTab; label: string }> = [
     { value: "general", label: t("常用增强") },
     { value: "dictation", label: t("语音输入") },
+    { value: "webSearch", label: t("Web 搜索") },
     { value: "stepwise", label: t("下一步建议") },
   ];
   const selectTab = (tab: EnhancementTab) => {
@@ -5447,6 +5565,9 @@ function EnhanceScreen({
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-dictation" role="tabpanel" aria-labelledby="enhance-tab-dictation" hidden={activeTab !== "dictation"}>
         <DictationSettingsPanel form={form} onFormChange={onFormChange} />
+      </div>
+      <div className="enhance-tab-panel" id="enhance-pane-webSearch" role="tabpanel" aria-labelledby="enhance-tab-webSearch" hidden={activeTab !== "webSearch"}>
+        <WebSearchSettingsPanel form={form} onFormChange={onFormChange} />
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-stepwise" role="tabpanel" aria-labelledby="enhance-tab-stepwise" hidden={activeTab !== "stepwise"}>
         <StepwiseSettingsPanel form={form} onFormChange={onFormChange} actions={actions} />
@@ -12280,6 +12401,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ...normalizeWhaleBalanceSettings(settings),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
+    webSearch: normalizeWebSearchSettings(settings.webSearch),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
@@ -12304,6 +12426,12 @@ function dictationSettingsValidationMessage(issue: DictationSettingsIssue | null
   if (issue === "baseUrl") return t("语音 Base URL 必须是 HTTP(S) 基础地址，不能包含账号密码、查询参数或片段。");
   if (issue === "model") return t("启用语音输入时需要填写语音模型。");
   if (issue === "apiKeyEnv") return t("语音 API Key 环境变量名称只能包含字母、数字和下划线，且不能以数字开头。");
+  return null;
+}
+
+function webSearchSettingsValidationMessage(issue: WebSearchSettingsIssue | null): string | null {
+  if (issue === "apiKey") return t("启用 Web 搜索时需要填写 API Key 或环境变量名称。");
+  if (issue === "apiKeyEnv") return t("Web 搜索 API Key 环境变量名称只能包含字母、数字和下划线，且不能以数字开头。");
   return null;
 }
 

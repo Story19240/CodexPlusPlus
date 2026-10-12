@@ -6,11 +6,11 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -31,6 +31,9 @@ const BRIDGE_REINJECT_BACKOFF_CAP_SECS: u64 = 300;
 /// 若一见健康就清零，退避会永远停在第一档、根本挡不住周期性重注入（issue #2330）。
 /// 必须持续健康满这么久才清零。
 const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
+const WEB_SEARCH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const WEB_SEARCH_FOLLOWUP_BODY_LIMIT: usize = 32 * 1024 * 1024;
+const WEB_SEARCH_KEEPALIVE: &[u8] = b": codex-plus-web-search-keepalive\n\n";
 
 /// 看门狗内跟踪重注入退避状态；持续健康一段时间或应用实例更换时重置。
 #[derive(Debug, Default)]
@@ -1963,6 +1966,40 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
+    if let Some(web_search_context) = upstream.web_search_context.take() {
+        let failure = forward_web_search_protocol_proxy_stream(
+            stream,
+            &mut upstream,
+            web_search_context,
+            session_headers,
+        )
+        .await?;
+        if let Some(reason) = failure {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.protocol_proxy_stream_failed",
+                serde_json::json!({
+                    "method": method,
+                    "path": path,
+                    "status": "200 OK",
+                    "stream_outcome": "failed",
+                    "wireApi": crate::protocol_proxy::UpstreamWireApi::ChatCompletions,
+                    "webSearch": true,
+                    "error": reason,
+                    "remote_addr": remote_addr_text
+                }),
+            );
+        } else {
+            log_helper_response(
+                "helper.protocol_proxy_stream_ok",
+                method,
+                path,
+                "200 OK",
+                remote_addr_text,
+            );
+        }
+        stream.shutdown().await?;
+        return Ok(());
+    }
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.compaction {
@@ -1993,6 +2030,21 @@ async fn handle_protocol_proxy_connection(
             stream.write_all(&payload).await?;
             log_helper_response(
                 "helper.protocol_proxy_compaction_ok",
+                method,
+                path,
+                "200 OK",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+        // Web 搜索编排会先读完第一轮 Chat 流再判断是否出现工具调用。
+        // 没有工具调用时，protocol_proxy 已经把完整 Responses SSE 放进缓冲；
+        // 这里必须直接下发，不能再要求一个仍可流式读取的 reqwest response。
+        if upstream.buffered_body.is_some() {
+            forward_buffered_protocol_proxy_stream(stream, &mut upstream).await?;
+            log_helper_response(
+                "helper.protocol_proxy_stream_ok",
                 method,
                 path,
                 "200 OK",
@@ -2583,6 +2635,380 @@ async fn forward_protocol_proxy_stream(
     }
     stream.write_all(&converter.finish()).await?;
     Ok(None)
+}
+
+async fn wait_with_web_search_keepalive<T>(
+    stream: &mut tokio::net::TcpStream,
+    future: impl Future<Output = T>,
+) -> anyhow::Result<T> {
+    wait_with_keepalive(stream, future, WEB_SEARCH_KEEPALIVE_INTERVAL).await
+}
+
+async fn wait_with_keepalive<T>(
+    stream: &mut tokio::net::TcpStream,
+    future: impl Future<Output = T>,
+    interval: Duration,
+) -> anyhow::Result<T> {
+    let mut future = Box::pin(future);
+    let sleep = tokio::time::sleep(interval);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            _ = &mut sleep => {
+                stream.write_all(WEB_SEARCH_KEEPALIVE).await?;
+                sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + interval);
+            }
+        }
+    }
+}
+
+async fn forward_web_search_chat_stream<S, T, E>(
+    stream: &mut tokio::net::TcpStream,
+    converter: &mut crate::protocol_proxy::ChatSseToResponsesConverter,
+    mut chunks: S,
+) -> anyhow::Result<Option<String>>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    T: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let sleep = tokio::time::sleep(WEB_SEARCH_KEEPALIVE_INTERVAL);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            chunk = chunks.next() => {
+                match chunk {
+                    Some(Ok(bytes)) => {
+                        let output = converter.push_bytes(bytes.as_ref());
+                        stream.write_all(&output).await?;
+                        if converter.has_failed() {
+                            return Ok(Some("上游返回错误事件".to_string()));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let failed = converter.fail(
+                            format!("上游响应流读取失败: {error}"),
+                            Some("stream_error".to_string()),
+                        );
+                        stream.write_all(&failed).await?;
+                        return Ok(Some(error.to_string()));
+                    }
+                    None => return Ok(None),
+                }
+            }
+            _ = &mut sleep => {
+                stream.write_all(WEB_SEARCH_KEEPALIVE).await?;
+                sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + WEB_SEARCH_KEEPALIVE_INTERVAL);
+            }
+        }
+    }
+}
+
+async fn forward_web_search_protocol_proxy_stream(
+    stream: &mut tokio::net::TcpStream,
+    upstream: &mut crate::protocol_proxy::UpstreamProxyResponse,
+    context: crate::protocol_proxy::WebSearchExecutionContext,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
+) -> anyhow::Result<Option<String>> {
+    write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+    let mut converter =
+        crate::protocol_proxy::ChatSseToResponsesConverter::with_web_search_orchestration(
+            &context.original_request,
+        );
+    let first_response = upstream.take_response()?;
+    if let Some(reason) =
+        forward_web_search_chat_stream(stream, &mut converter, first_response.bytes_stream())
+            .await?
+    {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.failed",
+            serde_json::json!({ "stage": "first_response" }),
+        );
+        return Ok(Some(reason));
+    }
+    if !converter.saw_done() {
+        let failed = converter.fail(
+            "上游在完成事件前结束了响应流".to_string(),
+            Some("stream_incomplete".to_string()),
+        );
+        stream.write_all(&failed).await?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.failed",
+            serde_json::json!({
+                "stage": "first_response",
+                "reasonKind": "stream_incomplete"
+            }),
+        );
+        return Ok(Some("上游缺少完成事件".to_string()));
+    }
+    // 第一轮上游已读完，必须先释放通道 permit，避免二段请求等待自己。
+    drop(upstream._channel_permit.take());
+
+    let pause_output = converter.pause_for_web_search();
+    stream.write_all(&pause_output).await?;
+    let first_parsed = converter.parsed_chat_response();
+    let first_response_id = first_parsed.id.clone();
+    if first_parsed.finish_reason.is_none() {
+        let failed = converter.fail(
+            "上游响应缺少 finish_reason".to_string(),
+            Some("stream_incomplete".to_string()),
+        );
+        stream.write_all(&failed).await?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.failed",
+            serde_json::json!({
+                "stage": "first_response",
+                "reasonKind": "missing_finish_reason"
+            }),
+        );
+        return Ok(Some("第一轮响应缺少 finish_reason".to_string()));
+    }
+    let search_calls = match first_parsed.web_search_calls() {
+        Ok(calls) => calls,
+        Err(error) => {
+            let failed = converter.fail(
+                error.to_string(),
+                Some("web_search_call_invalid".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({
+                    "stage": "parse_first_response",
+                    "argumentsValid": false
+                }),
+            );
+            return Ok(Some(error.to_string()));
+        }
+    };
+
+    if search_calls.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.no_call_passthrough",
+            serde_json::json!({ "callCount": 0 }),
+        );
+        let completed = converter.finish();
+        stream.write_all(&completed).await?;
+        return Ok(None);
+    }
+
+    let query_lengths = search_calls
+        .iter()
+        .map(|call| call.query.chars().count())
+        .collect::<Vec<_>>();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.call_detected",
+        serde_json::json!({
+            "callCount": search_calls.len(),
+            "argumentsValid": true,
+            "queryLengths": query_lengths
+        }),
+    );
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.call_count",
+        serde_json::json!({ "callCount": search_calls.len() }),
+    );
+
+    let search_outputs = match wait_with_web_search_keepalive(
+        stream,
+        crate::web_search::execute_web_search_calls_at(
+            &context.settings.web_search,
+            &search_calls,
+            context.search_endpoint.as_deref(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(outputs)) => outputs,
+        Ok(Err(error)) => {
+            let failed = converter.fail_web_search_calls(
+                error.to_string(),
+                Some("web_search_provider_failed".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({ "stage": "provider" }),
+            );
+            return Ok(Some(error.to_string()));
+        }
+        Err(error) => return Err(error),
+    };
+    let completed_calls = converter.complete_web_search_calls();
+    stream.write_all(&completed_calls).await?;
+
+    let followup_request = match crate::web_search::build_web_search_followup_request(
+        &context.chat_request,
+        &first_parsed,
+        &search_outputs,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            let failed = converter.fail(
+                error.to_string(),
+                Some("web_search_followup_invalid".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({ "stage": "build_followup" }),
+            );
+            return Ok(Some(error.to_string()));
+        }
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.followup_request",
+        serde_json::json!({
+            "messageCount": followup_request
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            "toolCount": followup_request
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            "stream": true
+        }),
+    );
+
+    let mut followup = match wait_with_web_search_keepalive(
+        stream,
+        crate::protocol_proxy::send_web_search_followup_request(
+            &context,
+            &followup_request,
+            session_headers,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let failed = converter.fail(
+                format!("Web 搜索后的模型请求失败: {error}"),
+                Some("web_search_followup_failed".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({ "stage": "followup" }),
+            );
+            return Ok(Some(error.to_string()));
+        }
+        Err(error) => return Err(error),
+    };
+    if !followup.is_success() {
+        let status_code = followup.status_code;
+        let mut response = followup.take_response()?;
+        let _ = crate::protocol_proxy::read_limited_upstream_body(
+            &mut response,
+            WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+        )
+        .await?;
+        let failed = converter.fail(
+            format!("Web 搜索后的模型请求返回 HTTP {status_code}"),
+            Some("web_search_followup_failed".to_string()),
+        );
+        stream.write_all(&failed).await?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.failed",
+            serde_json::json!({
+                "stage": "followup",
+                "statusCode": status_code
+            }),
+        );
+        return Ok(Some(format!("HTTP {status_code}")));
+    }
+
+    converter.resume_after_web_search(&first_response_id);
+    if followup.is_stream {
+        let response = followup.take_response()?;
+        if let Some(reason) =
+            forward_web_search_chat_stream(stream, &mut converter, response.bytes_stream())
+                .await?
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({ "stage": "followup_response" }),
+            );
+            return Ok(Some(reason));
+        }
+        if !converter.saw_done() {
+            let failed = converter.fail(
+                "Web 搜索后的模型响应在完成事件前结束".to_string(),
+                Some("stream_incomplete".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({
+                    "stage": "followup_response",
+                    "reasonKind": "stream_incomplete"
+                }),
+            );
+            return Ok(Some("二段响应缺少完成事件".to_string()));
+        }
+        if converter.parsed_chat_response().finish_reason.is_none() {
+            let failed = converter.fail(
+                "Web 搜索后的模型响应缺少 finish_reason".to_string(),
+                Some("stream_incomplete".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({
+                    "stage": "followup_response",
+                    "reasonKind": "missing_finish_reason"
+                }),
+            );
+            return Ok(Some("二段响应缺少 finish_reason".to_string()));
+        }
+    } else {
+        let mut response = followup.take_response()?;
+        let body = crate::protocol_proxy::read_limited_upstream_body(
+            &mut response,
+            WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+        )
+        .await?;
+        let parsed =
+            match crate::web_search::parse_chat_response(&body, &followup.content_type) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let failed = converter.fail(
+                        error.to_string(),
+                        Some("web_search_followup_invalid".to_string()),
+                    );
+                    stream.write_all(&failed).await?;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.failed",
+                        serde_json::json!({ "stage": "parse_followup" }),
+                    );
+                    return Ok(Some(error.to_string()));
+                }
+            };
+        let output = converter.push_parsed_chat_response(&parsed);
+        stream.write_all(&output).await?;
+    }
+
+    let completed = converter.finish();
+    stream.write_all(&completed).await?;
+    Ok(None)
+}
+
+async fn forward_buffered_protocol_proxy_stream(
+    stream: &mut tokio::net::TcpStream,
+    upstream: &mut crate::protocol_proxy::UpstreamProxyResponse,
+) -> anyhow::Result<()> {
+    let body = upstream.read_body().await?;
+    write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+    stream.write_all(&body).await?;
+    Ok(())
 }
 
 fn log_helper_response(
@@ -5025,8 +5451,13 @@ mod tests {
 
 #[cfg(test)]
 mod proxy_stream_tests {
-    use super::forward_protocol_proxy_stream;
-    use crate::protocol_proxy::UpstreamWireApi;
+    use super::{
+        forward_buffered_protocol_proxy_stream, forward_protocol_proxy_stream,
+        forward_web_search_protocol_proxy_stream, wait_with_keepalive,
+    };
+    use crate::protocol_proxy::{
+        ProxySessionHeaders, UpstreamProxyResponse, UpstreamWireApi, WebSearchExecutionContext,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
@@ -5076,6 +5507,256 @@ mod proxy_stream_tests {
                 assert!(output.contains("event: response.failed"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_web_search_response_is_sent_without_live_response() {
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_vec()),
+            response: None,
+            web_search_context: None,
+            _channel_permit: None,
+        };
+
+        let forwarded = tokio::spawn(async move {
+            forward_buffered_protocol_proxy_stream(&mut writer, &mut upstream)
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/event-stream; charset=utf-8"));
+        assert!(response.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn web_search_live_stream_preserves_reasoning_and_merges_followup() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let first_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&first_model_server)
+            .await;
+
+        let followup_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&followup_model_server)
+            .await;
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", first_model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", followup_model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let channel_key = crate::channel_protection::key_for_relay(&relay);
+        let first_permit = crate::channel_protection::acquire(&channel_key, &relay).await;
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+            _channel_permit: Some(first_permit),
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("{}/v1/chat/completions", followup_model_server.uri()),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "web_search", "parameters": { "type": "object" } }
+                }]
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "hi",
+                "stream": true,
+                "tools": [{ "type": "web_search" }]
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: Some(format!("{}/search", search_server.uri())),
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                failure.is_none(),
+                "web search stream failed: {failure:?}"
+            );
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(response.matches("event: response.created").count(), 1);
+        assert_eq!(response.matches("event: response.completed").count(), 1);
+        assert!(!response.contains("response.custom_tool_call_input.delta"));
+        let reasoning_at = response.find("first thought").unwrap();
+        let search_at = response
+            .find("web_search_call")
+            .unwrap_or_else(|| panic!("missing web_search_call in response: {response}"));
+        let answer_at = response
+            .find("final answer")
+            .unwrap_or_else(|| panic!("missing followup answer in response: {response}"));
+        let completed_at = response.find("event: response.completed").unwrap();
+        assert!(reasoning_at < search_at);
+        assert!(search_at < answer_at);
+        assert!(answer_at < completed_at);
+
+        let followup_request = followup_model_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let followup_body: serde_json::Value =
+            serde_json::from_slice(&followup_request.body).unwrap();
+        assert_eq!(followup_body["stream"], true);
+        assert!(followup_body.get("tools").is_none());
+        assert!(followup_body.get("tool_choice").is_none());
+        let messages = followup_body["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_search");
+
+        let search_request = search_server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let search_body: serde_json::Value =
+            serde_json::from_slice(&search_request.body).unwrap();
+        assert_eq!(search_body["query"], "Codex");
+    }
+
+    #[tokio::test]
+    async fn web_search_wait_writes_keepalive_comments_while_pending() {
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let waited = tokio::spawn(async move {
+            let value = wait_with_keepalive(
+                &mut writer,
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    7
+                },
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(value, 7);
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        waited.await.unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(": codex-plus-web-search-keepalive\n\n"));
+        assert!(output.matches(": codex-plus-web-search-keepalive\n\n").count() >= 1);
     }
 
     #[tokio::test]
