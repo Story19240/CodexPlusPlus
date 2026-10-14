@@ -1725,10 +1725,18 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
     }
 
     let mut exit_grace = MultiWorkerExitGrace::default();
-    while exit_grace.keep_waiting(
-        codex_plus_core::cdp::endpoint_available(options.debug_port),
-        std::time::Instant::now(),
-    ) {
+    loop {
+        let cdp_available = codex_plus_core::cdp::endpoint_available(options.debug_port);
+        // Windows 打包版的 DevTools 端口可能长期拒连，但实例主进程仍在运行。
+        // 这里必须以进程命令行里的调试端口为准，不能把 CDP 探测当作生命体征。
+        let process_alive = !cdp_available
+            && !codex_plus_core::watcher::find_codex_processes_for_debug_port(
+                options.debug_port,
+            )
+            .is_empty();
+        if !exit_grace.keep_waiting(process_alive, cdp_available, std::time::Instant::now()) {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     codex_plus_launcher::shutdown()
@@ -1765,8 +1773,13 @@ struct MultiWorkerExitGrace {
 }
 
 impl MultiWorkerExitGrace {
-    fn keep_waiting(&mut self, cdp_available: bool, now: std::time::Instant) -> bool {
-        if cdp_available {
+    fn keep_waiting(
+        &mut self,
+        process_alive: bool,
+        cdp_available: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        if process_alive || cdp_available {
             self.missing_since = None;
             self.missed_probes = 0;
             return true;
@@ -7930,11 +7943,25 @@ mod tests {
         let now = std::time::Instant::now();
         let mut grace = MultiWorkerExitGrace::default();
 
-        assert!(grace.keep_waiting(true, now));
-        assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(1)));
-        assert!(grace.keep_waiting(true, now + std::time::Duration::from_secs(2)));
-        assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(3)));
-        assert!(grace.keep_waiting(true, now + std::time::Duration::from_secs(4)));
+        assert!(grace.keep_waiting(false, true, now));
+        assert!(grace.keep_waiting(false, false, now + std::time::Duration::from_secs(1)));
+        assert!(grace.keep_waiting(false, true, now + std::time::Duration::from_secs(2)));
+        assert!(grace.keep_waiting(false, false, now + std::time::Duration::from_secs(3)));
+        assert!(grace.keep_waiting(false, true, now + std::time::Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn multi_worker_exit_grace_keeps_helper_alive_while_owned_process_is_alive() {
+        let now = std::time::Instant::now();
+        let mut grace = MultiWorkerExitGrace::default();
+
+        for second in 0..=30 {
+            assert!(grace.keep_waiting(
+                true,
+                false,
+                now + std::time::Duration::from_secs(second)
+            ));
+        }
     }
 
     #[test]
@@ -7943,9 +7970,17 @@ mod tests {
         let mut grace = MultiWorkerExitGrace::default();
 
         for second in 0..=9 {
-            assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(second)));
+            assert!(grace.keep_waiting(
+                false,
+                false,
+                now + std::time::Duration::from_secs(second)
+            ));
         }
-        assert!(!grace.keep_waiting(false, now + std::time::Duration::from_secs(10)));
+        assert!(!grace.keep_waiting(
+            false,
+            false,
+            now + std::time::Duration::from_secs(10)
+        ));
     }
 
     #[test]
