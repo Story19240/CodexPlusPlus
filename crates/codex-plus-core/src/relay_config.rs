@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::settings::{
-    BackendSettings, RelayMode, RelayProfile, RelayProtocol, RelaySessionProvider,
+    BackendSettings, RelayMode, RelayProfile, RelayProtocol, RelaySessionProvider, SettingsStore,
 };
 
 const RELAY_PROVIDER: &str = "custom";
@@ -873,27 +873,34 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
     })
 }
 
-/// 官方登录的接入地址。官方 profile 的 `configContents` 在管理端归一化时会被清空
-/// （App.tsx 里 `relayMode === "official"` 分支写空串），于是 `relay_profile_base_url`
-/// 返回空串、被下面的空值校验直接拒绝 —— 而官方模式下界面根本没有 base_url 输入框，
-/// 用户无处可填（issue #1488）。这里给官方模式兜一个内置地址。
-const OFFICIAL_LOGIN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-
 pub async fn test_relay_profile(
     profile: &RelayProfile,
     model: &str,
 ) -> anyhow::Result<RelayProfileTestResult> {
+    // 官方 profile 的 `configContents` 在管理端归一化时会被清空
+    // （App.tsx 里 `relayMode === "official"` 分支写空串），于是 `relay_profile_base_url`
+    // 返回空串、被下面的空值校验直接拒绝 —— 而官方模式下界面根本没有 base_url 输入框，
+    // 用户无处可填（issue #1488）。这里给官方模式兜一个内置地址。
     let mut base_url = relay_profile_base_url(profile);
     if base_url.trim().is_empty()
         && profile.relay_mode == crate::settings::RelayMode::Official
     {
-        base_url = OFFICIAL_LOGIN_BASE_URL.to_string();
+        base_url = crate::official_login::official_base_url();
     }
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         anyhow::bail!("Base URL 不能为空");
     }
-    let api_key = relay_profile_api_key(profile);
+    // 纯官方登录 profile 没有 API Key，测试请求同样要带该账号的 OAuth access token。
+    let api_key = if crate::official_login::is_official_login_profile(profile)
+        && crate::official_login::official_login_available(profile)
+    {
+        crate::official_login::resolve_official_credential(profile, false)
+            .await?
+            .access_token
+    } else {
+        relay_profile_api_key(profile)
+    };
     let api_key = api_key.trim();
     if api_key.is_empty() && !profile.uses_no_auth() {
         anyhow::bail!("API Key 不能为空");
@@ -2869,6 +2876,27 @@ fn apply_model_catalog_to_config_with_live_policy(
         sanitize_catalog_filename(&profile.id)
     );
     let mut config_text = config_text.to_string();
+    if let Some(catalog_json) = crate::aggregate_catalog::build_catalog_for_profile(profile)? {
+        let catalog_path = home.join(&catalog_relative);
+        if let Some(parent) = catalog_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
+        let mut doc = parse_toml_document(&config_text)?;
+        if root_key_string(&config_text, "model").is_none()
+            && let Ok(catalog) = serde_json::from_str::<Value>(&catalog_json)
+            && let Some(default_model) = catalog
+                .get("models")
+                .and_then(Value::as_array)
+                .and_then(|models| models.first())
+                .and_then(|model| model.get("slug"))
+                .and_then(Value::as_str)
+        {
+            doc["model"] = toml_edit::value(default_model);
+        }
+        doc["model_catalog_json"] = toml_edit::value(catalog_relative);
+        return Ok(normalize_optional_toml(doc));
+    }
     let mut model_windows = parse_model_string_map(&profile.model_windows, "model_windows")?;
     validate_model_windows(&model_windows)?;
     let model_list = if profile.model_list.contains('[') {
@@ -2927,7 +2955,7 @@ fn apply_model_catalog_to_config_with_live_policy(
         parse_optional_positive_u64(&profile.auto_compact_limit, "压缩上下文大小")?;
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）。
     // Codex++ 管理的 catalog 必须随当前 profile 切换；否则前一个供应商的模型列表会残留。
-    // cc-switch 的固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
+    // 该固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
     // 切换到 Codex++ profile 时应接管，否则旧 catalog 会继续覆盖本 profile 的模型元数据。
     if let Some(existing) = root_key_string(&config_text, "model_catalog_json") {
         if existing != catalog_relative {
@@ -3102,7 +3130,7 @@ fn validate_model_auto_compact(model_auto_compact: &HashMap<String, String>) -> 
     Ok(())
 }
 
-fn parse_model_metadata_map(metadata_json: &str) -> anyhow::Result<serde_json::Map<String, Value>> {
+pub(crate) fn parse_model_metadata_map(metadata_json: &str) -> anyhow::Result<serde_json::Map<String, Value>> {
     if metadata_json.trim().is_empty() {
         return Ok(serde_json::Map::new());
     }
@@ -3341,7 +3369,7 @@ mod managed_catalog_predicate_tests {
     }
 }
 
-fn apply_model_metadata_overrides(
+pub(crate) fn apply_model_metadata_overrides(
     catalog_json: &str,
     override_map: &serde_json::Map<String, Value>,
 ) -> anyhow::Result<String> {
@@ -4398,7 +4426,20 @@ fn complete_relay_profile_config_with_proxy_port(
     proxy_port: u16,
 ) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(&profile.config_contents)?;
-    let session_provider_id = active_session_provider_id(&doc);
+    let session_provider_id = if profile.relay_mode == RelayMode::Aggregate {
+        SettingsStore::default()
+            .load()
+            .ok()
+            .and_then(|settings| {
+                settings
+                    .active_aggregate_relay_profile()
+                    .filter(|aggregate| aggregate.model_aggregation_enabled)
+            })
+            .map(|aggregate| aggregate.session_provider.as_str().to_string())
+            .unwrap_or_else(|| active_session_provider_id(&doc))
+    } else {
+        active_session_provider_id(&doc)
+    };
     let uses_openai_provider = session_provider_id == "openai";
     if uses_openai_provider && profile.protocol != RelayProtocol::Responses {
         anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
