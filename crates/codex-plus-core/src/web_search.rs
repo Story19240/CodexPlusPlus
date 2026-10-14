@@ -46,13 +46,30 @@ impl ParsedChatResponse {
         let Some(tool_calls) = self.message.get("tool_calls").and_then(Value::as_array) else {
             return Ok(Vec::new());
         };
+        let has_web_search = tool_calls.iter().any(|tool_call| {
+            tool_call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "web_search")
+        });
+        let has_client_tool = tool_calls.iter().any(|tool_call| {
+            tool_call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name != "web_search")
+        });
+        if has_web_search && has_client_tool {
+            bail!("服务端 Web 搜索暂不支持与其它工具在同轮混合调用");
+        }
+        if !has_web_search {
+            // 模型选择 apply_patch、view_image 等客户端工具时，正常把工具调用交还
+            // Codex 执行；这不是 Web Search 编排可以代替的请求。
+            return Ok(Vec::new());
+        }
+
         let mut calls = Vec::new();
         for tool_call in tool_calls {
             let function = tool_call.get("function").unwrap_or(&Value::Null);
-            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-            if name != "web_search" {
-                bail!("服务端 Web 搜索只支持单独的 web_search 工具调用");
-            }
             let call_id = tool_call
                 .get("id")
                 .and_then(Value::as_str)
@@ -685,6 +702,63 @@ mod tests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["query"], "codex release");
         assert_eq!(body["max_results"], 2);
+    }
+
+    #[test]
+    fn web_search_calls_let_client_tools_pass_through() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-client-tool".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_client",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": "{\"input\":\"patch\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+
+        assert!(parsed.web_search_calls().unwrap().is_empty());
+    }
+
+    #[test]
+    fn web_search_calls_reject_mixed_client_and_server_tools() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-mixed-tools".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\":\"Codex\"}"
+                        }
+                    },
+                    {
+                        "id": "call_client",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"patch\"}"
+                        }
+                    }
+                ]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+
+        let error = parsed.web_search_calls().unwrap_err();
+        assert!(error.to_string().contains("暂不支持与其它工具在同轮混合调用"));
     }
 
     #[test]

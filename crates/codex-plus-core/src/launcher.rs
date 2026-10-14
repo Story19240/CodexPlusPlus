@@ -6281,6 +6281,130 @@ mod proxy_stream_tests {
     }
 
     #[tokio::test]
+    async fn web_search_live_stream_passes_client_tool_calls_through() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-client-tool\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"need a patch\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_patch\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"patch\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&model_server)
+            .await;
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("{}/v1/chat/completions", model_server.uri()),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": true,
+                "tools": [
+                    { "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } },
+                    { "type": "function", "function": { "name": "apply_patch", "parameters": { "type": "object" } } }
+                ]
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "hi",
+                "stream": true,
+                "tools": [
+                    { "type": "web_search" },
+                    { "type": "custom", "name": "apply_patch" }
+                ]
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: None,
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                failure.is_none(),
+                "client tool stream failed: {failure:?}"
+            );
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("need a patch"));
+        assert!(response.contains("apply_patch"));
+        assert_eq!(response.matches("event: response.completed").count(), 1);
+        assert!(!response.contains("event: response.failed"));
+        assert!(!response.contains("web_search_call"));
+
+        // 客户端工具必须交还 Codex 执行，不能在这里发起二段模型请求。
+        assert!(model_server.received_requests().await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
     async fn web_search_wait_writes_keepalive_comments_while_pending() {
         let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
