@@ -1724,7 +1724,11 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    while codex_plus_core::cdp::endpoint_available(options.debug_port) {
+    let mut exit_grace = MultiWorkerExitGrace::default();
+    while exit_grace.keep_waiting(
+        codex_plus_core::cdp::endpoint_available(options.debug_port),
+        std::time::Instant::now(),
+    ) {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     codex_plus_launcher::shutdown()
@@ -1748,6 +1752,32 @@ pub fn wait_for_multi_instance_ready(debug_port: u16, timeout: std::time::Durati
 }
 
 pub const MULTI_LAUNCH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 多开 worker 的 CDP 探测宽限。
+///
+/// Windows 打包版启动后，`/json` 可能在监听重建或进程换代时瞬断。这里一旦退出就会
+/// shutdown helper，而实例 config.toml 里的本地协议代理地址将失去对端。因此退出
+/// 必须要求连续多次失败，或持续失败超过 10 秒。
+#[derive(Default)]
+struct MultiWorkerExitGrace {
+    missing_since: Option<std::time::Instant>,
+    missed_probes: u32,
+}
+
+impl MultiWorkerExitGrace {
+    fn keep_waiting(&mut self, cdp_available: bool, now: std::time::Instant) -> bool {
+        if cdp_available {
+            self.missing_since = None;
+            self.missed_probes = 0;
+            return true;
+        }
+
+        self.missed_probes = self.missed_probes.saturating_add(1);
+        let missing_since = *self.missing_since.get_or_insert(now);
+        self.missed_probes < 3
+            || now.saturating_duration_since(missing_since) < std::time::Duration::from_secs(10)
+    }
+}
 
 fn multi_instance_codex_pid(debug_port: u16) -> Option<u32> {
     codex_plus_core::watcher::find_codex_processes_for_debug_port(debug_port)
@@ -7893,6 +7923,29 @@ mod tests {
         GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn multi_worker_exit_grace_survives_transient_cdp_probe_misses() {
+        let now = std::time::Instant::now();
+        let mut grace = MultiWorkerExitGrace::default();
+
+        assert!(grace.keep_waiting(true, now));
+        assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(1)));
+        assert!(grace.keep_waiting(true, now + std::time::Duration::from_secs(2)));
+        assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(3)));
+        assert!(grace.keep_waiting(true, now + std::time::Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn multi_worker_exit_grace_still_stops_after_sustained_cdp_failures() {
+        let now = std::time::Instant::now();
+        let mut grace = MultiWorkerExitGrace::default();
+
+        for second in 0..=9 {
+            assert!(grace.keep_waiting(false, now + std::time::Duration::from_secs(second)));
+        }
+        assert!(!grace.keep_waiting(false, now + std::time::Duration::from_secs(10)));
     }
 
     #[test]
