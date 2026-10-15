@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use crate::settings::{WebSearchProvider, WebSearchSettings};
 
@@ -11,6 +14,7 @@ const EXA_SEARCH_ENDPOINT: &str = "https://api.exa.ai/search";
 const TAVILY_SEARCH_ENDPOINT: &str = "https://api.tavily.com/search";
 pub const MAX_WEB_SEARCH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESULT_TEXT_CHARS: usize = 2000;
+const MAX_CONCURRENT_WEB_SEARCH_CALLS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSearchResult {
@@ -212,17 +216,37 @@ pub(crate) async fn execute_web_search_calls_at(
     calls: &[WebSearchToolCall],
     search_endpoint: Option<&str>,
 ) -> anyhow::Result<Vec<WebSearchToolOutput>> {
-    let mut outputs = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_WEB_SEARCH_CALLS));
+    let mut searches = Vec::with_capacity(calls.len());
     for call in calls {
-        let results = match search_endpoint {
-            Some(endpoint) => execute_web_search_at(settings, &call.query, endpoint).await,
-            None => execute_web_search(settings, &call.query).await,
-        }
-        .with_context(|| format!("web_search 调用 {} 执行失败", call.call_id))?;
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("获取 Web 搜索并发额度失败")?;
+        searches.push(async move {
+            let _permit = permit;
+            let results = match search_endpoint {
+                Some(endpoint) => execute_web_search_at(settings, &call.query, endpoint).await,
+                None => execute_web_search(settings, &call.query).await,
+            };
+            (call, results)
+        });
+    }
+
+    let mut outputs = Vec::with_capacity(calls.len());
+    for (call, result) in join_all(searches).await {
+        let content = match result {
+            Ok(results) => format_search_results(&call.query, &results),
+            Err(error) => format!(
+                "Web search failed for query: {}\nError: {error:#}",
+                call.query
+            ),
+        };
         outputs.push(WebSearchToolOutput {
             call_id: call.call_id.clone(),
             query: call.query.clone(),
-            content: format_search_results(&call.query, &results),
+            content,
         });
     }
     Ok(outputs)
@@ -613,7 +637,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn settings(provider: WebSearchProvider, api_key: &str) -> WebSearchSettings {
@@ -705,6 +729,65 @@ mod tests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["query"], "codex release");
         assert_eq!(body["max_results"], 2);
+    }
+
+    #[tokio::test]
+    async fn web_search_calls_allow_partial_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(body_json(json!({
+                "query": "failing query",
+                "numResults": 2,
+                "contents": { "text": true }
+            })))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": { "message": "provider rate limit" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(body_json(json!({
+                "query": "successful query",
+                "numResults": 2,
+                "contents": { "text": true }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Successful result",
+                    "url": "https://example.com/success",
+                    "text": "Successful content"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let calls = vec![
+            WebSearchToolCall {
+                call_id: "call_failed".to_string(),
+                query: "failing query".to_string(),
+            },
+            WebSearchToolCall {
+                call_id: "call_success".to_string(),
+                query: "successful query".to_string(),
+            },
+        ];
+        let outputs = execute_web_search_calls_at(
+            &settings(WebSearchProvider::Exa, "exa-key"),
+            &calls,
+            Some(&format!("{}/search", server.uri())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].call_id, "call_failed");
+        assert!(outputs[0].content.contains("Web search failed for query: failing query"));
+        assert!(outputs[0].content.contains("provider rate limit"));
+        assert_eq!(outputs[1].call_id, "call_success");
+        assert!(outputs[1].content.contains("Successful result"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[test]
