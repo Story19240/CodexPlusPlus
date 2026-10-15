@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,12 +9,37 @@ import { test } from "node:test";
 const source = await readFile(new URL("../../../scripts/installer/macos/package-dmg.sh", import.meta.url), "utf8");
 const start = source.indexOf('DMG_WORK_DIR="$(mktemp');
 assert.ok(start >= 0, "the real DMG lifecycle must be exercised");
-const bash = process.platform === "win32"
-  ? spawnSync("where.exe", ["bash.exe"], { encoding: "utf8" }).stdout
-      .split(/\r?\n/)
-      .find((path) => /\\Git\\(?:usr\\)?bin\\bash\.exe$/i.test(path))
-      ?? join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe")
-  : "/bin/bash";
+
+function resolveBashPath(): string {
+  if (process.platform !== "win32") {
+    return "/bin/bash";
+  }
+  const whereBash = spawnSync("where.exe", ["bash.exe"], { encoding: "utf8" }).stdout || "";
+  const found = whereBash
+    .split(/\r?\n/)
+    .find((path) => /\\Git\\(?:usr\\)?bin\\bash\.exe$/i.test(path));
+  if (found && existsSync(found)) return found;
+
+  const whereGit = spawnSync("where.exe", ["git.exe"], { encoding: "utf8" }).stdout || "";
+  for (const line of whereGit.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const gitDir = resolve(dirname(trimmed), "..");
+    for (const sub of [join("bin", "bash.exe"), join("usr", "bin", "bash.exe")]) {
+      const candidate = join(gitDir, sub);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  const defaultGit = join(process.env.ProgramFiles || "C:\\Program Files", "Git", "bin", "bash.exe");
+  if (existsSync(defaultGit)) return defaultGit;
+
+  return "bash";
+}
+
+const bash = resolveBashPath();
+const bashAvailable = process.platform !== "win32" || existsSync(bash);
+const bashTest = bashAvailable ? test : test.skip;
 
 // Run the actual packaging tail with synthetic disk commands, never real mounts.
 const fixture = `
@@ -108,7 +134,7 @@ async function runScenario(scenario: string) {
 }
 
 for (const scenario of ["success", "retry-convert", "late-convert", "delayed-output", "delayed", "already-gone", "force-only"]) {
-  test(`DMG packaging succeeds after ${scenario}`, async () => {
+  bashTest(`DMG packaging succeeds after ${scenario}`, async () => {
     const result = await runScenario(scenario);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /out\/final\.dmg/);
@@ -137,7 +163,7 @@ for (const scenario of ["success", "retry-convert", "late-convert", "delayed-out
 }
 
 for (const scenario of ["no-device", "no-volume"]) {
-  test(`DMG packaging cleans up failed attach parsing: ${scenario}`, async () => {
+  bashTest(`DMG packaging cleans up failed attach parsing: ${scenario}`, async () => {
     const result = await runScenario(scenario);
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /failed to find mounted DMG device and volume/);
@@ -152,7 +178,7 @@ for (const scenario of ["no-device", "no-volume"]) {
 }
 
 for (const scenario of ["fail-convert", "missing-output", "empty-output"]) {
-  test(`DMG packaging rejects ${scenario} instead of reporting create success`, async () => {
+  bashTest(`DMG packaging rejects ${scenario} instead of reporting create success`, async () => {
     const result = await runScenario(scenario);
     assert.equal(result.status, 1, result.stderr);
     if (scenario === "fail-convert") {
@@ -167,7 +193,7 @@ for (const scenario of ["fail-convert", "missing-output", "empty-output"]) {
 }
 
 for (const scenario of ["busy", "info-error"]) {
-  test(`DMG packaging refuses conversion when detach is ${scenario}`, async () => {
+  bashTest(`DMG packaging refuses conversion when detach is ${scenario}`, async () => {
     const result = await runScenario(scenario);
     assert.equal(result.status, 1, result.stderr);
     assert.doesNotMatch(result.trace, /^convert /m);

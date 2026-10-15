@@ -219,16 +219,18 @@ pub(crate) async fn execute_web_search_calls_at(
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_WEB_SEARCH_CALLS));
     let mut searches = Vec::with_capacity(calls.len());
     for call in calls {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .context("获取 Web 搜索并发额度失败")?;
+        let semaphore = semaphore.clone();
         searches.push(async move {
-            let _permit = permit;
-            let results = match search_endpoint {
-                Some(endpoint) => execute_web_search_at(settings, &call.query, endpoint).await,
-                None => execute_web_search(settings, &call.query).await,
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .context("获取 Web 搜索并发额度失败");
+            let results = match permit {
+                Ok(_permit) => match search_endpoint {
+                    Some(endpoint) => execute_web_search_at(settings, &call.query, endpoint).await,
+                    None => execute_web_search(settings, &call.query).await,
+                },
+                Err(error) => Err(error),
             };
             (call, results)
         });
@@ -436,21 +438,21 @@ pub fn build_web_search_followup_request(
 ) -> anyhow::Result<Value> {
     let mut request = chat_request.clone();
     // 二段不再暴露服务端搜索工具，避免模型连续发起未编排的搜索调用。
-    let should_remove_tools = if let Some(tools) =
-        request.get_mut("tools").and_then(Value::as_array_mut)
-    {
-        tools.retain(|tool| {
-            tool.pointer("/function/name")
-                .and_then(Value::as_str)
-                != Some("web_search")
-        });
-        tools.is_empty()
-    } else {
-        false
-    };
-    if should_remove_tools
-        && let Some(request_object) = request.as_object_mut()
-    {
+    let should_remove_tools =
+        if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| {
+                let name = tool
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .or_else(|| tool.get("name").and_then(Value::as_str))
+                    .or_else(|| tool.get("type").and_then(Value::as_str));
+                !matches!(name, Some("web_search" | "web_search_preview"))
+            });
+            tools.is_empty()
+        } else {
+            false
+        };
+    if should_remove_tools && let Some(request_object) = request.as_object_mut() {
         request_object.remove("tools");
         request_object.remove("tool_choice");
     }
@@ -485,9 +487,12 @@ pub fn build_web_search_followup_request(
     stream_options["include_usage"] = json!(true);
     request["stream_options"] = stream_options;
     let forced_web_search_choice = request.get("tool_choice").is_some_and(|choice| {
-        choice.as_str() == Some("web_search")
-            || choice.pointer("/function/name").and_then(Value::as_str) == Some("web_search")
-            || choice.get("type").and_then(Value::as_str) == Some("web_search")
+        let name = choice
+            .as_str()
+            .or_else(|| choice.pointer("/function/name").and_then(Value::as_str))
+            .or_else(|| choice.get("name").and_then(Value::as_str))
+            .or_else(|| choice.get("type").and_then(Value::as_str));
+        matches!(name, Some("web_search" | "web_search_preview"))
     });
     if forced_web_search_choice {
         request["tool_choice"] = json!("auto");
@@ -788,7 +793,11 @@ mod tests {
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].call_id, "call_failed");
-        assert!(outputs[0].content.contains("Web search failed for query: failing query"));
+        assert!(
+            outputs[0]
+                .content
+                .contains("Web search failed for query: failing query")
+        );
         assert!(outputs[0].content.contains("provider rate limit"));
         assert_eq!(outputs[1].call_id, "call_success");
         assert!(outputs[1].content.contains("Successful result"));
@@ -849,7 +858,11 @@ mod tests {
         };
 
         let error = parsed.web_search_calls().unwrap_err();
-        assert!(error.to_string().contains("暂不支持与其它工具在同轮混合调用"));
+        assert!(
+            error
+                .to_string()
+                .contains("暂不支持与其它工具在同轮混合调用")
+        );
     }
 
     #[test]
@@ -1000,5 +1013,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(truncated.to_string().contains("完成事件"));
+    }
+
+    #[tokio::test]
+    async fn web_search_calls_supports_more_than_concurrency_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "rust lang",
+                    "url": "https://www.rust-lang.org",
+                    "text": "Empowering everyone to build reliable and efficient software."
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let settings = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "test-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let calls = (0..5)
+            .map(|i| WebSearchToolCall {
+                call_id: format!("call_{i}"),
+                query: format!("rust topic {i}"),
+            })
+            .collect::<Vec<_>>();
+
+        let outputs = execute_web_search_calls_at(
+            &settings,
+            &calls,
+            Some(&format!("{}/search", server.uri())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outputs.len(), 5);
+        for (i, output) in outputs.iter().enumerate() {
+            assert_eq!(output.call_id, format!("call_{i}"));
+            assert!(output.content.contains("https://www.rust-lang.org"));
+        }
     }
 }
