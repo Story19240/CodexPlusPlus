@@ -2893,6 +2893,9 @@ where
                     Some(Ok(bytes)) => {
                         let output = converter.push_bytes(bytes.as_ref());
                         stream.write_all(&output).await?;
+                        sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + WEB_SEARCH_KEEPALIVE_INTERVAL);
                         if converter.has_failed() {
                             return Ok(Some("上游返回错误事件".to_string()));
                         }
@@ -3112,13 +3115,20 @@ async fn forward_web_search_protocol_proxy_stream(
     if !followup.is_success() {
         let status_code = followup.status_code;
         let mut response = followup.take_response()?;
-        let _ = crate::protocol_proxy::read_limited_upstream_body(
+        let body = crate::protocol_proxy::read_limited_upstream_body(
             &mut response,
             WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
         )
         .await?;
+        let upstream_message = crate::protocol_proxy::upstream_error_message(
+            status_code,
+            &followup.content_type,
+            &body,
+        );
+        let failure_message =
+            format!("Web 搜索后的模型请求返回 HTTP {status_code}: {upstream_message}");
         let failed = converter.fail(
-            format!("Web 搜索后的模型请求返回 HTTP {status_code}"),
+            failure_message.clone(),
             Some("web_search_followup_failed".to_string()),
         );
         stream.write_all(&failed).await?;
@@ -3126,10 +3136,11 @@ async fn forward_web_search_protocol_proxy_stream(
             "web_search.failed",
             serde_json::json!({
                 "stage": "followup",
-                "statusCode": status_code
+                "statusCode": status_code,
+                "message": upstream_message
             }),
         );
-        return Ok(Some(format!("HTTP {status_code}")));
+        return Ok(Some(failure_message));
     }
 
     converter.resume_after_web_search(&first_response_id);
@@ -6128,6 +6139,7 @@ mod proxy_stream_tests {
                     "data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\"}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
                     "data: [DONE]\n\n"
                 )
                 .as_bytes()
@@ -6144,6 +6156,7 @@ mod proxy_stream_tests {
                 concat!(
                     "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\n",
                     "data: [DONE]\n\n"
                 )
                 .as_bytes()
@@ -6253,6 +6266,10 @@ mod proxy_stream_tests {
         assert!(reasoning_at < search_at);
         assert!(search_at < answer_at);
         assert!(answer_at < completed_at);
+        assert!(response.contains("\"input_tokens\":17"));
+        assert!(response.contains("\"output_tokens\":7"));
+        assert!(response.contains("\"total_tokens\":24"));
+        assert!(response.contains("\"reasoning_tokens\":7"));
 
         let followup_request = followup_model_server
             .received_requests()
@@ -6266,6 +6283,7 @@ mod proxy_stream_tests {
         assert!(followup_body.get("tools").is_none());
         assert!(followup_body.get("tool_choice").is_none());
         let messages = followup_body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"], "");
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_search");
 

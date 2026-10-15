@@ -385,10 +385,7 @@ fn parse_chat_sse_response(text: &str) -> anyhow::Result<ParsedChatResponse> {
         bail!("Chat 上游在完成事件前结束了响应流");
     }
 
-    let mut message = json!({ "role": "assistant" });
-    if !content.is_empty() {
-        message["content"] = json!(content);
-    }
+    let mut message = json!({ "role": "assistant", "content": content });
     if !reasoning.is_empty() {
         message["reasoning_content"] = json!(reasoning);
     }
@@ -437,7 +434,13 @@ pub fn build_web_search_followup_request(
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .context("Chat 请求缺少 messages，无法追加搜索结果")?;
-    messages.push(first_response.message.clone());
+    let mut first_message = first_response.message.clone();
+    if first_message.get("role").and_then(Value::as_str) == Some("assistant")
+        && matches!(first_message.get("content"), None | Some(Value::Null))
+    {
+        first_message["content"] = json!("");
+    }
+    messages.push(first_message);
     for output in outputs {
         if output.call_id.trim().is_empty() {
             bail!("Web 搜索结果缺少 tool_call_id");
@@ -806,6 +809,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "other_tool");
         let messages = followup["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"], "");
         assert_eq!(
             messages[1]["tool_calls"][0]["function"]["name"],
             "web_search"

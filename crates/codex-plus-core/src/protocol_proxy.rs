@@ -4148,6 +4148,7 @@ struct ChatSseState {
     tools: BTreeMap<usize, ToolCallState>,
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
+    usage_baseline: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
     original_request: Option<Value>,
@@ -4169,6 +4170,7 @@ impl Default for ChatSseState {
             tools: BTreeMap::new(),
             output_items: Vec::new(),
             latest_usage: None,
+            usage_baseline: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             original_request: None,
@@ -4204,7 +4206,11 @@ impl ChatSseState {
         self.ensure_response_started_into(output);
 
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
-            self.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+            let current_usage = chat_usage_to_responses_usage(Some(usage));
+            self.latest_usage = Some(match self.usage_baseline.clone() {
+                Some(base_usage) => merge_responses_usage(&base_usage, &current_usage),
+                None => current_usage,
+            });
         }
 
         let Some(choice) = chunk
@@ -4604,10 +4610,10 @@ impl ChatSseState {
     }
 
     fn parsed_chat_response(&self) -> crate::web_search::ParsedChatResponse {
-        let mut message = json!({ "role": "assistant" });
-        if !self.text.text.is_empty() {
-            message["content"] = json!(self.text.text);
-        }
+        let mut message = json!({
+            "role": "assistant",
+            "content": self.text.text
+        });
         if !self.reasoning.text.is_empty() {
             message["reasoning_content"] = json!(self.reasoning.text);
         }
@@ -4696,7 +4702,8 @@ impl ChatSseState {
         self.inline_think = InlineThinkState::default();
         self.tools.clear();
         self.finish_reason = None;
-        self.latest_usage = None;
+        self.usage_baseline = self.latest_usage.clone();
+        self.latest_usage = self.usage_baseline.clone();
     }
 
     fn finalize_reasoning_into(&mut self, output: &mut String) {
@@ -5108,6 +5115,14 @@ fn upstream_error_parts(
         preview
     };
     (message, None, Some(status_code.to_string()), None)
+}
+
+pub(crate) fn upstream_error_message(
+    status_code: u16,
+    content_type: &str,
+    body: &[u8],
+) -> String {
+    upstream_error_parts(status_code, content_type, body).0
 }
 
 fn truncate_error_preview(input: &str) -> String {
@@ -7546,6 +7561,62 @@ fn default_responses_usage() -> Value {
     })
 }
 
+fn merge_responses_usage(base: &Value, current: &Value) -> Value {
+    let mut merged = current.clone();
+    let usage_sum = |base: &Value, current: &Value, pointer: &str| {
+        base.pointer(pointer).and_then(Value::as_u64).unwrap_or(0)
+            + current.pointer(pointer).and_then(Value::as_u64).unwrap_or(0)
+    };
+
+    for key in ["input_tokens", "output_tokens", "total_tokens"] {
+        merged[key] = json!(usage_sum(base, current, &format!("/{key}")));
+    }
+
+    let reasoning_tokens = usage_sum(
+        base,
+        current,
+        "/output_tokens_details/reasoning_tokens",
+    );
+    if merged.get("output_tokens_details").is_none() {
+        merged["output_tokens_details"] = json!({});
+    }
+    merged["output_tokens_details"]["reasoning_tokens"] = json!(reasoning_tokens);
+
+    let cached_tokens = usage_sum(base, current, "/input_tokens_details/cached_tokens");
+    if base.pointer("/input_tokens_details/cached_tokens").is_some()
+        || current.pointer("/input_tokens_details/cached_tokens").is_some()
+    {
+        if merged.get("input_tokens_details").is_none() {
+            merged["input_tokens_details"] = json!({});
+        }
+        merged["input_tokens_details"]["cached_tokens"] = json!(cached_tokens);
+    }
+
+    for key in [
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+    ] {
+        if base.get(key).is_some() || current.get(key).is_some() {
+            merged[key] = json!(usage_sum(base, current, &format!("/{key}")));
+        }
+    }
+
+    let base_cache_ttl = base.get("cache_ttl").and_then(Value::as_str);
+    let current_cache_ttl = current.get("cache_ttl").and_then(Value::as_str);
+    match (base_cache_ttl, current_cache_ttl) {
+        (Some(base_value), Some(current_value)) if base_value != current_value => {
+            merged["cache_ttl"] = json!("mixed");
+        }
+        (Some(base_value), None) => {
+            merged["cache_ttl"] = json!(base_value);
+        }
+        _ => {}
+    }
+    merged
+}
+
 fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     let Some(usage) = usage.filter(|value| value.is_object() && !value.is_null()) else {
         return default_responses_usage();
@@ -8266,6 +8337,40 @@ mod response_compatibility_tests {
             json!(["query"])
         );
         assert_eq!(converted["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn upstream_error_message_extracts_json_error() {
+        let message = upstream_error_message(
+            400,
+            "application/json",
+            br#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(message, "context length exceeded");
+    }
+
+    #[test]
+    fn web_search_stream_waits_for_delayed_function_name_without_custom_tools() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        let first = String::from_utf8(converter.push_bytes(
+            b"data: {\"id\":\"chatcmpl-split\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\"}]}}]}\n\n",
+        ))
+        .unwrap();
+        assert!(!first.contains("event: response.output_item.added"));
+        assert!(!first.contains("unknown_tool"));
+
+        let second = String::from_utf8(converter.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+        ))
+        .unwrap();
+        assert!(second.contains("event: response.output_item.added"));
+        assert!(second.contains("\"type\":\"web_search_call\""));
     }
 
     fn completed_response_from_sse(sse: &str) -> Value {
