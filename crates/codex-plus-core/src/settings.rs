@@ -15,6 +15,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayProfile {
@@ -128,6 +132,40 @@ pub struct RelayProfile {
         skip_serializing_if = "is_false"
     )]
     pub web_search_history_compat: bool,
+    /// Anthropic 上游的认证字段：`x-api-key`（默认，Anthropic 原生）或
+    /// `authorization`（多数 Claude 系中转网关用 Bearer）。
+    #[serde(
+        rename = "anthropicAuthHeader",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub anthropic_auth_header: String,
+    /// Anthropic 的 `max_tokens` 是必填项：Codex 请求没带上限时用这个值兜底。
+    /// 一旦填了（非 0），它优先于请求自带的上限。
+    #[serde(
+        rename = "anthropicMaxTokens",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
+    pub anthropic_max_tokens: u64,
+    /// 注入 Anthropic 提示缓存断点（`cache_control`），默认开启。
+    #[serde(rename = "anthropicPromptCache", default = "default_true")]
+    pub anthropic_prompt_cache: bool,
+    /// 伪装 Claude Code 客户端：只在网关限制「仅 Claude Code 可用」时才需要。
+    #[serde(
+        rename = "anthropicImpersonateClaudeCode",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub anthropic_impersonate_claude_code: bool,
+    /// 思考模式：空/`auto`（新代模型透传等级、旧代回落预算）、`adaptive`（强制透传）、
+    /// `budget`（强制经典预算）、`off`（不发 thinking）。
+    #[serde(
+        rename = "anthropicThinkingMode",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub anthropic_thinking_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -228,6 +266,15 @@ pub struct AggregateRelayProfile {
     /// 空串表示未设置，此时保持原有的 400 报错行为。
     #[serde(default)]
     pub default_relay_id: String,
+    /// 把默认成员的官方登录同步进 Codex（auth.json 的 `tokens` 段）。
+    ///
+    /// 聚合的请求都发往本地代理，默认切换只写一个代理 Key，于是 Codex 侧显示"未登录"，
+    /// 官方成员的账号态与额度都不在 Codex 里体现。打开这个开关后，切换聚合时会把默认
+    /// 成员的 ChatGPT 凭据一并写进 live auth.json（代理 Key 与其它字段保留），账号在
+    /// Codex 里就是登录态。默认关：它会把某个账号的凭据写进 Codex 的凭据文件，
+    /// 应当由用户显式选择。
+    #[serde(rename = "syncDefaultMemberLogin", default)]
+    pub sync_default_member_login: bool,
 }
 
 impl Default for RelayProfile {
@@ -266,6 +313,11 @@ impl Default for RelayProfile {
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
             web_search_history_compat: false,
+            anthropic_auth_header: String::new(),
+            anthropic_max_tokens: 0,
+            anthropic_prompt_cache: true,
+            anthropic_impersonate_claude_code: false,
+            anthropic_thinking_mode: String::new(),
         }
     }
 }
@@ -287,6 +339,54 @@ impl RelayProfile {
             .iter()
             .any(|route| !route.model.trim().is_empty() && !route.target_relay_id.trim().is_empty())
     }
+
+    /// 上游协议是否需要本地协议代理转换（Codex 侧恒以 Responses 说话）。
+    ///
+    /// 与「Chat Completions 专有行为」区分开：`standard_openai_protocol`、
+    /// 原生远程压缩、VLM 等开关只认 `ChatCompletions`，不要用本函数替代。
+    pub fn requires_protocol_proxy_conversion(&self) -> bool {
+        matches!(
+            self.protocol,
+            RelayProtocol::ChatCompletions | RelayProtocol::AnthropicMessages
+        )
+    }
+
+    /// Anthropic 上游的认证字段，空值表示默认的 `x-api-key`。
+    pub fn anthropic_auth_header(&self) -> &str {
+        let value = self.anthropic_auth_header.trim();
+        if value.is_empty() {
+            crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_API_KEY
+        } else {
+            value
+        }
+    }
+
+    /// Anthropic 的思考模式（空值按 `auto`）。
+    pub fn anthropic_thinking_mode(&self) -> crate::anthropic_bridge::AnthropicThinkingMode {
+        crate::anthropic_bridge::AnthropicThinkingMode::parse(&self.anthropic_thinking_mode)
+    }
+
+    /// Anthropic 的 `max_tokens` 兜底值（协议必填，Codex 未给上限时使用）。
+    pub fn anthropic_max_tokens(&self) -> u64 {
+        if self.anthropic_max_tokens == 0 {
+            crate::anthropic_bridge::ANTHROPIC_DEFAULT_MAX_TOKENS
+        } else {
+            self.anthropic_max_tokens
+        }
+    }
+}
+
+/// 归一化 Anthropic 认证字段：只接受两种取值，其余（含空串）按默认 `x-api-key` 处理。
+pub fn normalize_anthropic_auth_header(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "authorization" | "bearer" | "auth_token" | "anthropic_auth_token" => {
+            crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_BEARER.to_string()
+        }
+        "x-api-key" | "x_api_key" | "api_key" | "anthropic_api_key" => {
+            crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_API_KEY.to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -303,6 +403,8 @@ pub enum RelayProtocol {
     #[default]
     Responses,
     ChatCompletions,
+    /// Anthropic Messages（`/v1/messages`）：由本地协议代理转成 Responses 供 Codex 使用。
+    AnthropicMessages,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -596,6 +698,14 @@ pub struct BackendSettings {
     // 默认开启：纯展示层状态栏，不改变 Codex 的请求内容与本地数据，误开没有副作用。
     #[serde(rename = "codexAppUsageStatusLine", default = "default_true")]
     pub codex_app_usage_status_line: bool,
+    // 默认开启：只在受管副本的页面里加一个语音入口，识别走 Codex++ 自己的听写服务，
+    // 不改官方应用、不动输入框已有内容；关掉只是没有入口，已运行的副本需重启才生效。
+    #[serde(rename = "claudeAppVoiceInput", default = "default_true")]
+    pub claude_app_voice_input: bool,
+    // 默认开启：受管副本注入中文词表并把外壳语言切到 zh-Hans。关掉后副本按原语言启动，
+    // 与「准备副本」这件事互不影响——副本只是所有增强共同的前置条件。
+    #[serde(rename = "claudeAppLocalization", default = "default_true")]
+    pub claude_app_localization: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -809,6 +919,8 @@ impl Default for BackendSettings {
             codex_app_markdown_export: true,
             codex_app_session_share: true,
             codex_app_usage_status_line: true,
+            claude_app_voice_input: true,
+            claude_app_localization: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -924,6 +1036,11 @@ impl BackendSettings {
                 custom_headers: Vec::new(),
                 standard_openai_protocol: false,
                 web_search_history_compat: false,
+                anthropic_auth_header: String::new(),
+                anthropic_max_tokens: 0,
+                anthropic_prompt_cache: true,
+                anthropic_impersonate_claude_code: false,
+                anthropic_thinking_mode: String::new(),
             };
         }
 
@@ -981,6 +1098,11 @@ impl BackendSettings {
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
             web_search_history_compat: false,
+            anthropic_auth_header: String::new(),
+            anthropic_max_tokens: 0,
+            anthropic_prompt_cache: true,
+            anthropic_impersonate_claude_code: false,
+            anthropic_thinking_mode: String::new(),
         }
     }
 
@@ -1033,7 +1155,7 @@ impl BackendSettings {
 
     pub fn active_relay_transport_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
+            || self.active_relay_profile().requires_protocol_proxy_conversion()
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
             || self
@@ -2523,6 +2645,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_enhancement_switches_default_on_and_respect_explicit_off() {
+        // 老用户的 settings.json 里没有这两个键：必须按默认开启读出来，否则升级后
+        // 语音入口与中文界面会静默消失，用户会以为是坏了，而不是自己关掉的。
+        let mut legacy = serde_json::to_value(BackendSettings::default()).unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("claudeAppVoiceInput");
+        legacy.remove("claudeAppLocalization");
+        let parsed: BackendSettings = serde_json::from_value(serde_json::Value::Object(legacy.clone())).unwrap();
+        assert!(parsed.claude_app_voice_input, "缺少键时语音输入应按默认开启");
+        assert!(parsed.claude_app_localization, "缺少键时界面汉化应按默认开启");
+
+        let mut off = serde_json::to_value(BackendSettings::default()).unwrap();
+        off["claudeAppVoiceInput"] = json!(false);
+        off["claudeAppLocalization"] = json!(false);
+        let parsed: BackendSettings = serde_json::from_value(off).unwrap();
+        assert!(!parsed.claude_app_voice_input, "显式关闭必须被尊重");
+        assert!(!parsed.claude_app_localization, "显式关闭必须被尊重");
+    }
+
+    #[test]
     fn atomic_write_replaces_existing_file_and_removes_temp_file() {
         let dir = temp_dir();
         let path = dir.join("settings.json");
@@ -3517,6 +3659,7 @@ experimental_bearer_token = "sk-existing""#
                 name: "聚合".to_string(),
                 session_provider: RelaySessionProvider::Openai,
                 model_aggregation_enabled: true,
+                sync_default_member_login: false,
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {

@@ -458,6 +458,16 @@ export type RelayProfile = {
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
   webSearchHistoryCompat: boolean;
+  /** Anthropic 上游的认证字段：`x-api-key`（默认）或 `authorization`。 */
+  anthropicAuthHeader?: string;
+  /** Anthropic 的 `max_tokens` 兜底值，0/缺省表示用内置 8192；填了则优先于请求值。 */
+  anthropicMaxTokens?: number;
+  /** 注入 Anthropic 提示缓存断点，默认开启。 */
+  anthropicPromptCache?: boolean;
+  /** 伪装 Claude Code 客户端（仅网关限制「只能通过 Claude Code 使用」时需要）。 */
+  anthropicImpersonateClaudeCode?: boolean;
+  /** 思考模式：空/auto、adaptive（等级透传）、budget（经典预算）、off。 */
+  anthropicThinkingMode?: string;
   aggregate?: RelayAggregateConfig | null;
 };
 
@@ -479,6 +489,8 @@ type RelayAggregateConfig = {
   modelAggregationEnabled?: boolean;
   /** 默认供应商：解析不到成员的普通模型请求交给该成员转发；空串表示未设置。 */
   defaultRelayId?: string;
+  /** 把默认成员的官方登录同步进 Codex（写 auth.json 的 tokens 段）。默认关。 */
+  syncDefaultMemberLogin?: boolean;
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -493,6 +505,8 @@ type AggregateRelayProfile = {
   members: AggregateRelayMember[];
   routes?: { pattern: string; relayId: string; priority: number }[];
   defaultRelayId?: string;
+  /** 把默认成员的官方登录同步进 Codex（auth.json 的 tokens 段）。默认关。 */
+  syncDefaultMemberLogin?: boolean;
 };
 
 type RelayContextSelection = {
@@ -518,7 +532,7 @@ type CodexContextEntries = {
   plugins: CodexContextEntry[];
 };
 
-type RelayProtocol = "responses" | "chatCompletions";
+type RelayProtocol = "responses" | "chatCompletions" | "anthropicMessages";
 type StepwiseProtocol = "auto" | "chat_completions" | "responses" | "anthropic_messages";
 type StepwiseGenerationMode = "auto" | "manual";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
@@ -1055,7 +1069,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "relay", label: t("供应商配置"), icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", label: t("Codex多开"), icon: Layers3, badge: "NEW", tool: "codex" },
   { id: "grok", label: t("Grok 配置"), icon: Blocks, tool: "grok" },
-  { id: "claude", label: t("Claude 汉化"), icon: Languages, tool: "claude" },
+  { id: "claude", label: t("Claude 增强"), icon: Languages, tool: "claude" },
   { id: "sessions", label: t("会话管理"), icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
@@ -3172,6 +3186,9 @@ export function App() {
   };
 
   useEffect(() => {
+    // 工具栏只依赖本地配置，不能排在广告等网络请求之后。
+    // 切换语言会重载窗口，串行等待会让三个 Agent 图标长时间消失。
+    void refreshTools(true);
     void (async () => {
       const startup = await run(() => call<StartupResult>("startup_options"));
       const handledNavigation = await consumePendingManagerNavigation();
@@ -3185,7 +3202,6 @@ export function App() {
       // 概览页的赞助商区块要显示真实广告源内容，所以启动就拉一次，
       // 不要等到用户点进「推荐内容」才加载。
       await refreshAds(true);
-      await refreshTools(true);
       if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
@@ -9455,9 +9471,88 @@ function RelayProfileEditor({
                       options={[
                         { value: "responses", label: "Responses API" },
                         { value: "chatCompletions", label: "Chat Completions" },
+                        { value: "anthropicMessages", label: "Anthropic Messages" },
                       ]}
                     />
                   </Field>
+                  {profile.protocol === "anthropicMessages" ? (
+                    <>
+                      <Field className="relay-field-anthropic-auth" label={t("认证字段")}>
+                        <AppSelect
+                          ariaLabel={t("认证字段")}
+                          value={profile.anthropicAuthHeader || "x-api-key"}
+                          onChange={(value) => updateDraft({ anthropicAuthHeader: value })}
+                          options={[
+                            { value: "x-api-key", label: t("x-api-key（Anthropic 原生）") },
+                            { value: "authorization", label: t("Authorization: Bearer") },
+                          ]}
+                        />
+                      </Field>
+                      <Field className="relay-field-anthropic-max-tokens" label={t("最大输出 tokens")}>
+                        <Input
+                          inputMode="numeric"
+                          value={profile.anthropicMaxTokens ? String(profile.anthropicMaxTokens) : ""}
+                          placeholder="8192"
+                          onChange={(event) =>
+                            updateDraft({ anthropicMaxTokens: normalizeAnthropicMaxTokens(Number(event.currentTarget.value)) })
+                          }
+                        />
+                      </Field>
+                      <Field className="relay-field-anthropic-thinking" label={t("思考模式")}>
+                        <AppSelect
+                          ariaLabel={t("思考模式")}
+                          value={profile.anthropicThinkingMode || "auto"}
+                          onChange={(value) =>
+                            updateDraft({ anthropicThinkingMode: value === "auto" ? "" : value })
+                          }
+                          options={[
+                            { value: "auto", label: t("自动（新代模型透传等级）") },
+                            { value: "adaptive", label: t("等级透传（adaptive）") },
+                            { value: "budget", label: t("经典预算（budget_tokens）") },
+                            { value: "off", label: t("关闭思考") },
+                          ]}
+                        />
+                      </Field>
+                      <label className="switch-row compact relay-switch-row relay-field-anthropic-cache">
+                        <input
+                          checked={profile.anthropicPromptCache !== false}
+                          onChange={(event) =>
+                            updateDraft({ anthropicPromptCache: event.currentTarget.checked })
+                          }
+                          type="checkbox"
+                        />
+                        <span>
+                          <strong>{t("提示缓存")}</strong>
+                          <small>
+                            {t("给系统提示、工具定义和最新一轮对话打 5 分钟缓存断点（最多 4 个），长对话不会每轮全价重发。")}
+                          </small>
+                        </span>
+                        <ToggleVisual />
+                      </label>
+                      <label className="switch-row compact relay-switch-row relay-field-anthropic-impersonate">
+                        <input
+                          checked={profile.anthropicImpersonateClaudeCode === true}
+                          onChange={(event) =>
+                            updateDraft({ anthropicImpersonateClaudeCode: event.currentTarget.checked })
+                          }
+                          type="checkbox"
+                        />
+                        <span>
+                          <strong>{t("模拟 Claude Code 客户端")}</strong>
+                          <small>
+                            {t("伪装 User-Agent、anthropic-beta、x-app，并在系统提示首行注入 Claude Code 身份。仅在网关限制「只能通过 Claude Code 使用」时开启。")}
+                          </small>
+                        </span>
+                        <ToggleVisual />
+                      </label>
+                      <div className="hint-line relay-protocol-hint">
+                        <MessageCircle className="h-4 w-4" />
+                        <span>
+                          {t("思考档位跟随 Codex 的 reasoning effort：自动模式下新代模型按等级透传（adaptive + effort），旧代模型折算成 thinking 预算；模型声明 1M 窗口时会自动附上 1m 上下文 beta 头。")}
+                        </span>
+                      </div>
+                    </>
+                  ) : null}
                 </div>
               </div>
             ) : (
@@ -9790,6 +9885,11 @@ function RelayProfileEditor({
                               rows={7}
                             />
                             {metadataImportError ? <div className="relay-model-metadata-import-error" role="alert">{metadataImportError}</div> : null}
+                            {metadataImportPreview?.contextWindow && row.window.trim() && metadataImportPreview.contextWindow !== row.window.trim() ? (
+                              <div className="relay-model-metadata-import-warning" role="status">
+                                {tf("文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。", [metadataImportPreview.contextWindow, row.window.trim()])}
+                              </div>
+                            ) : null}
                             {metadataImportPreview?.ignoredFields.length ? (
                               <div className="relay-model-metadata-import-warning" role="status">
                                 {tf("以下字段由 Codex++ 计算或维护，导入不会覆盖：{0}", [metadataImportPreview.ignoredFields.join(", ")])}
@@ -10143,10 +10243,14 @@ function RelayProfileEditor({
                 </div>
               </Field>
             ) : null}
-            {showApiFields && profile.protocol === "chatCompletions" ? (
+            {showApiFields && profile.protocol !== "responses" ? (
               <div className="hint-line relay-protocol-hint">
                 <MessageCircle className="h-4 w-4" />
-                <span>{t("此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。")}</span>
+                <span>
+                  {profile.protocol === "anthropicMessages"
+                    ? t("此上游说 Anthropic Messages（/v1/messages）：本地 127.0.0.1:57321 会把请求转成 Anthropic 协议发出，再转回 Responses，需要从 Codex++ 启动 Codex。")
+                    : t("此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。")}
+                </span>
               </div>
             ) : null}
             <div className="hint-line relay-protocol-hint">
@@ -10447,6 +10551,11 @@ function AggregateRelayProfileEditor({
     });
   };
   const totalWeight = aggregate.members.reduce((total, member) => total + clampAggregateWeight(member.weight), 0);
+  // 只有"纯官方登录"成员才有 ChatGPT 凭据可同步；带 URL/Key 的官方混入走 API 通道。
+  const defaultMemberCandidate = candidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
+  const defaultMemberIsOfficialLogin = !!defaultMemberCandidate
+    && defaultMemberCandidate.relayMode === "official"
+    && !defaultMemberCandidate.officialMixApiKey;
   const routes = aggregate.routes ?? [];
   const routeTargetOptions = aggregate.members
     .map((member) => {
@@ -10633,6 +10742,26 @@ function AggregateRelayProfileEditor({
               ])
               : t("还没指定默认供应商：在上方成员行尾点「设为默认」。不带 cpx- 前缀的请求会原样交给它，没设就报错。")}
           </span>
+          {defaultMemberIsOfficialLogin ? (
+            <label className="aggregate-default-login-sync">
+              <input
+                checked={aggregate.syncDefaultMemberLogin === true}
+                onChange={(event) => updateAggregate({
+                  ...aggregate,
+                  syncDefaultMemberLogin: event.currentTarget.checked,
+                })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("把默认成员的官方登录同步到 Codex")}</strong>
+                <small>{t("开启后切换到本聚合时，会把默认成员的 ChatGPT 凭据一并写进 Codex（代理 Key 保留），账号在 Codex 里就是登录态。默认成员不是官方登录时无效。")}</small>
+              </span>
+            </label>
+          ) : (
+            <span className="aggregate-default-login-note">
+              {t("当前默认成员不是官方登录账号，无法把登录同步到 Codex；只有「官方登录」类型的成员才有 ChatGPT 凭据。")}
+            </span>
+          )}
         </div>
       ) : null}
       {!modelMode ? <div className="aggregate-routes">
@@ -11634,40 +11763,145 @@ type ClaudeLocalizationStatus = {
   pythonAvailable: boolean;
   shellLocale: string | null;
   catalogEntries: number;
+  voiceInput: boolean;
+  localization: boolean;
 };
 
 function ClaudeLocalizationScreen() {
   const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const refresh = async () => {
-    try { setStatus(await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_status")); }
-    catch (cause) { setError(stringifyError(cause)); }
+  const mounted = useRef(true);
+  const pending = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const accept = (result: CommandResult<ClaudeLocalizationStatus>) => {
+    if (!mounted.current) return;
+    if (result.status === "ok") setStatus(result);
+    else setError(result.message);
   };
-  useEffect(() => { void refresh(); }, []);
+  const refresh = async () => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy("detect"); setError(null);
+    try { accept(await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_status")); }
+    catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
+    if (pending.current) return;
+    pending.current = true;
     setBusy(action); setError(null);
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_action", { action });
-      setStatus(result);
-      if (result.status !== "ok") setError(result.message);
-    } catch (cause) { setError(stringifyError(cause)); }
-    finally { setBusy(null); }
+      // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
+      // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      accept(result);
+    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
+  const toggleVoiceInput = async (enabled: boolean) => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy("voiceInput"); setError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
+        "claude_localization_set_voice_input",
+        { enabled },
+      );
+      // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
+      // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      accept(result);
+    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
+  const toggleLocalization = async (enabled: boolean) => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy("localization"); setError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
+        "claude_localization_set_localization",
+        { enabled },
+      );
+      // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
+      // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      accept(result);
+    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
   };
   const s = status;
   const canLaunch = Boolean(s?.prepared && !s.needsRebuild && s.nodeAvailable);
   const statusTone = !s ? "pending" : s.prepared ? (s.needsRebuild ? "warn" : "ok") : "idle";
-  const statusText = !s ? t("读取中") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备");
+  const statusText = busy === "detect" ? t("检测中…") : !s ? t("未检测") : !s.supported ? t("未检测到 Claude") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备");
   return (
     <div className="claude-localization-page">
+      {/* 左栏：增强项。每一项都跑在右边的受管副本上，汉化只是其中之一。 */}
+      <div className="claude-l10n-column">
+        <Panel>
+          <CardHead
+            title={t("增强功能")}
+            detail={t("各自独立开关，互不影响；副本只是它们共同的前置条件，改动在重启副本后应用。")}
+          />
+          <CardContent>
+            <label className="switch-row compact">
+              <input
+                checked={Boolean(s?.localization)}
+                disabled={busy !== null || !s?.supported}
+                onChange={(event) => void toggleLocalization(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("界面汉化")}</strong>
+                <small>{t("启动时注入官方中文词表，界面语言切到简体中文；关掉后副本按原语言启动。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            <label className="switch-row compact">
+              <input
+                checked={Boolean(s?.voiceInput)}
+                disabled={busy !== null || !s?.supported}
+                onChange={(event) => void toggleVoiceInput(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("语音输入")}</strong>
+                <small>{t("在 Claude 输入框右下角加一个麦克风入口，识别结果只写进输入框、不自动发送。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+            {s?.supported && !s.prepared ? (
+              <p className="claude-l10n-hint">
+                {t("副本还没准备：开关会先存下来，等你在右边准备好副本并启动后生效。")}
+              </p>
+            ) : null}
+          </CardContent>
+        </Panel>
+      </div>
+      {/* 右栏：所有增强共同的前置条件。 */}
+      <div className="claude-l10n-column">
       <Panel className="claude-l10n-hero">
         <CardContent>
           <div className="claude-l10n-hero-head">
             <div className="claude-l10n-hero-title">
-              <span className="claude-l10n-hero-icon"><Languages className="h-5 w-5" /></span>
+              <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
               <div>
-                <strong>{t("Claude Code 汉化")}</strong>
-                <span className="claude-l10n-hero-subtitle">{t("官方 Claude.app 与 app.asar 保持原样，中文通过受管副本和启动时注入实现。")}</span>
+                <strong>{t("受管副本")}</strong>
+                <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
               </div>
             </div>
             <span className={`claude-l10n-status claude-l10n-status-${statusTone}`}>
@@ -11675,10 +11909,33 @@ function ClaudeLocalizationScreen() {
               {statusText}
             </span>
           </div>
+          <div className="claude-l10n-steps" role="list">
+            <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
+              <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
+              <div className="claude-l10n-step-body">
+                <strong>{t("准备副本")}</strong>
+                <small>{t("用下面的按钮创建受管副本；官方 Claude.app 与 app.asar 保持原样。")}</small>
+              </div>
+            </div>
+            <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
+              <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
+              <div className="claude-l10n-step-body">
+                <strong>{t("启动 Claude 副本")}</strong>
+                <small>{t("增强只在副本里生效，官方版和登录态不受影响。")}</small>
+              </div>
+            </div>
+            <div className="claude-l10n-step" role="listitem">
+              <span className="claude-l10n-step-no" aria-hidden="true">3</span>
+              <div className="claude-l10n-step-body">
+                <strong>{t("在左边开启需要的增强")}</strong>
+                <small>{t("界面汉化与语音输入各自独立，改动在重启副本后应用。")}</small>
+              </div>
+            </div>
+          </div>
           <div className="claude-l10n-stats">
             <div className="claude-l10n-stat">
               <span>{t("官方版本")}</span>
-              <strong title={s?.sourceVersion || undefined}>{s?.sourceVersion || t("未检测到")}</strong>
+              <strong title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</strong>
             </div>
             <div className="claude-l10n-stat">
               <span>{t("副本版本")}</span>
@@ -11690,32 +11947,46 @@ function ClaudeLocalizationScreen() {
             </div>
             <div className="claude-l10n-stat">
               <span>{t("官方词条")}</span>
-              <strong>{s ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("读取中")}</strong>
+              <strong>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</strong>
             </div>
           </div>
           <div className="claude-l10n-note" role="note">
             <Info className="h-4 w-4" />
             <span>{t("首次准备会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
           </div>
+          {!s ? (
+            <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
+          ) : !s.supported ? (
+            <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
+          ) : null}
           {error ? <div className="inline-error">{error}</div> : null}
           <div className="claude-l10n-actions">
+            <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
+              <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
+              {busy === "detect" ? t("检测中…") : t("检测 Claude")}
+            </Button>
             <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
-              <PackageOpen className="h-4 w-4" />{busy === "prepare" ? t("准备中…") : t("准备汉化副本")}
+              <PackageOpen className="h-4 w-4" />
+              {busy === "prepare"
+                ? t("准备中…")
+                : s?.needsRebuild
+                  ? t("更新副本")
+                  : s?.prepared
+                    ? t("重新准备副本")
+                    : t("准备副本")}
             </Button>
             <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
-              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动中文 Claude")}
+              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动 Claude 副本")}
             </Button>
             <div className="claude-l10n-actions-secondary">
               <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
                 <RefreshCw className="h-4 w-4" />{t("检查副本")}
               </Button>
-              <Button disabled={busy !== null || !s?.shellLocale} onClick={() => void act("restore")} variant="secondary">
-                <RotateCcw className="h-4 w-4" />{t("还原语言")}
-              </Button>
             </div>
           </div>
         </CardContent>
       </Panel>
+      </div>
     </div>
   );
 }
@@ -12453,7 +12724,7 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
-    claude: t("保留官方 Claude.app 原样，通过受管副本动态应用中文界面"),
+    claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
     relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP 服务器与插件"),
@@ -13325,7 +13596,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: profile.apiKey || "",
-    protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
+    protocol: normalizeRelayProtocol(profile.protocol),
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
@@ -13351,6 +13622,11 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
     webSearchHistoryCompat: profile.webSearchHistoryCompat === true,
+    anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
+    anthropicMaxTokens: normalizeAnthropicMaxTokens(profile.anthropicMaxTokens),
+    anthropicPromptCache: profile.anthropicPromptCache !== false,
+    anthropicImpersonateClaudeCode: profile.anthropicImpersonateClaudeCode === true,
+    anthropicThinkingMode: normalizeAnthropicThinkingMode(profile.anthropicThinkingMode),
   };
   return relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
 }
@@ -13371,6 +13647,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
       })),
       routes: normalizeAggregateRoutes(aggregate.routes ?? []),
       defaultRelayId: aggregate.defaultRelayId ?? "",
+      syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
     },
   };
 }
@@ -13383,8 +13660,39 @@ function activeRelayProfile(settings: BackendSettings): RelayProfile {
   );
 }
 
+/** 协议取值归一化：认不出的值一律回退 Responses，避免脏数据把上游写成直连。 */
+function normalizeRelayProtocol(value: RelayProtocol | undefined): RelayProtocol {
+  if (value === "chatCompletions" || value === "anthropicMessages") return value;
+  return "responses";
+}
+
+/** Anthropic 认证字段：只允许 `x-api-key` 与 `authorization`，缺省用前者。 */
+function normalizeAnthropicAuthHeader(value: string | undefined): string {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "authorization" || normalized === "bearer") return "authorization";
+  if (normalized === "x-api-key" || normalized === "x_api_key" || normalized === "api_key") return "x-api-key";
+  return "";
+}
+
+/** 思考模式：只认四个取值，其余（含空串）按 auto。 */
+function normalizeAnthropicThinkingMode(value: string | undefined): string {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "adaptive" || normalized === "budget" || normalized === "off") {
+    return normalized;
+  }
+  return "";
+}
+
+/** Anthropic 的 `max_tokens` 兜底值：空/非法按 0（用内置 8192），上限 200000。 */
+function normalizeAnthropicMaxTokens(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(200000, Math.round(value));
+}
+
 function relayProtocolLabel(protocol: RelayProtocol): string {
-  return protocol === "chatCompletions" ? t("Chat Completions 转 Responses") : "Responses API";
+  if (protocol === "chatCompletions") return t("Chat Completions 转 Responses");
+  if (protocol === "anthropicMessages") return t("Anthropic Messages 转 Responses");
+  return "Responses API";
 }
 
 function ccsProviderSummary(result: CcsProvidersResult | null): string {
@@ -13565,7 +13873,7 @@ function buildRelayConfigToml(
     && profile.protocol === "responses"
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol === "chatCompletions" || searchHistoryCompat
+  const baseUrl = profile.protocol !== "responses" || searchHistoryCompat
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -13704,7 +14012,7 @@ function applyRelayProfilePatchToFiles(
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat
+    const baseUrlForConfig = next.protocol !== "responses" || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
@@ -14322,6 +14630,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
         priority: route.priority,
       })),
       defaultRelayId: aggregate.defaultRelayId ?? "",
+      syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
     };
   });
 }
@@ -14550,7 +14859,7 @@ function relayProviderView(profile: RelayProfile): ProviderViewKind {
   if (isAggregateRelayProfile(profile)) {
     return profile.aggregate?.modelAggregationEnabled === true ? "modelAggregation" : "failover";
   }
-  return profile.protocol === "chatCompletions" || normalizeRelayModelRoutes(profile.modelRoutes).length
+  return profile.protocol !== "responses" || normalizeRelayModelRoutes(profile.modelRoutes).length
     ? "routing"
     : "direct";
 }
@@ -14649,6 +14958,7 @@ function normalizeAggregateConfig(
     members,
     routes,
     defaultRelayId,
+    syncDefaultMemberLogin: aggregate?.syncDefaultMemberLogin === true,
   };
 }
 

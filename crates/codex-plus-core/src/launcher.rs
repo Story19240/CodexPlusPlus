@@ -741,6 +741,15 @@ where
         // 覆盖 Codex 在 UI 选择后回写的 live 值），只在 live config 的 model 仍是
         // 工具写入的隐式默认且有未归档目标任务时，对齐到目标任务模型。
         if settings.relay_profiles_enabled {
+            // 只迁移旧版受管 catalog 的路径表达，不重放 profile 或覆盖用户选定模型。
+            if let Err(error) =
+                crate::relay_config::migrate_managed_model_catalog_pointer_in_home(&home, &settings)
+            {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.model_catalog_pointer_migration_failed",
+                    serde_json::json!({ "message": error.to_string() }),
+                );
+            }
             let profile = settings.active_relay_profile();
             if profile.relay_mode != crate::settings::RelayMode::Official {
                 if let Err(error) =
@@ -1098,6 +1107,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                 "address": format!("http://{bind_host}:{helper_port}")
             }),
         );
+        // 端口绑定成功后立刻落凭据：Claude 汉化注入的 hook 靠它调用听写路由。
+        write_dictation_helper_receipt(helper_port);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             loop {
@@ -1528,6 +1539,7 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn shutdown_helper(&self, _helper_port: u16) {
+        remove_dictation_helper_receipt();
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -1571,6 +1583,63 @@ impl LaunchHooks for DefaultLaunchHooks {
             } => {}
         }
     }
+}
+
+/// 听写 helper 的凭据文件名。Claude 汉化的注入脚本按同一路径读取，
+/// 两边改动必须同步（见 assets/claude-localization/hook.js）。
+const DICTATION_HELPER_RECEIPT: &str = "dictation-helper.json";
+
+/// helper 运行期间把端口与能力令牌写进用户态目录。
+///
+/// 为什么需要它：Claude 汉化的页面脚本没有 Codex 页面的特权桥，只能由主进程 hook
+/// 转发听写请求，而 helper 的能力令牌只存在于 launcher 进程内存里。文件限当前用户
+/// 可读（0600），helper 停止即删除；令牌也只在 loopback 的听写路由上有效。
+fn dictation_helper_receipt_path() -> PathBuf {
+    crate::paths::default_app_state_dir().join(DICTATION_HELPER_RECEIPT)
+}
+
+fn write_dictation_helper_receipt(helper_port: u16) {
+    write_dictation_helper_receipt_at(
+        &dictation_helper_receipt_path(),
+        helper_port,
+        crate::dictation::helper_token(),
+    );
+}
+
+fn write_dictation_helper_receipt_at(path: &Path, helper_port: u16, token: &str) {
+    let Ok(text) = serde_json::to_vec(&serde_json::json!({
+        "port": helper_port,
+        "token": token,
+    })) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    // 先写临时文件再改名：读到写了一半的凭据会让调用方白失败一轮。
+    let temporary = path.with_extension("json.tmp");
+    if std::fs::write(&temporary, &text).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+    }
+    // Windows 上 rename 不覆盖已存在的目标，先删再加。
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::rename(&temporary, path);
+}
+
+fn remove_dictation_helper_receipt() {
+    remove_dictation_helper_receipt_at(&dictation_helper_receipt_path());
+}
+
+fn remove_dictation_helper_receipt_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 async fn handle_helper_connection(
@@ -2215,13 +2284,26 @@ async fn handle_protocol_proxy_connection(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
             );
+            let is_anthropic_upstream =
+                upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages;
             if upstream.wire_api != crate::protocol_proxy::UpstreamWireApi::Responses {
                 converter = converter.with_chat_upstream();
             }
+            // Anthropic 事件流先落成 chat 事件流，再进既有的 chat 压缩聚合器。
+            let mut anthropic_bridge =
+                is_anthropic_upstream.then(crate::anthropic_bridge::AnthropicSseToChatSse::default);
             let mut bytes_stream = upstream.take_response()?.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
-                    Ok(bytes) => converter.push_upstream_bytes(&bytes),
+                    Ok(bytes) => {
+                        let payload = match anthropic_bridge.as_mut() {
+                            Some(bridge) => bridge.push_bytes(&bytes),
+                            None => bytes.to_vec(),
+                        };
+                        if !payload.is_empty() {
+                            converter.push_upstream_bytes(&payload);
+                        }
+                    }
                     Err(error) => {
                         converter.fail(format!("Stream error: {error}"), None);
                         break;
@@ -2237,6 +2319,31 @@ async fn handle_protocol_proxy_connection(
                 "200 OK",
                 remote_addr_text,
             );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses
+            && upstream.exec_adapted
+        {
+            let mut converter = crate::responses_exec_sse::ExecSseAdapter::new();
+            let mut bytes_stream = upstream.take_response()?.bytes_stream();
+            while let Some(chunk) = bytes_stream.next().await {
+                let converted = match chunk {
+                    Ok(bytes) => match converter.push_bytes(&bytes) {
+                        Ok(converted) => converted,
+                        Err(_) => converter.fail(),
+                    },
+                    Err(_) => converter.fail(),
+                };
+                stream.write_all(&converted).await?;
+                if converter.is_complete() {
+                    break;
+                }
+            }
+            stream.write_all(&converter.finish()?).await?;
+            if let Some(outcome) = upstream.exec_outcome.as_mut() {
+                outcome.finish(converter.succeeded());
+            }
             stream.shutdown().await?;
             return Ok(());
         }
@@ -2288,11 +2395,23 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let upstream_body = upstream.read_body().await?;
+    let upstream_body = match upstream.read_body().await {
+        Ok(body) => body,
+        Err(error) => {
+            if let Some(outcome) = upstream.exec_outcome.as_mut() {
+                outcome.finish(false);
+            }
+            return Err(error);
+        }
+    };
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
-        let body = crate::protocol_proxy::wrap_non_stream_response_as_compaction(
+        let compaction_input = crate::anthropic_bridge::normalize_non_stream_body_for_compaction(
+            upstream.wire_api,
             &upstream_body,
+        )?;
+        let body = crate::protocol_proxy::wrap_non_stream_response_as_compaction(
+            &compaction_input,
             request_json
                 .as_ref()
                 .and_then(|request| request.get("model"))
@@ -2311,6 +2430,17 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let body = if upstream.exec_adapted {
+            let (body, valid) = crate::responses_exec_transport::adapted_json(&upstream_body);
+            write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
+            if let Some(outcome) = upstream.exec_outcome.as_mut() {
+                outcome.finish(valid);
+            }
+            stream.shutdown().await?;
+            return Ok(());
+        } else {
+            upstream_body
+        };
         write_http_response(
             stream,
             "200 OK",
@@ -2319,7 +2449,7 @@ async fn handle_protocol_proxy_connection(
             } else {
                 &upstream.content_type
             },
-            &upstream_body,
+            &body,
         )
         .await?;
         log_helper_response(
@@ -2332,12 +2462,28 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if let Some(request_json) = request_json.as_ref() {
+    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+    // Anthropic 上游先落成 chat 响应体，再复用同一份 chat → Responses 映射；
+    // 签名思考块要挂回 Responses 的 reasoning item，下一轮才能原样回放。
+    let (chat_json, thinking_blocks) =
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let blocks =
+                crate::anthropic_bridge::thinking_blocks_from_anthropic_message(&upstream_json);
+            (
+                crate::anthropic_bridge::anthropic_message_to_chat_completion(upstream_json)?,
+                blocks,
+            )
+        } else {
+            (upstream_json, Vec::new())
+        };
+    let mut response_json = if let Some(request_json) = request_json.as_ref() {
         crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
     } else {
         crate::protocol_proxy::chat_completion_to_response(chat_json)?
     };
+    if !thinking_blocks.is_empty() {
+        crate::anthropic_bridge::attach_thinking_to_responses(&mut response_json, &thinking_blocks);
+    }
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
@@ -2437,6 +2583,38 @@ async fn transcribe_until_disconnect(
                 }
             }
         } => None,
+    }
+}
+
+#[cfg(test)]
+mod dictation_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_round_trip_keeps_port_token_and_owner_only_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictation-helper.json");
+        write_dictation_helper_receipt_at(&path, 57321, "token-abc");
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["port"], 57321);
+        assert_eq!(value["token"], "token-abc");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "凭据文件必须只对当前用户可读");
+        }
+        // 覆盖写不能失败：Windows 上 rename 到已存在的目标会报错。
+        write_dictation_helper_receipt_at(&path, 57322, "token-def");
+        let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(again["port"], 57322);
+        assert_eq!(again["token"], "token-def");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "临时文件必须被改名走"
+        );
+        remove_dictation_helper_receipt_at(&path);
+        assert!(!path.exists());
     }
 }
 
@@ -2804,6 +2982,45 @@ async fn forward_protocol_proxy_stream(
         }
         return Ok(observer.finish());
     }
+    if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+        // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
+        let mut converter = request
+            .map(crate::anthropic_bridge::AnthropicSseToResponsesConverter::with_request)
+            .unwrap_or_default();
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = converter.push_bytes(&bytes);
+                    if !converted.is_empty() {
+                        stream.write_all(&converted).await?;
+                    }
+                    if converter.has_failed() {
+                        return Ok(Some("上游返回了流式错误事件".to_string()));
+                    }
+                }
+                Err(error) => {
+                    let failed = converter.fail(
+                        "上游响应流读取失败".to_string(),
+                        Some("stream_error".to_string()),
+                    );
+                    stream.write_all(&failed).await?;
+                    return Ok(Some(error.without_url().to_string()));
+                }
+            }
+        }
+        // Anthropic 的 `message_stop` 就是完成事件；缺它说明流被掐断，
+        // 已发出的文本和工具增量不能自动重放。
+        if !converter.has_terminal_event() {
+            let failed = converter.fail(
+                "上游在完成事件前结束了响应流".to_string(),
+                Some("stream_incomplete".to_string()),
+            );
+            stream.write_all(&failed).await?;
+            return Ok(Some("上游缺少完成事件".to_string()));
+        }
+        stream.write_all(&converter.finish()).await?;
+        return Ok(None);
+    }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
         .unwrap_or_default();
@@ -3140,8 +3357,7 @@ async fn forward_web_search_protocol_proxy_stream(
     if followup.is_stream {
         let response = followup.take_response()?;
         if let Some(reason) =
-            forward_web_search_chat_stream(stream, &mut converter, response.bytes_stream())
-                .await?
+            forward_web_search_chat_stream(stream, &mut converter, response.bytes_stream()).await?
         {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "web_search.failed",
@@ -3186,22 +3402,21 @@ async fn forward_web_search_protocol_proxy_stream(
             WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
         )
         .await?;
-        let parsed =
-            match crate::web_search::parse_chat_response(&body, &followup.content_type) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    let failed = converter.fail(
-                        error.to_string(),
-                        Some("web_search_followup_invalid".to_string()),
-                    );
-                    stream.write_all(&failed).await?;
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "web_search.failed",
-                        serde_json::json!({ "stage": "parse_followup" }),
-                    );
-                    return Ok(Some(error.to_string()));
-                }
-            };
+        let parsed = match crate::web_search::parse_chat_response(&body, &followup.content_type) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let failed = converter.fail(
+                    error.to_string(),
+                    Some("web_search_followup_invalid".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.failed",
+                    serde_json::json!({ "stage": "parse_followup" }),
+                );
+                return Ok(Some(error.to_string()));
+            }
+        };
         let output = converter.push_parsed_chat_response(&parsed);
         stream.write_all(&output).await?;
     }
@@ -5853,6 +6068,152 @@ mod tests {
         assert!(!response.contains("unsupported_encrypted_agent_content"));
     }
 
+    #[tokio::test]
+    async fn completed_exec_stream_does_not_wait_for_upstream_eof() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = BackendSettings {
+            active_relay_id: "terminal-stream".into(),
+            relay_profiles: vec![crate::settings::RelayProfile {
+                id: "terminal-stream".into(),
+                base_url: format!("http://{upstream_addr}/v1"),
+                protocol: crate::settings::RelayProtocol::Responses,
+                relay_mode: crate::settings::RelayMode::PureApi,
+                api_key: "fixture-only".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::settings::SettingsStore::new(path.clone())
+            .save(&settings)
+            .unwrap();
+        let previous = crate::paths::set_settings_path_for_tests(Some(path));
+        let upstream = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = upstream_listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = find_header_end(&buffer) {
+                        let headers = String::from_utf8_lossy(&buffer[..end]);
+                        let length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        if buffer.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                if attempt == 0 {
+                    let rejection = serde_json::json!({
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": crate::responses_exec::EXEC_REJECTION_MESSAGE
+                        }
+                    })
+                    .to_string();
+                    write_http_response(
+                        &mut socket,
+                        "400 Bad Request",
+                        "application/json",
+                        rejection.as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    let event = serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "object": "response",
+                            "status": "completed",
+                            "output": [{
+                                "type": "function_call",
+                                "name": "exec",
+                                "id": "fc_review",
+                                "call_id": "review",
+                                "arguments": "{\"input\":\"text('ok')\"}"
+                            }]
+                        }
+                    });
+                    let payload =
+                        format!("event: response.completed\ndata: {event}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n",
+                        payload.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (socket, address) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(socket, Some(address)).await
+        });
+        let body = serde_json::json!({
+            "model": "terminal-stream",
+            "stream": true,
+            "store": false,
+            "input": "fixture",
+            "tools": [{"type": "custom", "name": "exec", "format": {"type": "text"}}]
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        // 先等待终态事件，再计时关闭，隔离并行测试的启动延迟。
+        let terminal_seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let read = client.read_buf(&mut response).await?;
+                if read == 0
+                    || String::from_utf8_lossy(&response).contains("event: response.completed")
+                {
+                    return Ok::<_, std::io::Error>(());
+                }
+            }
+        })
+        .await;
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await;
+        upstream.abort();
+        helper.abort();
+        let _ = upstream.await;
+        let _ = helper.await;
+        crate::paths::set_settings_path_for_tests(previous);
+        drop(_settings_guard);
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            matches!(terminal_seen, Ok(Ok(()))),
+            "{terminal_seen:?}: {response}"
+        );
+        assert!(response.contains("event: response.completed"), "{response}");
+        assert!(response.contains("data: [DONE]"), "{response}");
+        assert!(
+            matches!(completed, Ok(Ok(_))),
+            "completed exec SSE waits for upstream EOF: {response}"
+        );
+    }
+
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -5870,6 +6231,97 @@ mod tests {
         client.read_to_end(&mut response).await.unwrap();
         helper.await.unwrap();
         response
+    }
+
+    #[tokio::test]
+    async fn helper_serves_adapted_exec_json_and_sse_without_exposing_the_wrapper() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let server = MockServer::start().await;
+        let settings = BackendSettings {
+            active_relay_id: "served-exec".to_string(),
+            relay_profiles: vec![crate::settings::RelayProfile {
+                id: "served-exec".to_string(),
+                base_url: format!("{}/v1", server.uri()),
+                protocol: crate::settings::RelayProtocol::Responses,
+                relay_mode: crate::settings::RelayMode::PureApi,
+                api_key: "fixture-only".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::settings::SettingsStore::new(path.clone())
+            .save(&settings)
+            .unwrap();
+        let previous = crate::paths::set_settings_path_for_tests(Some(path));
+        let program = "text(\"served exec\");";
+        let arguments = serde_json::json!({"input":program}).to_string();
+        let item = serde_json::json!({
+            "type":"function_call", "id":"fc_served", "call_id":"call_served",
+            "name":"exec", "arguments":arguments, "status":"completed"
+        });
+        let response = serde_json::json!({
+            "object":"response", "status":"completed", "output":[item]
+        });
+        Mock::given(method("POST"))
+            .respond_with(move |incoming: &wiremock::Request| {
+                let body: serde_json::Value = incoming.body_json().unwrap();
+                if body["tools"][0]["type"] == "custom" {
+                    return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error":{"type":"invalid_request_error",
+                                 "message":crate::responses_exec::EXEC_REJECTION_MESSAGE,
+                                 "param":"tools[0]"}
+                    }));
+                }
+                if body["stream"] == true {
+                    let event =
+                        serde_json::json!({"type":"response.completed","response":response});
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!(
+                            "event: response.completed\ndata: {event}\n\ndata: [DONE]\n\n"
+                        ))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(&response)
+                }
+            })
+            .mount(&server)
+            .await;
+        for is_stream in [false, true] {
+            let body = serde_json::json!({
+                "model": if is_stream {"stream-model"} else {"json-model"},
+                "stream":is_stream, "store":false, "input":"fixture",
+                "tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]
+            })
+            .to_string();
+            let request = format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                send_raw_helper_request(request.as_bytes()),
+            )
+            .await
+            .unwrap();
+            let headers_end = find_header_end(&bytes).unwrap();
+            let body = String::from_utf8(bytes[headers_end + 4..].to_vec()).unwrap();
+            assert!(body.contains("custom_tool_call"), "{body}");
+            assert!(!body.contains("function_call"), "{body}");
+            assert!(!body.contains("\"arguments\""), "{body}");
+            if is_stream {
+                assert!(body.contains("response.custom_tool_call_input.delta"));
+                assert!(body.contains("data: [DONE]"));
+            } else {
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["output"][0]["input"], program);
+            }
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        crate::paths::set_settings_path_for_tests(previous);
     }
 
     #[tokio::test]
@@ -6072,9 +6524,13 @@ mod proxy_stream_tests {
             wire_api: UpstreamWireApi::Responses,
             compaction: false,
             native_compaction_passthrough: false,
-            buffered_body: Some(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_vec()),
+            buffered_body: Some(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".to_vec(),
+            ),
             response: None,
             web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
         };
 
         let forwarded = tokio::spawn(async move {
@@ -6172,6 +6628,8 @@ mod proxy_stream_tests {
             buffered_body: None,
             response: Some(first_response),
             web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
         };
 
         let mut settings = BackendSettings::default();
@@ -6223,10 +6681,7 @@ mod proxy_stream_tests {
             )
             .await
             .unwrap();
-            assert!(
-                failure.is_none(),
-                "web search stream failed: {failure:?}"
-            );
+            assert!(failure.is_none(), "web search stream failed: {failure:?}");
             writer.shutdown().await.unwrap();
         });
         let mut response = Vec::new();
@@ -6276,8 +6731,7 @@ mod proxy_stream_tests {
             .unwrap()
             .pop()
             .unwrap();
-        let search_body: serde_json::Value =
-            serde_json::from_slice(&search_request.body).unwrap();
+        let search_body: serde_json::Value = serde_json::from_slice(&search_request.body).unwrap();
         assert_eq!(search_body["query"], "Codex");
     }
 
@@ -6329,6 +6783,8 @@ mod proxy_stream_tests {
             buffered_body: None,
             response: Some(first_response),
             web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
         };
 
         let mut settings = BackendSettings::default();
@@ -6383,10 +6839,7 @@ mod proxy_stream_tests {
             )
             .await
             .unwrap();
-            assert!(
-                failure.is_none(),
-                "client tool stream failed: {failure:?}"
-            );
+            assert!(failure.is_none(), "client tool stream failed: {failure:?}");
             writer.shutdown().await.unwrap();
         });
         let mut response = Vec::new();
@@ -6438,7 +6891,12 @@ mod proxy_stream_tests {
         waited.await.unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains(": codex-plus-web-search-keepalive\n\n"));
-        assert!(output.matches(": codex-plus-web-search-keepalive\n\n").count() >= 1);
+        assert!(
+            output
+                .matches(": codex-plus-web-search-keepalive\n\n")
+                .count()
+                >= 1
+        );
     }
 
     #[tokio::test]
@@ -6505,5 +6963,48 @@ mod proxy_stream_tests {
         assert!(failure.is_none());
         assert!(output.contains("event: response.completed"));
         assert!(!output.contains("event: response.failed"));
+    }
+
+    /// Anthropic 上游：`message_stop` 是完成事件，缺失时按掐断上报而不是伪装成功。
+    #[tokio::test]
+    async fn anthropic_stream_is_converted_and_truncation_is_reported() {
+        let complete = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (failure, output) =
+            forward_fixture(complete, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("你好"));
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+
+        // 少了 message_stop：已有增量不能重放，也不能记成正常结束。
+        let truncated = complete
+            .split("event: message_delta")
+            .next()
+            .expect("fixture 由多个事件拼成");
+        let (failure, output) =
+            forward_fixture(truncated, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(
+            failure.expect("流中途断开必须报错").contains("完成事件"),
+            "错误原因要能指向缺失的完成事件"
+        );
+        assert!(output.contains("event: response.failed"));
+
+        // 只有 message_stop 缺失、但 stop_reason 已到：与 chat 上游口径一致，
+        // finish_reason 本身就是终止信号，按成功处理而不是报「被掐断」。
+        let without_stop = complete.replace(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "",
+        );
+        let (failure, output) =
+            forward_fixture(&without_stop, false, UpstreamWireApi::AnthropicMessages).await;
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(output.contains("event: response.completed"));
     }
 }
