@@ -151,7 +151,6 @@ impl CodexAppServer {
         // conhost。仓库其它 spawn 路径都已设该标志，仅此处遗漏（issue #2048）。
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         }
         let mut child = command.spawn().map_err(|error| {

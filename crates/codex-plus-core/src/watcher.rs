@@ -1804,7 +1804,7 @@ fn macos_codex_process_ids<'a>(process_lines: impl IntoIterator<Item = &'a str>)
     macos_codex_process_ids_with(process_lines, read_macos_bundle_identifier)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn macos_codex_process_ids_with<'a>(
     process_lines: impl IntoIterator<Item = &'a str>,
     bundle_identifier: impl Fn(&Path) -> Option<String>,

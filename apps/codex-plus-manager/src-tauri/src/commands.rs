@@ -1609,7 +1609,7 @@ fn multi_worker_process_matches(pid: u32, options_path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        let _ = options_path;
+        let _ = (pid, options_path);
         true
     }
     #[cfg(not(any(unix, windows)))]
@@ -3026,6 +3026,7 @@ pub fn find_desktop_codex_cli() -> CommandResult<Value> {
     }
 }
 
+#[cfg(not(windows))]
 fn codex_cli_can_start(path: &std::path::Path) -> bool {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};

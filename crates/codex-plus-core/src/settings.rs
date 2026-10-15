@@ -2641,6 +2641,7 @@ mod tests {
         assert_eq!(updated.relay_profiles, initial.relay_profiles);
     }
 
+    #[test]
     fn settings_deserialize_normalizes_stepwise_protocol_and_supports_legacy_missing_field() {
         let defaults: BackendSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(defaults.codex_app_stepwise_protocol, "chat_completions");
