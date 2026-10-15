@@ -6396,6 +6396,12 @@ mod proxy_stream_tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("need a patch"));
         assert!(response.contains("apply_patch"));
+        assert_eq!(
+            response
+                .matches("event: response.custom_tool_call_input.delta")
+                .count(),
+            1
+        );
         assert_eq!(response.matches("event: response.completed").count(), 1);
         assert!(!response.contains("event: response.failed"));
         assert!(!response.contains("web_search_call"));

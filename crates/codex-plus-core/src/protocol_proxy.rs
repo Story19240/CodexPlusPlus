@@ -4130,6 +4130,7 @@ struct ToolCallState {
     arguments: String,
     added: bool,
     done: bool,
+    final_input_event_sent: bool,
 }
 
 #[derive(Debug)]
@@ -4643,9 +4644,10 @@ impl ChatSseState {
         self.finalize_text_into(output);
         let keys: Vec<usize> = self.tools.keys().copied().collect();
         for key in keys {
-            if let Some(state) = self.tools.get(&key) {
+            if let Some(state) = self.tools.get_mut(&key) {
                 let output_index = state.output_index.unwrap_or(0);
                 push_tool_call_done_sse(output, state, output_index, &self.tool_context);
+                state.final_input_event_sent = true;
             }
         }
     }
@@ -4822,7 +4824,63 @@ impl ChatSseState {
             let item = tool_call_done_item(state, &self.tool_context);
             state.done = true;
             self.output_items.push((output_index, item.clone()));
-            push_tool_call_done_sse(output, state, output_index, &self.tool_context);
+            if !state.final_input_event_sent {
+                push_tool_call_done_sse(output, state, output_index, &self.tool_context);
+                state.final_input_event_sent = true;
+            }
+            push_sse(
+                output,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item
+                }),
+            );
+        }
+    }
+
+    fn complete_streamed_tool_calls_into(&mut self, output: &mut String, status: &str) {
+        self.ensure_response_started_into(output);
+        let keys: Vec<usize> = self.tools.keys().copied().collect();
+        for key in keys {
+            if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
+                continue;
+            }
+            if self
+                .tools
+                .get(&key)
+                .map(|state| !state.added && !state.done)
+                .unwrap_or(false)
+            {
+                let assigned = self.next_output_index();
+                let state = self.tools.get_mut(&key).expect("tool state exists");
+                state.added = true;
+                if state.call_id.is_empty() {
+                    state.call_id = format!("call_{key}");
+                }
+                if state.name.is_empty() {
+                    state.name = "unknown_tool".to_string();
+                }
+                state.output_index = Some(assigned);
+                state.item_id = tool_call_item_id(&state.call_id, &state.name, &self.tool_context);
+                let added_item = tool_call_added_item(state, assigned, &self.tool_context);
+                push_sse(output, "response.output_item.added", added_item);
+            }
+
+            let state = self.tools.get_mut(&key).expect("tool state exists");
+            let output_index = state.output_index.unwrap_or(0);
+            if !state.final_input_event_sent {
+                push_tool_call_done_sse(output, state, output_index, &self.tool_context);
+                state.final_input_event_sent = true;
+            }
+            let item = if status == "failed" {
+                tool_call_failed_item(state, &self.tool_context)
+            } else {
+                tool_call_done_item(state, &self.tool_context)
+            };
+            state.done = true;
+            self.output_items.push((output_index, item.clone()));
             push_sse(
                 output,
                 "response.output_item.done",
@@ -4836,6 +4894,9 @@ impl ChatSseState {
     }
 
     fn failed_into(&mut self, output: &mut String, message: String, error_type: Option<String>) {
+        if !self.completed {
+            self.complete_streamed_tool_calls_into(output, "failed");
+        }
         self.completed = true;
         let mut error = json!({ "message": message });
         if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
@@ -7200,6 +7261,12 @@ fn tool_call_done_item(state: &ToolCallState, tool_context: &CodexToolContext) -
     response_tool_call_item(&state.call_id, &state.name, &state.arguments, tool_context)
 }
 
+fn tool_call_failed_item(state: &ToolCallState, tool_context: &CodexToolContext) -> Value {
+    let mut item = tool_call_done_item(state, tool_context);
+    item["status"] = json!("failed");
+    item
+}
+
 fn response_tool_call_item(
     call_id: &str,
     name: &str,
@@ -8215,6 +8282,20 @@ mod response_compatibility_tests {
         panic!("SSE should contain one response.completed event");
     }
 
+    fn failed_response_from_sse(sse: &str) -> Value {
+        for block in sse.split("\n\n") {
+            if !block.contains("event: response.failed") {
+                continue;
+            }
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("failed event should carry data");
+            return serde_json::from_str(data).expect("failed event should be JSON");
+        }
+        panic!("SSE should contain one response.failed event");
+    }
+
     #[test]
     fn web_search_stream_keeps_first_reasoning_and_continues_output_items() {
         let request = json!({
@@ -8351,6 +8432,97 @@ mod response_compatibility_tests {
         assert!(failed.contains("\"status\":\"failed\""));
         assert!(failed.contains("event: response.failed"));
         assert!(!failed.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn web_search_parse_failure_closes_streamed_tool_items() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [
+                { "type": "web_search" },
+                { "type": "custom", "name": "apply_patch" }
+            ]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        let streamed = String::from_utf8(converter.push_bytes(
+            concat!(
+                "data: {\"id\":\"chatcmpl-invalid\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_patch\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"patch\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        ))
+        .unwrap();
+        let pause = String::from_utf8(converter.pause_for_web_search()).unwrap();
+        let failed = String::from_utf8(converter.fail(
+            "mixed tools are not supported".to_string(),
+            Some("web_search_call_invalid".to_string()),
+        ))
+        .unwrap();
+
+        let mut all = streamed;
+        all.push_str(&pause);
+        all.push_str(&failed);
+        assert!(all.contains("first thought"));
+        assert!(all.contains("\"type\":\"web_search_call\""));
+        assert!(all.contains("\"type\":\"custom_tool_call\""));
+        assert!(all.contains("\"status\":\"failed\""));
+        assert_eq!(all.matches("event: response.output_item.done").count(), 3);
+        assert!(all.contains("event: response.failed"));
+        assert!(!all.contains("event: response.completed"));
+
+        let failed_response = failed_response_from_sse(&all);
+        let output_types = failed_response["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["reasoning", "web_search_call", "custom_tool_call"]
+        );
+        assert_eq!(failed_response["response"]["output"][1]["status"], "failed");
+        assert_eq!(failed_response["response"]["output"][2]["status"], "failed");
+    }
+
+    #[test]
+    fn stream_error_closes_tool_items_that_never_reached_pause() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        let streamed = String::from_utf8(converter.push_bytes(
+            concat!(
+                "data: {\"id\":\"chatcmpl-truncated\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n"
+            )
+            .as_bytes(),
+        ))
+        .unwrap();
+        let failed = String::from_utf8(converter.fail(
+            "upstream stream failed".to_string(),
+            Some("stream_error".to_string()),
+        ))
+        .unwrap();
+
+        let mut all = streamed;
+        all.push_str(&failed);
+        assert!(all.contains("\"type\":\"web_search_call\""));
+        assert!(all.contains("\"status\":\"failed\""));
+        assert_eq!(all.matches("event: response.output_item.done").count(), 1);
+        assert!(all.contains("event: response.failed"));
+        assert!(!all.contains("event: response.completed"));
+
+        let failed_response = failed_response_from_sse(&all);
+        assert_eq!(failed_response["response"]["output"][0]["type"], "web_search_call");
+        assert_eq!(failed_response["response"]["output"][0]["status"], "failed");
     }
 
     #[tokio::test]
