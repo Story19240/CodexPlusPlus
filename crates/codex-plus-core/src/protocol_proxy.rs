@@ -5829,11 +5829,7 @@ fn normalize_chat_messages(messages: &mut [Value]) {
             Some(Value::Array(parts)) => !parts.is_empty(),
             Some(_) => true,
         };
-        let has_tool_calls = message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some_and(|tool_calls| !tool_calls.is_empty());
-        if !has_content && !has_tool_calls {
+        if !has_content {
             message["content"] = json!("");
         }
     }
@@ -7389,6 +7385,7 @@ fn web_search_action_from_arguments(arguments: &str) -> Value {
     }
 }
 
+#[cfg(test)]
 fn web_search_action_has_target(action: &Value) -> bool {
     action
         .get("query")
@@ -8337,6 +8334,22 @@ mod response_compatibility_tests {
             json!(["query"])
         );
         assert_eq!(converted["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn normalize_chat_messages_adds_content_to_assistant_tool_calls() {
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{ "id": "call", "type": "function", "function": { "name": "web_search" } }]
+            }),
+            json!({ "role": "assistant", "content": Value::Null }),
+            json!({ "role": "assistant", "content": "existing" }),
+        ];
+        normalize_chat_messages(&mut messages);
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["content"], "");
+        assert_eq!(messages[2]["content"], "existing");
     }
 
     #[test]

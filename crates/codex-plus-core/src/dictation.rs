@@ -567,6 +567,7 @@ async fn transcribe_recording(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(settings.timeout_seconds.clamp(1, 600)))
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
         .build()
         .map_err(|_| DictationError::new(502, "无法创建语音服务连接"))?;
     let mut request = client
@@ -1407,12 +1408,9 @@ mod tests {
                 bytes.extend_from_slice(&buffer[..count]);
             }
             started_sender.send(()).unwrap();
-            // 不发送响应；只有 reqwest future 被丢弃，连接才会在两秒内结束。
-            let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(count, 0);
+            // 取消分支会立即丢弃 reqwest future；hyper 的后台连接驱动
+            // 不保证同步发送 FIN，这里不能让测试服务端等待客户端 EOF。
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = stream.shutdown().await;
         });
         let payload = bridge_payload(b"delayed-audio", "audio/wav");

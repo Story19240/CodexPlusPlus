@@ -484,7 +484,12 @@ pub fn build_web_search_followup_request(
         .unwrap_or_else(|| json!({}));
     stream_options["include_usage"] = json!(true);
     request["stream_options"] = stream_options;
-    if request.get("tool_choice").is_some() {
+    let forced_web_search_choice = request.get("tool_choice").is_some_and(|choice| {
+        choice.as_str() == Some("web_search")
+            || choice.pointer("/function/name").and_then(Value::as_str) == Some("web_search")
+            || choice.get("type").and_then(Value::as_str) == Some("web_search")
+    });
+    if forced_web_search_choice {
         request["tool_choice"] = json!("auto");
     }
     Ok(request)
@@ -509,7 +514,7 @@ pub fn format_search_results(query: &str, results: &[WebSearchResult]) -> String
 
 fn query_from_arguments(arguments: &str) -> anyhow::Result<String> {
     let parsed: Value = serde_json::from_str(arguments).context("web_search 参数不是有效 JSON")?;
-    for key in ["query", "input", "q"] {
+    for key in ["query", "input", "q", "url"] {
         if let Some(query) = parsed.get(key).and_then(Value::as_str) {
             let query = query.trim();
             if !query.is_empty() {
@@ -527,7 +532,7 @@ fn query_from_arguments(arguments: &str) -> anyhow::Result<String> {
             return Ok(query.to_string());
         }
     }
-    bail!("web_search 参数缺少 query/input/queries")
+    bail!("web_search 参数缺少 query/input/queries/url")
 }
 
 fn configured_api_key(direct: &str, env_name: &str, provider: &str) -> anyhow::Result<String> {
@@ -848,6 +853,35 @@ mod tests {
     }
 
     #[test]
+    fn web_search_calls_accept_url_fallback() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-url".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_url",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"url\":\"https://example.com/article\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+
+        assert_eq!(
+            parsed.web_search_calls().unwrap(),
+            vec![WebSearchToolCall {
+                call_id: "call_url".to_string(),
+                query: "https://example.com/article".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn chat_stream_parser_and_followup_request_preserve_tool_contract() {
         let stream = concat!(
             "data: {\"id\":\"chatcmpl-search\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\"}}]}}]}\n\n",
@@ -900,6 +934,55 @@ mod tests {
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_search");
         assert_eq!(messages[2]["content"], "Web search result");
+    }
+
+    #[test]
+    fn followup_preserves_non_web_search_tool_choice() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-search".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Codex\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+        let outputs = vec![WebSearchToolOutput {
+            call_id: "call_search".to_string(),
+            query: "Codex".to_string(),
+            content: "Web search result".to_string(),
+        }];
+
+        for tool_choice in [
+            json!("none"),
+            json!({ "type": "function", "function": { "name": "other_tool" } }),
+        ] {
+            let followup = build_web_search_followup_request(
+                &json!({
+                    "model": "fixture-model",
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "stream": false,
+                    "tools": [
+                        { "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } },
+                        { "type": "function", "function": { "name": "other_tool", "parameters": { "type": "object" } } }
+                    ],
+                    "tool_choice": tool_choice,
+                }),
+                &parsed,
+                &outputs,
+            )
+            .unwrap();
+            assert_eq!(followup["tool_choice"], tool_choice);
+        }
     }
 
     #[test]
