@@ -48,8 +48,18 @@ pub struct ParsedChatResponse {
 
 impl ParsedChatResponse {
     pub fn web_search_calls(&self) -> anyhow::Result<Vec<WebSearchToolCall>> {
+        let (calls, has_client_tool) = self.web_search_calls_with_client_tools()?;
+        if has_client_tool && !calls.is_empty() {
+            bail!("服务端 Web 搜索暂不支持与其它工具在同轮混合调用");
+        }
+        Ok(calls)
+    }
+
+    pub(crate) fn web_search_calls_with_client_tools(
+        &self,
+    ) -> anyhow::Result<(Vec<WebSearchToolCall>, bool)> {
         let Some(tool_calls) = self.message.get("tool_calls").and_then(Value::as_array) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let has_web_search = tool_calls.iter().any(|tool_call| {
             tool_call
@@ -64,16 +74,24 @@ impl ParsedChatResponse {
                 .is_some_and(|name| name != "web_search")
         });
         if has_web_search && has_client_tool {
-            bail!("服务端 Web 搜索暂不支持与其它工具在同轮混合调用");
+            // 流式编排可以执行 web_search，同时把客户端工具交还 Codex。
+            // 严格版 web_search_calls() 仍保留该错误，供非流式路径使用。
         }
         if !has_web_search {
             // 模型选择 apply_patch、view_image 等客户端工具时，正常把工具调用交还
             // Codex 执行；这不是 Web Search 编排可以代替的请求。
-            return Ok(Vec::new());
+            return Ok((Vec::new(), has_client_tool));
         }
 
         let mut calls = Vec::new();
         for tool_call in tool_calls {
+            let is_web_search = tool_call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "web_search");
+            if !is_web_search {
+                continue;
+            }
             let function = tool_call.get("function").unwrap_or(&Value::Null);
             let call_id = tool_call
                 .get("id")
@@ -91,7 +109,7 @@ impl ParsedChatResponse {
                 queries,
             });
         }
-        Ok(calls)
+        Ok((calls, has_client_tool))
     }
 }
 
@@ -492,8 +510,8 @@ pub fn build_web_search_followup_request_with_web_search_tool(
     retain_web_search_tool: bool,
 ) -> anyhow::Result<Value> {
     let mut request = chat_request.clone();
-    // 默认二段不暴露服务端搜索工具。流式编排允许继续搜索时显式保留它，
-    // 由 launcher 按轮数上限继续执行，避免模型把未执行的工具调用写成文本。
+    // 默认二段不暴露服务端搜索工具。连续搜索轮次保留全部工具，但禁用并行
+    // tool_calls 并在工具描述中要求 web_search 单独调用，避免混合调用破坏配对。
     let should_remove_tools = if retain_web_search_tool {
         false
     } else if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
@@ -553,6 +571,9 @@ pub fn build_web_search_followup_request_with_web_search_tool(
     });
     if forced_web_search_choice {
         request["tool_choice"] = json!("auto");
+    }
+    if retain_web_search_tool {
+        request["parallel_tool_calls"] = json!(false);
     }
     Ok(request)
 }
@@ -984,6 +1005,47 @@ mod tests {
     }
 
     #[test]
+    fn web_search_streaming_can_extract_mixed_client_and_server_tools() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-mixed-tools".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\":\"Codex\"}"
+                        }
+                    },
+                    {
+                        "id": "call_client",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"patch\"}"
+                        }
+                    }
+                ]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+
+        let (calls, has_client_tool) = parsed.web_search_calls_with_client_tools().unwrap();
+        assert!(has_client_tool);
+        assert_eq!(
+            calls,
+            vec![WebSearchToolCall {
+                call_id: "call_search".to_string(),
+                queries: vec!["Codex".to_string()],
+            }]
+        );
+    }
+
+    #[test]
     fn web_search_calls_accept_url_fallback() {
         let parsed = ParsedChatResponse {
             id: "chatcmpl-url".to_string(),
@@ -1125,6 +1187,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(followup["tool_choice"], "auto");
+        assert_eq!(followup["parallel_tool_calls"], false);
         let tools = followup["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["function"]["name"], "web_search");

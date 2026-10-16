@@ -542,7 +542,11 @@ pub(crate) fn responses_to_chat_completions_with_web_search(
         }) {
             result["tool_choice"] = tool_choice;
         }
-        if let Some(value) = body.get("parallel_tool_calls") {
+        if execute_web_search {
+            // 服务端搜索由代理二段编排执行；同轮混入客户端工具会破坏 tool_call
+            // 配对。禁用并行工具调用，降低上游一次返回混合 tool_calls 的概率。
+            result["parallel_tool_calls"] = json!(false);
+        } else if let Some(value) = body.get("parallel_tool_calls") {
             result["parallel_tool_calls"] = value.clone();
         }
     }
@@ -1755,6 +1759,18 @@ impl ChatSseToResponsesConverter {
         let mut output = String::new();
         self.state
             .complete_web_search_calls_into(&mut output, "completed");
+        output.into_bytes()
+    }
+
+    /// 混合调用时，把服务端搜索结果落成普通 assistant message。
+    /// 客户端工具由 Codex 执行；下轮历史会携带这条消息，搜索结果不会丢。
+    pub(crate) fn push_web_search_results(
+        &mut self,
+        outputs: &[crate::web_search::WebSearchToolOutput],
+    ) -> Vec<u8> {
+        let mut output = String::new();
+        self.state
+            .push_web_search_results_into(&mut output, outputs);
         output.into_bytes()
     }
 
@@ -5032,6 +5048,105 @@ impl ChatSseState {
         }
     }
 
+    fn push_web_search_results_into(
+        &mut self,
+        output: &mut String,
+        outputs: &[crate::web_search::WebSearchToolOutput],
+    ) {
+        self.ensure_response_started_into(output);
+        self.flush_inline_think_at_boundary_into(output);
+        self.finalize_reasoning_into(output);
+        self.finalize_text_into(output);
+
+        let text = outputs
+            .iter()
+            .map(|search_output| {
+                format!(
+                    "Web search results for {}:\n{}",
+                    search_output
+                        .queries
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    search_output.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let output_index = self.next_output_index();
+        let item_id = format!(
+            "msg_{}_web_search_results",
+            response_id_body(&self.response_id)
+        );
+        let item = json!({
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+        });
+
+        push_sse(
+            output,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        );
+        push_sse(
+            output,
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] }
+            }),
+        );
+        push_sse(
+            output,
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": text
+            }),
+        );
+        push_sse(
+            output,
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": text, "annotations": [] }
+            }),
+        );
+        push_sse(
+            output,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item
+            }),
+        );
+        self.output_items.push((output_index, item));
+    }
+
     fn resume_after_web_search(&mut self, first_response_id: &str) {
         self.final_response_id = Some(first_response_id.to_string());
         self.response_id = format!("{first_response_id}_followup");
@@ -6668,7 +6783,7 @@ fn web_search_chat_tool() -> Value {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current information.",
+            "description": "Search the web for current information. Call this tool by itself; do not combine it with other tool calls in the same assistant message.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -8658,7 +8773,11 @@ mod response_compatibility_tests {
                 "model": "fixture-model",
                 "input": "hi",
                 "stream": true,
-                "tools": [{ "type": "web_search" }],
+                "parallel_tool_calls": true,
+                "tools": [
+                    { "type": "web_search" },
+                    { "type": "function", "name": "other_tool", "parameters": { "type": "object" } }
+                ],
                 "tool_choice": { "type": "web_search" }
             }),
             false,
@@ -8667,6 +8786,14 @@ mod response_compatibility_tests {
         .unwrap();
 
         assert_eq!(converted["tools"][0]["function"]["name"], "web_search");
+        assert_eq!(converted["tools"][1]["function"]["name"], "other_tool");
+        assert_eq!(converted["parallel_tool_calls"], false);
+        assert!(
+            converted["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Call this tool by itself")
+        );
         assert_eq!(
             converted["tools"][0]["function"]["parameters"]["required"],
             json!(["query"])
