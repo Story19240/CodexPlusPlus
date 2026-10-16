@@ -34,6 +34,9 @@ const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
 const WEB_SEARCH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const WEB_SEARCH_FOLLOWUP_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const WEB_SEARCH_KEEPALIVE: &[u8] = b": codex-plus-web-search-keepalive\n\n";
+/// 同一个响应内最多执行 3 轮服务端搜索。最后一轮后的模型请求移除 web_search，
+/// 防止模型无限要求搜索而无法产出最终答案。
+const MAX_WEB_SEARCH_ROUNDS: usize = 3;
 
 /// 看门狗内跟踪重注入退避状态；持续健康一段时间或应用实例更换时重置。
 #[derive(Debug, Default)]
@@ -3171,7 +3174,6 @@ async fn forward_web_search_protocol_proxy_stream(
     let pause_output = converter.pause_for_web_search();
     stream.write_all(&pause_output).await?;
     let first_parsed = converter.parsed_chat_response();
-    let first_response_id = first_parsed.id.clone();
     if first_parsed.finish_reason.is_none() {
         let failed = converter.fail(
             "上游响应缺少 finish_reason".to_string(),
@@ -3216,171 +3218,236 @@ async fn forward_web_search_protocol_proxy_stream(
         return Ok(None);
     }
 
-    let query_lengths = search_calls
-        .iter()
-        .map(|call| call.query.chars().count())
-        .collect::<Vec<_>>();
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "web_search.call_detected",
-        serde_json::json!({
-            "callCount": search_calls.len(),
-            "argumentsValid": true,
-            "queryLengths": query_lengths
-        }),
-    );
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "web_search.call_count",
-        serde_json::json!({ "callCount": search_calls.len() }),
-    );
+    let mut current_chat_request = context.chat_request.clone();
+    let mut current_parsed = first_parsed;
+    let mut current_search_calls = search_calls;
+    let mut search_round = 1usize;
 
-    let search_outputs = match wait_with_web_search_keepalive(
-        stream,
-        crate::web_search::execute_web_search_calls_at(
-            &context.settings.web_search,
-            &search_calls,
-            context.search_endpoint.as_deref(),
-        ),
-    )
-    .await
-    {
-        Ok(Ok(outputs)) => outputs,
-        Ok(Err(error)) => {
-            let failed = converter.fail_web_search_calls(
-                error.to_string(),
-                Some("web_search_provider_failed".to_string()),
-            );
-            stream.write_all(&failed).await?;
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "web_search.failed",
-                serde_json::json!({ "stage": "provider" }),
-            );
-            return Ok(Some(error.to_string()));
+    loop {
+        if search_round > 1 {
+            let pause_output = converter.pause_for_web_search();
+            stream.write_all(&pause_output).await?;
         }
-        Err(error) => return Err(error),
-    };
-    let completed_calls = converter.complete_web_search_calls();
-    stream.write_all(&completed_calls).await?;
+        let query_count: usize = current_search_calls
+            .iter()
+            .map(|call| call.queries.len())
+            .sum();
+        let query_lengths = current_search_calls
+            .iter()
+            .flat_map(|call| call.queries.iter())
+            .map(|query| query.chars().count())
+            .collect::<Vec<_>>();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.call_detected",
+            serde_json::json!({
+                "callCount": current_search_calls.len(),
+                "queryCount": query_count,
+                "searchRound": search_round,
+                "argumentsValid": true,
+                "queryLengths": query_lengths
+            }),
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.call_count",
+            serde_json::json!({ "callCount": current_search_calls.len() }),
+        );
 
-    let followup_request = match crate::web_search::build_web_search_followup_request(
-        &context.chat_request,
-        &first_parsed,
-        &search_outputs,
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            let failed = converter.fail(
-                error.to_string(),
-                Some("web_search_followup_invalid".to_string()),
-            );
-            stream.write_all(&failed).await?;
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "web_search.failed",
-                serde_json::json!({ "stage": "build_followup" }),
-            );
-            return Ok(Some(error.to_string()));
-        }
-    };
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "web_search.followup_request",
-        serde_json::json!({
-            "messageCount": followup_request
-                .get("messages")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
-            "toolCount": followup_request
-                .get("tools")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
-            "stream": true
-        }),
-    );
+        let search_outputs = match wait_with_web_search_keepalive(
+            stream,
+            crate::web_search::execute_web_search_calls_at(
+                &context.settings.web_search,
+                &current_search_calls,
+                context.search_endpoint.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(outputs)) => outputs,
+            Ok(Err(error)) => {
+                let failed = converter.fail_web_search_calls(
+                    error.to_string(),
+                    Some("web_search_provider_failed".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.failed",
+                    serde_json::json!({ "stage": "provider", "searchRound": search_round }),
+                );
+                return Ok(Some(error.to_string()));
+            }
+            Err(error) => return Err(error),
+        };
+        let completed_calls = converter.complete_web_search_calls();
+        stream.write_all(&completed_calls).await?;
 
-    let mut followup = match wait_with_web_search_keepalive(
-        stream,
-        crate::protocol_proxy::send_web_search_followup_request(
-            &context,
-            &followup_request,
-            session_headers,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
+        let retain_web_search_tool = search_round < MAX_WEB_SEARCH_ROUNDS;
+        let followup_request =
+            match crate::web_search::build_web_search_followup_request_with_web_search_tool(
+                &current_chat_request,
+                &current_parsed,
+                &search_outputs,
+                retain_web_search_tool,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    let failed = converter.fail(
+                        error.to_string(),
+                        Some("web_search_followup_invalid".to_string()),
+                    );
+                    stream.write_all(&failed).await?;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.failed",
+                        serde_json::json!({
+                            "stage": "build_followup",
+                            "searchRound": search_round
+                        }),
+                    );
+                    return Ok(Some(error.to_string()));
+                }
+            };
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.followup_request",
+            serde_json::json!({
+                "messageCount": followup_request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                "toolCount": followup_request
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                "searchRound": search_round,
+                "retainWebSearchTool": retain_web_search_tool,
+                "stream": true
+            }),
+        );
+
+        let mut followup = match wait_with_web_search_keepalive(
+            stream,
+            crate::protocol_proxy::send_web_search_followup_request(
+                &context,
+                &followup_request,
+                session_headers,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let failed = converter.fail(
+                    format!("Web 搜索后的模型请求失败: {error}"),
+                    Some("web_search_followup_failed".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.failed",
+                    serde_json::json!({
+                        "stage": "followup",
+                        "searchRound": search_round
+                    }),
+                );
+                return Ok(Some(error.to_string()));
+            }
+            Err(error) => return Err(error),
+        };
+        if !followup.is_success() {
+            let status_code = followup.status_code;
+            let mut response = followup.take_response()?;
+            let body = crate::protocol_proxy::read_limited_upstream_body(
+                &mut response,
+                WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+            )
+            .await?;
+            let upstream_message = crate::protocol_proxy::upstream_error_message(
+                status_code,
+                &followup.content_type,
+                &body,
+            );
+            let failure_message =
+                format!("Web 搜索后的模型请求返回 HTTP {status_code}: {upstream_message}");
             let failed = converter.fail(
-                format!("Web 搜索后的模型请求失败: {error}"),
+                failure_message.clone(),
                 Some("web_search_followup_failed".to_string()),
             );
             stream.write_all(&failed).await?;
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "web_search.failed",
-                serde_json::json!({ "stage": "followup" }),
-            );
-            return Ok(Some(error.to_string()));
-        }
-        Err(error) => return Err(error),
-    };
-    if !followup.is_success() {
-        let status_code = followup.status_code;
-        let mut response = followup.take_response()?;
-        let body = crate::protocol_proxy::read_limited_upstream_body(
-            &mut response,
-            WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
-        )
-        .await?;
-        let upstream_message = crate::protocol_proxy::upstream_error_message(
-            status_code,
-            &followup.content_type,
-            &body,
-        );
-        let failure_message =
-            format!("Web 搜索后的模型请求返回 HTTP {status_code}: {upstream_message}");
-        let failed = converter.fail(
-            failure_message.clone(),
-            Some("web_search_followup_failed".to_string()),
-        );
-        stream.write_all(&failed).await?;
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "web_search.failed",
-            serde_json::json!({
-                "stage": "followup",
-                "statusCode": status_code,
-                "message": upstream_message
-            }),
-        );
-        return Ok(Some(failure_message));
-    }
-
-    converter.resume_after_web_search(&first_response_id);
-    if followup.is_stream {
-        let response = followup.take_response()?;
-        if let Some(reason) =
-            forward_web_search_chat_stream(stream, &mut converter, response.bytes_stream()).await?
-        {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "web_search.failed",
-                serde_json::json!({ "stage": "followup_response" }),
-            );
-            return Ok(Some(reason));
-        }
-        if !converter.saw_done() {
-            let failed = converter.fail(
-                "Web 搜索后的模型响应在完成事件前结束".to_string(),
-                Some("stream_incomplete".to_string()),
-            );
-            stream.write_all(&failed).await?;
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "web_search.failed",
                 serde_json::json!({
-                    "stage": "followup_response",
-                    "reasonKind": "stream_incomplete"
+                    "stage": "followup",
+                    "searchRound": search_round,
+                    "statusCode": status_code,
+                    "message": upstream_message
                 }),
             );
-            return Ok(Some("二段响应缺少完成事件".to_string()));
+            return Ok(Some(failure_message));
         }
-        if converter.parsed_chat_response().finish_reason.is_none() {
+
+        converter.resume_after_web_search(&current_parsed.id);
+        if followup.is_stream {
+            let response = followup.take_response()?;
+            if let Some(reason) =
+                forward_web_search_chat_stream(stream, &mut converter, response.bytes_stream())
+                    .await?
+            {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.failed",
+                    serde_json::json!({
+                        "stage": "followup_response",
+                        "searchRound": search_round
+                    }),
+                );
+                return Ok(Some(reason));
+            }
+            if !converter.saw_done() {
+                let failed = converter.fail(
+                    "Web 搜索后的模型响应在完成事件前结束".to_string(),
+                    Some("stream_incomplete".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.failed",
+                    serde_json::json!({
+                        "stage": "followup_response",
+                        "searchRound": search_round,
+                        "reasonKind": "stream_incomplete"
+                    }),
+                );
+                return Ok(Some("二段响应缺少完成事件".to_string()));
+            }
+        } else {
+            let mut response = followup.take_response()?;
+            let body = crate::protocol_proxy::read_limited_upstream_body(
+                &mut response,
+                WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+            )
+            .await?;
+            let parsed = match crate::web_search::parse_chat_response(&body, &followup.content_type)
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let failed = converter.fail(
+                        error.to_string(),
+                        Some("web_search_followup_invalid".to_string()),
+                    );
+                    stream.write_all(&failed).await?;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "web_search.failed",
+                        serde_json::json!({
+                            "stage": "parse_followup",
+                            "searchRound": search_round
+                        }),
+                    );
+                    return Ok(Some(error.to_string()));
+                }
+            };
+            let output = converter.push_parsed_chat_response(&parsed);
+            stream.write_all(&output).await?;
+        }
+
+        current_parsed = converter.parsed_chat_response();
+        if current_parsed.finish_reason.is_none() {
             let failed = converter.fail(
                 "Web 搜索后的模型响应缺少 finish_reason".to_string(),
                 Some("stream_incomplete".to_string()),
@@ -3390,35 +3457,53 @@ async fn forward_web_search_protocol_proxy_stream(
                 "web_search.failed",
                 serde_json::json!({
                     "stage": "followup_response",
+                    "searchRound": search_round,
                     "reasonKind": "missing_finish_reason"
                 }),
             );
             return Ok(Some("二段响应缺少 finish_reason".to_string()));
         }
-    } else {
-        let mut response = followup.take_response()?;
-        let body = crate::protocol_proxy::read_limited_upstream_body(
-            &mut response,
-            WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
-        )
-        .await?;
-        let parsed = match crate::web_search::parse_chat_response(&body, &followup.content_type) {
-            Ok(parsed) => parsed,
+
+        current_search_calls = match current_parsed.web_search_calls() {
+            Ok(calls) => calls,
             Err(error) => {
-                let failed = converter.fail(
+                let failed = converter.fail_web_search_calls(
                     error.to_string(),
-                    Some("web_search_followup_invalid".to_string()),
+                    Some("web_search_call_invalid".to_string()),
                 );
                 stream.write_all(&failed).await?;
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "web_search.failed",
-                    serde_json::json!({ "stage": "parse_followup" }),
+                    serde_json::json!({
+                        "stage": "parse_followup_response",
+                        "searchRound": search_round,
+                        "argumentsValid": false
+                    }),
                 );
                 return Ok(Some(error.to_string()));
             }
         };
-        let output = converter.push_parsed_chat_response(&parsed);
-        stream.write_all(&output).await?;
+        if current_search_calls.is_empty() {
+            break;
+        }
+        if !retain_web_search_tool {
+            let message = format!("Web 搜索超过 {MAX_WEB_SEARCH_ROUNDS} 轮上限");
+            let failed = converter
+                .fail_web_search_calls(message.clone(), Some("web_search_round_limit".to_string()));
+            stream.write_all(&failed).await?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.failed",
+                serde_json::json!({
+                    "stage": "round_limit",
+                    "searchRound": search_round,
+                    "maxRounds": MAX_WEB_SEARCH_ROUNDS
+                }),
+            );
+            return Ok(Some(message));
+        }
+
+        current_chat_request = followup_request;
+        search_round += 1;
     }
 
     let completed = converter.finish();
@@ -6430,7 +6515,7 @@ mod tests {
 mod proxy_stream_tests {
     use super::{
         forward_buffered_protocol_proxy_stream, forward_protocol_proxy_stream,
-        forward_web_search_protocol_proxy_stream, wait_with_keepalive,
+        forward_web_search_protocol_proxy_stream, read_http_request, wait_with_keepalive,
     };
     use crate::protocol_proxy::{
         ProxySessionHeaders, UpstreamProxyResponse, UpstreamWireApi, WebSearchExecutionContext,
@@ -6718,7 +6803,12 @@ mod proxy_stream_tests {
         let followup_body: serde_json::Value =
             serde_json::from_slice(&followup_request.body).unwrap();
         assert_eq!(followup_body["stream"], true);
-        assert!(followup_body.get("tools").is_none());
+        let followup_tools = followup_body["tools"].as_array().unwrap();
+        assert!(
+            followup_tools.iter().any(
+                |tool| tool.pointer("/function/name") == Some(&serde_json::json!("web_search"))
+            )
+        );
         assert!(followup_body.get("tool_choice").is_none());
         let messages = followup_body["messages"].as_array().unwrap();
         assert_eq!(messages[1]["content"], "");
@@ -6733,6 +6823,196 @@ mod proxy_stream_tests {
             .unwrap();
         let search_body: serde_json::Value = serde_json::from_slice(&search_request.body).unwrap();
         assert_eq!(search_body["query"], "Codex");
+    }
+
+    #[tokio::test]
+    async fn web_search_live_stream_executes_sequential_rounds() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "title": "Search result",
+                    "url": "https://example.com/result",
+                    "text": "Search content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let first_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_first\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Rust\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&first_model_server)
+            .await;
+
+        let followup_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let followup_address = followup_listener.local_addr().unwrap();
+        let followup_server = tokio::spawn(async move {
+            let responses = [
+                concat!(
+                    "data: {\"id\":\"chatcmpl-second\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_second\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Go\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                concat!(
+                    "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"both answers\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            ];
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut socket, _) = followup_listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await.unwrap();
+                requests.push(serde_json::from_slice::<serde_json::Value>(&request.body).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", first_model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("http://{followup_address}"),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("http://{followup_address}/v1/chat/completions"),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "search twice" }],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "web_search", "parameters": { "type": "object" } }
+                }],
+                "tool_choice": { "type": "web_search" }
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "search twice",
+                "stream": true,
+                "tools": [{ "type": "web_search" }],
+                "tool_choice": { "type": "web_search" }
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: Some(format!("{}/search", search_server.uri())),
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(failure.is_none(), "web search stream failed: {failure:?}");
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let followup_requests = followup_server.await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(response.matches("event: response.created").count(), 1);
+        assert_eq!(response.matches("event: response.completed").count(), 1);
+        assert!(response.contains("\"call_id\":\"call_first\""));
+        assert!(response.contains("\"call_id\":\"call_second\""));
+        assert!(response.contains("both answers"));
+        assert!(!response.contains("event: response.failed"));
+
+        let search_requests = search_server.received_requests().await.unwrap();
+        assert_eq!(search_requests.len(), 2);
+        let queries = search_requests
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["query"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(queries.contains(&"Rust".to_string()));
+        assert!(queries.contains(&"Go".to_string()));
+
+        assert_eq!(followup_requests.len(), 2);
+        let first_followup_tools = followup_requests[0]["tools"].as_array().unwrap();
+        assert!(
+            first_followup_tools.iter().any(
+                |tool| tool.pointer("/function/name") == Some(&serde_json::json!("web_search"))
+            )
+        );
+        assert_eq!(followup_requests[0]["tool_choice"], "auto");
+        let first_messages = followup_requests[0]["messages"].as_array().unwrap();
+        assert_eq!(first_messages.last().unwrap()["tool_call_id"], "call_first");
+        let second_messages = followup_requests[1]["messages"].as_array().unwrap();
+        assert_eq!(second_messages.len(), first_messages.len() + 2);
     }
 
     #[tokio::test]

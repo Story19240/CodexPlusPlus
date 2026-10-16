@@ -1778,7 +1778,9 @@ impl ChatSseToResponsesConverter {
         self.buffer.clear();
         self.utf8_remainder.clear();
         self.failed = false;
-        self.defer_completion = false;
+        // 二段仍可能继续调用 web_search；先延迟完成事件，等 launcher 判断没有
+        // 新搜索调用后再 finish。
+        self.defer_completion = true;
         self.saw_done = false;
     }
 
@@ -1853,6 +1855,20 @@ pub fn is_responses_proxy_path(path: &str) -> bool {
             | "/v1/v1/responses/compact"
             | "/codex/v1/responses/compact"
     )
+}
+
+fn web_search_execution_enabled(
+    settings: &crate::settings::BackendSettings,
+    relay: &crate::settings::RelayProfile,
+    request_json: &Value,
+    request_path: &str,
+) -> bool {
+    settings.enhancements_enabled
+        && settings.web_search.enabled
+        && relay.protocol == RelayProtocol::ChatCompletions
+        && request_has_native_web_search(request_json)
+        && !request_has_compaction_trigger(request_json)
+        && !is_responses_compact_proxy_path(request_path)
 }
 
 pub fn is_responses_compact_proxy_path(path: &str) -> bool {
@@ -2148,11 +2164,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .as_ref()
             .map(|binding| binding.upstream_model.clone())
             .or_else(|| aggregate_upstream_model_override(&settings, &relay));
-        let web_search_execution = settings.web_search.enabled
-            && relay.protocol == RelayProtocol::ChatCompletions
-            && request_has_native_web_search(&request_json)
-            && !request_has_compaction_trigger(&request_json)
-            && !is_responses_compact_proxy_path(request_path);
+        let web_search_execution =
+            web_search_execution_enabled(&settings, &relay, &request_json, request_path);
         let preserve_native_request = relay.protocol == RelayProtocol::Responses
             && (request_has_compaction_trigger(&request_json)
                 || is_responses_compact_proxy_path(request_path));
@@ -8659,6 +8672,50 @@ mod response_compatibility_tests {
             json!(["query"])
         );
         assert_eq!(converted["tool_choice"]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn web_search_master_switch_takes_precedence_over_sub_switch() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.web_search.enabled = true;
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::ChatCompletions,
+            ..crate::settings::RelayProfile::default()
+        };
+        let request = json!({"tools": [{ "type": "web_search" }]});
+
+        settings.enhancements_enabled = false;
+        assert!(!web_search_execution_enabled(
+            &settings,
+            &relay,
+            &request,
+            "/v1/responses"
+        ));
+
+        settings.enhancements_enabled = true;
+        assert!(web_search_execution_enabled(
+            &settings,
+            &relay,
+            &request,
+            "/v1/responses"
+        ));
+
+        let compact_request = json!({
+            "tools": [{ "type": "web_search" }],
+            "input": [{ "type": "compaction_trigger" }]
+        });
+        assert!(!web_search_execution_enabled(
+            &settings,
+            &relay,
+            &compact_request,
+            "/v1/responses"
+        ));
+        assert!(!web_search_execution_enabled(
+            &settings,
+            &relay,
+            &request,
+            "/v1/responses/compact"
+        ));
     }
 
     #[test]

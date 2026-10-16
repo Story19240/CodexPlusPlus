@@ -15,6 +15,7 @@ const TAVILY_SEARCH_ENDPOINT: &str = "https://api.tavily.com/search";
 pub const MAX_WEB_SEARCH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESULT_TEXT_CHARS: usize = 2000;
 const MAX_CONCURRENT_WEB_SEARCH_CALLS: usize = 3;
+const MAX_WEB_SEARCH_QUERIES_PER_CALL: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSearchResult {
@@ -26,13 +27,13 @@ pub struct WebSearchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSearchToolCall {
     pub call_id: String,
-    pub query: String,
+    pub queries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSearchToolOutput {
     pub call_id: String,
-    pub query: String,
+    pub queries: Vec<String>,
     pub content: String,
 }
 
@@ -83,11 +84,11 @@ impl ParsedChatResponse {
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let query = query_from_arguments(arguments)
+            let queries = query_from_arguments(arguments)
                 .with_context(|| format!("web_search 调用 {call_id} 缺少有效查询词"))?;
             calls.push(WebSearchToolCall {
                 call_id: call_id.to_string(),
-                query,
+                queries,
             });
         }
         Ok(calls)
@@ -216,42 +217,82 @@ pub(crate) async fn execute_web_search_calls_at(
     calls: &[WebSearchToolCall],
     search_endpoint: Option<&str>,
 ) -> anyhow::Result<Vec<WebSearchToolOutput>> {
+    if calls
+        .iter()
+        .any(|call| call.queries.iter().all(|query| query.trim().is_empty()))
+    {
+        bail!("Web 搜索调用缺少有效查询词");
+    }
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_WEB_SEARCH_CALLS));
-    let mut searches = Vec::with_capacity(calls.len());
-    for call in calls {
+    struct PendingWebSearch {
+        call_index: usize,
+        query: String,
+    }
+
+    let pending_searches = calls
+        .iter()
+        .enumerate()
+        .flat_map(|(call_index, call)| {
+            call.queries.iter().map(move |query| PendingWebSearch {
+                call_index,
+                query: query.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut searches = Vec::with_capacity(pending_searches.len());
+    for pending_search in pending_searches {
         let semaphore = semaphore.clone();
         searches.push(async move {
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .context("获取 Web 搜索并发额度失败");
-            let results = match permit {
+            let result = match permit {
                 Ok(_permit) => match search_endpoint {
-                    Some(endpoint) => execute_web_search_at(settings, &call.query, endpoint).await,
-                    None => execute_web_search(settings, &call.query).await,
+                    Some(endpoint) => {
+                        execute_web_search_at(settings, &pending_search.query, endpoint).await
+                    }
+                    None => execute_web_search(settings, &pending_search.query).await,
                 },
                 Err(error) => Err(error),
             };
-            (call, results)
+            (pending_search.call_index, pending_search.query, result)
         });
     }
 
+    let mut grouped_results = (0..calls.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (call_index, query, result) in join_all(searches).await {
+        grouped_results[call_index].push((query, result));
+    }
+
     let mut outputs = Vec::with_capacity(calls.len());
-    for (call, result) in join_all(searches).await {
-        let content = match result {
-            Ok(results) => format_search_results(&call.query, &results),
-            Err(error) => format!(
-                "Web search failed for query: {}\nError: {error:#}",
-                call.query
-            ),
-        };
+    for (call, call_results) in calls.iter().zip(grouped_results) {
         outputs.push(WebSearchToolOutput {
             call_id: call.call_id.clone(),
-            query: call.query.clone(),
-            content,
+            queries: call.queries.clone(),
+            content: format_search_call_results(call_results),
         });
     }
     Ok(outputs)
+}
+
+fn format_search_call_results(
+    results: Vec<(String, anyhow::Result<Vec<WebSearchResult>>)>,
+) -> String {
+    let mut output = String::new();
+    for (query, result) in results {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        match result {
+            Ok(results) => output.push_str(&format_search_results(&query, &results)),
+            Err(error) => output.push_str(&format!(
+                "Web search failed for query: {query}\nError: {error:#}"
+            )),
+        }
+    }
+    output
 }
 
 pub fn parse_chat_response(body: &[u8], content_type: &str) -> anyhow::Result<ParsedChatResponse> {
@@ -436,22 +477,38 @@ pub fn build_web_search_followup_request(
     first_response: &ParsedChatResponse,
     outputs: &[WebSearchToolOutput],
 ) -> anyhow::Result<Value> {
+    build_web_search_followup_request_with_web_search_tool(
+        chat_request,
+        first_response,
+        outputs,
+        false,
+    )
+}
+
+pub fn build_web_search_followup_request_with_web_search_tool(
+    chat_request: &Value,
+    first_response: &ParsedChatResponse,
+    outputs: &[WebSearchToolOutput],
+    retain_web_search_tool: bool,
+) -> anyhow::Result<Value> {
     let mut request = chat_request.clone();
-    // 二段不再暴露服务端搜索工具，避免模型连续发起未编排的搜索调用。
-    let should_remove_tools =
-        if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
-            tools.retain(|tool| {
-                let name = tool
-                    .pointer("/function/name")
-                    .and_then(Value::as_str)
-                    .or_else(|| tool.get("name").and_then(Value::as_str))
-                    .or_else(|| tool.get("type").and_then(Value::as_str));
-                !matches!(name, Some("web_search" | "web_search_preview"))
-            });
-            tools.is_empty()
-        } else {
-            false
-        };
+    // 默认二段不暴露服务端搜索工具。流式编排允许继续搜索时显式保留它，
+    // 由 launcher 按轮数上限继续执行，避免模型把未执行的工具调用写成文本。
+    let should_remove_tools = if retain_web_search_tool {
+        false
+    } else if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            let name = tool
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .or_else(|| tool.get("name").and_then(Value::as_str))
+                .or_else(|| tool.get("type").and_then(Value::as_str));
+            !matches!(name, Some("web_search" | "web_search_preview"))
+        });
+        tools.is_empty()
+    } else {
+        false
+    };
     if should_remove_tools && let Some(request_object) = request.as_object_mut() {
         request_object.remove("tools");
         request_object.remove("tool_choice");
@@ -517,27 +574,32 @@ pub fn format_search_results(query: &str, results: &[WebSearchResult]) -> String
     output
 }
 
-fn query_from_arguments(arguments: &str) -> anyhow::Result<String> {
+fn query_from_arguments(arguments: &str) -> anyhow::Result<Vec<String>> {
     let parsed: Value = serde_json::from_str(arguments).context("web_search 参数不是有效 JSON")?;
-    for key in ["query", "input", "q", "url"] {
-        if let Some(query) = parsed.get(key).and_then(Value::as_str) {
-            let query = query.trim();
-            if !query.is_empty() {
-                return Ok(query.to_string());
-            }
+    let mut queries = Vec::new();
+    let mut push_query = |value: Option<&str>| {
+        let query = value?.trim();
+        if query.is_empty() || queries.iter().any(|existing| existing == query) {
+            return None;
         }
+        queries.push(query.to_string());
+        Some(())
+    };
+    for key in ["query", "input", "q", "url"] {
+        let _ = push_query(parsed.get(key).and_then(Value::as_str));
     }
     if let Some(queries) = parsed.get("queries").and_then(Value::as_array) {
-        let query = queries
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .find(|query| !query.is_empty());
-        if let Some(query) = query {
-            return Ok(query.to_string());
+        for value in queries.iter().filter_map(Value::as_str) {
+            let _ = push_query(Some(value));
         }
     }
-    bail!("web_search 参数缺少 query/input/queries/url")
+    if queries.is_empty() {
+        bail!("web_search 参数缺少 query/input/queries/url")
+    }
+    if queries.len() > MAX_WEB_SEARCH_QUERIES_PER_CALL {
+        bail!("web_search 参数最多支持 {MAX_WEB_SEARCH_QUERIES_PER_CALL} 条查询");
+    }
+    Ok(queries)
 }
 
 fn configured_api_key(direct: &str, env_name: &str, provider: &str) -> anyhow::Result<String> {
@@ -776,11 +838,11 @@ mod tests {
         let calls = vec![
             WebSearchToolCall {
                 call_id: "call_failed".to_string(),
-                query: "failing query".to_string(),
+                queries: vec!["failing query".to_string()],
             },
             WebSearchToolCall {
                 call_id: "call_success".to_string(),
-                query: "successful query".to_string(),
+                queries: vec!["successful query".to_string()],
             },
         ];
         let outputs = execute_web_search_calls_at(
@@ -801,6 +863,62 @@ mod tests {
         assert!(outputs[0].content.contains("provider rate limit"));
         assert_eq!(outputs[1].call_id, "call_success");
         assert!(outputs[1].content.contains("Successful result"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn web_search_calls_execute_every_query_and_merge_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(body_json(json!({
+                "query": "Codex",
+                "numResults": 2,
+                "contents": { "text": true }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(body_json(json!({
+                "query": "Rust",
+                "numResults": 2,
+                "contents": { "text": true }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Rust result",
+                    "url": "https://example.com/rust",
+                    "text": "Rust content"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let calls = vec![WebSearchToolCall {
+            call_id: "call_multi".to_string(),
+            queries: vec!["Codex".to_string(), "Rust".to_string()],
+        }];
+        let outputs = execute_web_search_calls_at(
+            &settings(WebSearchProvider::Exa, "exa-key"),
+            &calls,
+            Some(&format!("{}/search", server.uri())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].call_id, "call_multi");
+        assert_eq!(outputs[0].queries, vec!["Codex", "Rust"]);
+        assert!(outputs[0].content.contains("Codex content"));
+        assert!(outputs[0].content.contains("Rust content"));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
@@ -889,9 +1007,23 @@ mod tests {
             parsed.web_search_calls().unwrap(),
             vec![WebSearchToolCall {
                 call_id: "call_url".to_string(),
-                query: "https://example.com/article".to_string(),
+                queries: vec!["https://example.com/article".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn web_search_queries_are_deduplicated_and_capped() {
+        let queries =
+            query_from_arguments(r#"{"query":"Codex","queries":["Codex"," Rust ","", "Rust"]}"#)
+                .unwrap();
+        assert_eq!(queries, vec!["Codex".to_string(), "Rust".to_string()]);
+
+        let too_many = query_from_arguments(
+            r#"{"queries":["q0","q1","q2","q3","q4","q5","q6","q7","q8","q9","q10"]}"#,
+        )
+        .unwrap_err();
+        assert!(too_many.to_string().contains("最多支持 10 条查询"));
     }
 
     #[test]
@@ -907,13 +1039,13 @@ mod tests {
             calls,
             vec![WebSearchToolCall {
                 call_id: "call_search".to_string(),
-                query: "Codex".to_string(),
+                queries: vec!["Codex".to_string()],
             }]
         );
 
         let outputs = vec![WebSearchToolOutput {
             call_id: "call_search".to_string(),
-            query: "Codex".to_string(),
+            queries: vec!["Codex".to_string()],
             content: "Web search result".to_string(),
         }];
         let followup = build_web_search_followup_request(
@@ -950,6 +1082,56 @@ mod tests {
     }
 
     #[test]
+    fn followup_can_retain_web_search_for_another_round() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-search".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Codex\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+        let outputs = vec![WebSearchToolOutput {
+            call_id: "call_search".to_string(),
+            queries: vec!["Codex".to_string()],
+            content: "Web search result".to_string(),
+        }];
+
+        let followup = build_web_search_followup_request_with_web_search_tool(
+            &json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": false,
+                "tools": [
+                    { "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } },
+                    { "type": "function", "function": { "name": "other_tool", "parameters": { "type": "object" } } }
+                ],
+                "tool_choice": { "type": "web_search" },
+            }),
+            &parsed,
+            &outputs,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(followup["tool_choice"], "auto");
+        let tools = followup["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+        assert_eq!(tools[1]["function"]["name"], "other_tool");
+    }
+
+    #[test]
     fn followup_preserves_non_web_search_tool_choice() {
         let parsed = ParsedChatResponse {
             id: "chatcmpl-search".to_string(),
@@ -971,7 +1153,7 @@ mod tests {
         };
         let outputs = vec![WebSearchToolOutput {
             call_id: "call_search".to_string(),
-            query: "Codex".to_string(),
+            queries: vec!["Codex".to_string()],
             content: "Web search result".to_string(),
         }];
 
@@ -1043,7 +1225,7 @@ mod tests {
         let calls = (0..5)
             .map(|i| WebSearchToolCall {
                 call_id: format!("call_{i}"),
-                query: format!("rust topic {i}"),
+                queries: vec![format!("rust topic {i}")],
             })
             .collect::<Vec<_>>();
 
