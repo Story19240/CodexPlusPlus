@@ -3292,6 +3292,11 @@ async fn forward_web_search_protocol_proxy_stream(
                     "searchRound": search_round
                 }),
             );
+            // web_search 已收敛成 web_search_call；剩余客户端工具按原类型
+            // （custom_tool_call / function_call）收敛后再写搜索结果，
+            // 保证 done 事件按 output_index 顺序发出且工具项不被丢失。
+            let client_tools_done = converter.complete_client_tool_calls();
+            stream.write_all(&client_tools_done).await?;
             let search_results = converter.push_web_search_results(&accumulated_search_outputs);
             stream.write_all(&search_results).await?;
             let completed = converter.finish();
@@ -3512,6 +3517,10 @@ async fn forward_web_search_protocol_proxy_stream(
                         "searchRound": search_round
                     }),
                 );
+                // 二段只带客户端工具时，先按原类型收敛工具项，再写搜索结果
+                // message，保持 done 事件按 output_index 顺序发出。
+                let client_tools_done = converter.complete_client_tool_calls();
+                stream.write_all(&client_tools_done).await?;
                 let search_results = converter.push_web_search_results(&accumulated_search_outputs);
                 stream.write_all(&search_results).await?;
             }
@@ -6557,6 +6566,20 @@ mod proxy_stream_tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn completed_response_from_sse(sse: &str) -> serde_json::Value {
+        for block in sse.split("\n\n") {
+            if !block.contains("event: response.completed") {
+                continue;
+            }
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("completed event should carry data");
+            return serde_json::from_str(data).expect("completed event should be JSON");
+        }
+        panic!("SSE should contain one response.completed event");
+    }
+
     async fn forward_fixture(
         body: &str,
         truncated: bool,
@@ -7189,6 +7212,28 @@ mod proxy_stream_tests {
         assert!(response.contains("\"name\":\"apply_patch\""));
         assert!(response.contains("Web search results for Codex"));
         assert!(response.contains("Search content"));
+        // 混合同轮调用时客户端工具必须保持原类型收敛（custom_tool_call），
+        // 不能被 web_search 编排错误序列化成 web_search_call（id 前缀 ws_）。
+        assert!(
+            response.contains("\"type\":\"custom_tool_call\""),
+            "apply_patch should close as custom_tool_call, got: {response}"
+        );
+        assert!(
+            !response.contains("\"id\":\"ws_call_patch\""),
+            "client tool must not be serialized as a web_search_call"
+        );
+        let completed = completed_response_from_sse(&response);
+        let output_types = completed["response"]["output"]
+            .as_array()
+            .expect("completed response should have output array")
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["web_search_call", "custom_tool_call", "message"],
+            "completed output items must preserve client tool type, got: {response}"
+        );
 
         assert_eq!(model_server.received_requests().await.unwrap().len(), 1);
         assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
@@ -7345,6 +7390,27 @@ mod proxy_stream_tests {
         assert!(response.contains("\"name\":\"apply_patch\""));
         assert!(response.contains("Web search results for Codex"));
         assert!(response.contains("Search content"));
+        // 二段返回客户端工具时同样必须保持原类型收敛，搜索结果 message 紧随其后。
+        assert!(
+            response.contains("\"type\":\"custom_tool_call\""),
+            "apply_patch should close as custom_tool_call, got: {response}"
+        );
+        assert!(
+            !response.contains("\"id\":\"ws_call_patch\""),
+            "client tool must not be serialized as a web_search_call"
+        );
+        let completed = completed_response_from_sse(&response);
+        let output_types = completed["response"]["output"]
+            .as_array()
+            .expect("completed response should have output array")
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["web_search_call", "custom_tool_call", "message"],
+            "completed output items must preserve client tool type, got: {response}"
+        );
 
         assert_eq!(
             followup_model_server

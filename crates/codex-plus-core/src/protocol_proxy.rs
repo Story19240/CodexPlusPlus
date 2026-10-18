@@ -1762,6 +1762,17 @@ impl ChatSseToResponsesConverter {
         output.into_bytes()
     }
 
+    /// 混合调用时，web_search 已由 complete_web_search_calls 收敛，剩余的
+    /// 客户端工具在这里按原类型（custom_tool_call / function_call）落成
+    /// done item。必须在 push_web_search_results 之前调用，保证 done 事件
+    /// 按 output_index 顺序发出。
+    pub(crate) fn complete_client_tool_calls(&mut self) -> Vec<u8> {
+        let mut output = String::new();
+        self.state
+            .complete_streamed_tool_calls_into(&mut output, "completed");
+        output.into_bytes()
+    }
+
     /// 混合调用时，把服务端搜索结果落成普通 assistant message。
     /// 客户端工具由 Codex 执行；下轮历史会携带这条消息，搜索结果不会丢。
     pub(crate) fn push_web_search_results(
@@ -2899,15 +2910,16 @@ async fn execute_web_search_round(
                 ));
             }
         };
-    let search_calls = match first_response.web_search_calls() {
-        Ok(calls) => calls,
-        Err(error) => {
-            return Ok(web_search_failure_response(
-                original_request,
-                error.to_string(),
-            ));
-        }
-    };
+    let (search_calls, has_client_tool) =
+        match first_response.web_search_calls_with_client_tools() {
+            Ok(calls) => calls,
+            Err(error) => {
+                return Ok(web_search_failure_response(
+                    original_request,
+                    error.to_string(),
+                ));
+            }
+        };
     if search_calls.is_empty() {
         return converted_chat_response(
             &first_body,
@@ -2932,6 +2944,75 @@ async fn execute_web_search_round(
             ));
         }
     };
+
+    if has_client_tool {
+        let mut response_json = match chat_completion_to_response_with_request(
+            chat_json_from_parsed(&first_response),
+            original_request,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(web_search_failure_response(
+                    original_request,
+                    error.to_string(),
+                ));
+            }
+        };
+
+        if let Some(output) = response_json.get_mut("output").and_then(Value::as_array_mut) {
+            for item in output.iter_mut() {
+                let is_executed_search = item.get("type").and_then(Value::as_str)
+                    == Some("web_search_call")
+                    && search_outputs.iter().any(|search_output| {
+                        item.get("call_id").and_then(Value::as_str)
+                            == Some(search_output.call_id.as_str())
+                    });
+                if is_executed_search {
+                    item["status"] = json!("completed");
+                }
+            }
+        }
+        response_json["status"] = json!("completed");
+        if let Some(response) = response_json.as_object_mut() {
+            response.remove("error");
+        }
+        let search_results_item =
+            web_search_results_response_item(&response_json, &search_outputs);
+        if let Some(output) = response_json.get_mut("output").and_then(Value::as_array_mut) {
+            output.push(search_results_item);
+        }
+
+        let target_stream = request_wants_stream(original_request);
+        if target_stream {
+            return Ok(UpstreamProxyResponse {
+                web_search_context: None,
+                exec_adapted: false,
+                exec_outcome: None,
+                status_code: 200,
+                is_stream: true,
+                content_type: "text/event-stream; charset=utf-8".to_string(),
+                wire_api: UpstreamWireApi::Responses,
+                compaction: false,
+                native_compaction_passthrough: false,
+                buffered_body: Some(responses_json_as_sse(&response_json)),
+                response: None,
+            });
+        }
+        return Ok(UpstreamProxyResponse {
+            web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::Responses,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&response_json)?),
+            response: None,
+        });
+    }
+
     let followup_request = match crate::web_search::build_web_search_followup_request(
         &chat_request,
         &first_response,
@@ -3209,6 +3290,34 @@ fn request_wants_stream(request: &Value) -> bool {
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn web_search_results_response_item(
+    response: &Value,
+    outputs: &[crate::web_search::WebSearchToolOutput],
+) -> Value {
+    let response_id = response.get("id").and_then(Value::as_str).unwrap_or("");
+    let text = outputs
+        .iter()
+        .map(|output| {
+            format!(
+                "Web search results for {}:\n{}",
+                output.queries.join(", "),
+                output.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    json!({
+        "id": format!(
+            "msg_{}_web_search_results",
+            response_id_body(response_id)
+        ),
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+    })
 }
 
 fn chat_json_from_parsed(parsed: &crate::web_search::ParsedChatResponse) -> Value {
@@ -5017,6 +5126,22 @@ impl ChatSseState {
         let keys: Vec<usize> = self.tools.keys().copied().collect();
         for key in keys {
             if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
+                continue;
+            }
+            // 混合调用场景下 self.tools 同时持有 web_search 与客户端工具
+            // （apply_patch 等）。这里只收敛服务端 web_search_call；客户端工具
+            // 保持未完成状态，由 finish()/fail() 里的 finalize_tools_into /
+            // complete_streamed_tool_calls_into 按原类型（custom_tool_call /
+            // function_call）收敛，避免被错误序列化成 web_search_call 后客户端
+            // 丢失可执行的工具项。判定必须与 tool_call_added_item /
+            // response_tool_call_item 使用同一谓词，保证 added 与 done 的 item
+            // 类型一致。
+            let is_web_search = self
+                .tools
+                .get(&key)
+                .map(|state| self.tool_context.is_builtin_web_search_proxy(&state.name))
+                .unwrap_or(false);
+            if !is_web_search {
                 continue;
             }
             let output_index = match self.tools.get(&key).and_then(|state| state.output_index) {
@@ -9155,6 +9280,100 @@ mod response_compatibility_tests {
         assert_eq!(failed_response["response"]["output"][0]["status"], "failed");
     }
 
+    #[test]
+    fn mixed_client_tool_survives_web_search_call_completion() {
+        let request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": true,
+            "tools": [
+                { "type": "web_search" },
+                { "type": "custom", "name": "apply_patch" }
+            ]
+        });
+        let mut converter = ChatSseToResponsesConverter::with_web_search_orchestration(&request);
+        let streamed = String::from_utf8(converter.push_bytes(
+            concat!(
+                "data: {\"id\":\"chatcmpl-mixed\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[",
+                "{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}},",
+                "{\"index\":1,\"id\":\"call_patch\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"patch\\\"}\"}}",
+                "]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes(),
+        ))
+        .unwrap();
+        assert!(converter.saw_done());
+
+        let pause = String::from_utf8(converter.pause_for_web_search()).unwrap();
+        // pause 已把两个工具的最终输入事件落盘，但都保持未 done。
+        // complete_web_search_calls 只能收敛 web_search，客户端工具必须原样保留。
+        let completed_calls = String::from_utf8(converter.complete_web_search_calls()).unwrap();
+        assert!(
+            !completed_calls.contains("call_patch"),
+            "complete_web_search_calls must not touch client tools, got: {completed_calls}"
+        );
+
+        // 客户端工具按原类型收敛（对应 launcher 的 complete_client_tool_calls）。
+        let client_tools_done = String::from_utf8(converter.complete_client_tool_calls()).unwrap();
+        assert!(
+            client_tools_done.contains("\"type\":\"custom_tool_call\""),
+            "apply_patch should close as custom_tool_call, got: {client_tools_done}"
+        );
+
+        let search_results = String::from_utf8(converter.push_web_search_results(&[
+            crate::web_search::WebSearchToolOutput {
+                call_id: "call_search".to_string(),
+                queries: vec!["Codex".to_string()],
+                content: "Codex content".to_string(),
+            },
+        ]))
+        .unwrap();
+        assert!(search_results.contains("Codex content"));
+
+        let completed = String::from_utf8(converter.finish()).unwrap();
+
+        let mut all = streamed;
+        all.push_str(&pause);
+        all.push_str(&completed_calls);
+        all.push_str(&client_tools_done);
+        all.push_str(&search_results);
+        all.push_str(&completed);
+
+        assert_eq!(all.matches("event: response.created").count(), 1);
+        assert_eq!(all.matches("event: response.completed").count(), 1);
+        // done 事件数量：web_search + apply_patch + 搜索结果 message = 3。
+        assert_eq!(all.matches("event: response.output_item.done").count(), 3);
+        // 客户端工具的 done item 必须是 custom_tool_call，且带原始 call_id。
+        assert!(
+            all.contains("\"type\":\"custom_tool_call\""),
+            "apply_patch should close as custom_tool_call, got: {all}"
+        );
+        assert!(
+            all.contains("\"call_id\":\"call_patch\""),
+            "apply_patch done item should keep its call_id"
+        );
+        assert!(
+            !all.contains("\"id\":\"ws_call_patch\""),
+            "client tool must not be serialized as a web_search_call"
+        );
+
+        let completed_response = completed_response_from_sse(&all);
+        let output_types = completed_response["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["web_search_call", "custom_tool_call", "message"]
+        );
+        assert_eq!(completed_response["response"]["output"][0]["status"], "completed");
+        assert_eq!(completed_response["response"]["output"][1]["status"], "completed");
+    }
+
     #[tokio::test]
     async fn web_search_round_executes_search_and_builds_streamed_followup() {
         use crate::settings::{RelayProfile, WebSearchProvider, WebSearchSettings};
@@ -9314,6 +9533,150 @@ mod response_compatibility_tests {
             .unwrap();
         let search_body: Value = serde_json::from_slice(&search_request.body).unwrap();
         assert_eq!(search_body["query"], "Codex");
+    }
+
+    #[tokio::test]
+    async fn web_search_round_non_stream_mixed_tools_returns_client_tool_and_results() {
+        use crate::settings::{RelayProfile, WebSearchProvider, WebSearchSettings};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(header("x-api-key", "exa-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            timeout_seconds: 5,
+        };
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", search_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let endpoint = chat_completions_url(&relay.base_url);
+        let first_chat_response = json!({
+            "id": "chatcmpl-mixed",
+            "model": "fixture-model",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_search",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\":\"Codex\"}"
+                            }
+                        },
+                        {
+                            "id": "call_patch",
+                            "type": "function",
+                            "function": {
+                                "name": "apply_patch",
+                                "arguments": "{\"input\":\"patch\"}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+        let upstream = UpstreamProxyResponse {
+            web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
+            status_code: 200,
+            is_stream: false,
+            content_type: "application/json".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: Some(serde_json::to_vec(&first_chat_response).unwrap()),
+            response: None,
+        };
+        let chat_request = json!({
+            "model": "fixture-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": false,
+            "tools": [
+                { "type": "function", "function": { "name": "web_search", "parameters": { "type": "object" } } },
+                { "type": "custom", "name": "apply_patch", "format": { "definition": "patch" } }
+            ]
+        });
+        let original_request = json!({
+            "model": "fixture-model",
+            "input": "hi",
+            "stream": false,
+            "tools": [
+                { "type": "web_search" },
+                { "type": "custom", "name": "apply_patch", "format": { "definition": "patch" } }
+            ]
+        });
+
+        let mut response = execute_web_search_round(
+            upstream,
+            relay,
+            endpoint,
+            chat_request,
+            &original_request,
+            &settings,
+            None,
+            None,
+            ProxySessionHeaders::default(),
+            Some(&format!("{}/search", search_server.uri())),
+        )
+        .await
+        .unwrap();
+        let body = response.read_body().await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!response.is_stream);
+        assert_eq!(response.wire_api, UpstreamWireApi::Responses);
+        assert_eq!(response_json["status"], "completed", "{response_json}");
+        assert!(response_json.get("error").is_none());
+        let output_types = response_json["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_types,
+            ["web_search_call", "custom_tool_call", "message"],
+            "{response_json}"
+        );
+        assert_eq!(response_json["output"][0]["status"], "completed");
+        assert_eq!(response_json["output"][0]["call_id"], "call_search");
+        assert_eq!(response_json["output"][1]["status"], "completed");
+        assert_eq!(response_json["output"][1]["call_id"], "call_patch");
+        assert_eq!(response_json["output"][1]["name"], "apply_patch");
+        assert!(
+            response_json["output"][2]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Codex content")
+        );
     }
 
     #[test]
