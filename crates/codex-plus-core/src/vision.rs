@@ -308,13 +308,20 @@ fn resolve_context_window(
     context_window_str: &str,
     request_model: &str,
 ) -> u64 {
-    let model_name = request_model.rsplit('/').next().unwrap_or(request_model);
     if let Ok(map) =
         serde_json::from_str::<std::collections::BTreeMap<String, String>>(model_windows_json)
-        && let Some(token) = lookup_model_map(&map, model_name)
-        && let Some(w) = crate::model_suffix::parse_window_token(&token)
     {
-        return w;
+        // modelWindows 里可能存的是完整 slug（z-ai/glm-5.3），也可能存的是
+        // 剥掉 provider 前缀后的短名（glm-5.3）。先按完整请求模型匹配，
+        // 再按短名回退，避免两边只有一边带前缀时误落到硬编码窗口。
+        let short_name = request_model.rsplit('/').next().unwrap_or(request_model);
+        for candidate in [request_model, short_name] {
+            if let Some(token) = lookup_model_map(&map, candidate)
+                && let Some(w) = crate::model_suffix::parse_window_token(&token)
+            {
+                return w;
+            }
+        }
     }
     if let Ok(w) = context_window_str.parse::<u64>() {
         if w > 0 {
@@ -1412,6 +1419,20 @@ mod tests {
                 "deepseek-v4-pro"
             ),
             256_000
+        );
+        // modelWindows 里的 key 也可能带 provider 前缀；不能只剥请求模型的前缀。
+        assert_eq!(
+            resolve_context_window(
+                r#"{"z-ai/glm-5.3":"1M"}"#,
+                "",
+                "z-ai/glm-5.3"
+            ),
+            1_000_000
+        );
+        // 反向兼容：map 用短名、请求模型带前缀时也要能命中。
+        assert_eq!(
+            resolve_context_window(r#"{"glm-5.3":"1M"}"#, "", "z-ai/glm-5.3"),
+            1_000_000
         );
     }
 
