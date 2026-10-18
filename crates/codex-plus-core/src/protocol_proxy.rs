@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
 use crate::relay_rotation::{RotationContext, RotationEvent};
@@ -237,6 +238,8 @@ struct CodexToolContext {
     function_tools: BTreeMap<String, CodexFunctionToolSpec>,
     has_custom_tools: bool,
     has_namespace_tools: bool,
+    /// 只用于拒绝模型虚构的已移除原生调用，不参与客户端工具映射。
+    rejected_native_search: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +284,7 @@ impl CodexToolContext {
     /// （issue #1209 / #586：web_search 被错译成 custom_tool_call 后，客户端
     /// 拿不到搜索结果，表现为「工具调用后无反应」或上游报 tool 名不识别）。
     fn is_builtin_web_search_proxy(&self, upstream_name: &str) -> bool {
-        self.custom_tools.get(upstream_name).is_some_and(|spec| {
+        self.rejected_native_search.contains(upstream_name) || self.custom_tools.get(upstream_name).is_some_and(|spec| {
             spec.kind == CodexCustomToolKind::BuiltIn && spec.openai_name == "web_search"
         })
     }
@@ -358,6 +361,75 @@ impl UnsupportedNativeWebSearch {
     }
 }
 
+/// 附件尚无 Chat 映射，必须在任何上游发送之前明确拒绝。
+#[derive(Debug)]
+pub(crate) struct UnsupportedInputFile {
+    param: String,
+}
+
+impl std::fmt::Display for UnsupportedInputFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Chat/Anthropic 转换不支持 input_file 附件，请使用支持附件的 Responses 上游"
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedInputFile {}
+
+impl UnsupportedInputFile {
+    pub(crate) fn response_body(&self) -> Value {
+        json!({"error":{"type":"invalid_request_error", "code":"unsupported_input_file",
+            "param":self.param, "message":self.to_string()}})
+    }
+}
+
+fn validate_chat_attachments(body: &Value) -> anyhow::Result<()> {
+    fn content(value: &Value, path: &str) -> anyhow::Result<()> {
+        if value.get("type").and_then(Value::as_str) == Some("input_file") {
+            return Err(UnsupportedInputFile {
+                param: path.to_string(),
+            }
+            .into());
+        }
+        if let Some(parts) = value.as_array() {
+            for (index, part) in parts.iter().enumerate() {
+                if part.get("type").and_then(Value::as_str) == Some("input_file") {
+                    return Err(UnsupportedInputFile {
+                        param: format!("{path}[{index}]"),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn item(value: &Value, path: &str) -> anyhow::Result<()> {
+        content(value, path)?;
+        let kind = value.get("type").and_then(Value::as_str);
+        if matches!(kind, None | Some("message" | "agent_message")) {
+            if let Some(parts) = value.get("content") {
+                content(parts, &format!("{path}.content"))?;
+            }
+        } else if kind == Some("function_call_output") {
+            if let Some(parts) = value.get("output") {
+                content(parts, &format!("{path}.output"))?;
+            }
+        }
+        Ok(())
+    }
+    if let Some(input) = body.get("input") {
+        if let Some(items) = input.as_array() {
+            for (index, value) in items.iter().enumerate() {
+                item(value, &format!("input[{index}]"))?;
+            }
+        } else {
+            item(input, "input")?;
+        }
+    }
+    Ok(())
+}
 fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     let choice = body.get("tool_choice");
     if choice
@@ -401,26 +473,6 @@ fn request_has_native_web_search(body: &Value) -> bool {
         )
 }
 
-fn input_has_encrypted_agent_content(input: &Value) -> bool {
-    fn item_has_encrypted_content(item: &Value) -> bool {
-        item.get("type").and_then(Value::as_str) == Some("encrypted_content")
-            || item.get("content").is_some_and(|content| match content {
-                Value::Array(parts) => parts.iter().any(|part| {
-                    part.get("type").and_then(Value::as_str) == Some("encrypted_content")
-                }),
-                Value::Object(_) => {
-                    content.get("type").and_then(Value::as_str) == Some("encrypted_content")
-                }
-                _ => false,
-            })
-    }
-    match input {
-        Value::Array(items) => items.iter().any(item_has_encrypted_content),
-        Value::Object(_) => item_has_encrypted_content(input),
-        _ => false,
-    }
-}
-
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     responses_to_chat_completions_with_options(body, false)
 }
@@ -440,18 +492,13 @@ pub(crate) fn responses_to_chat_completions_with_web_search(
     if !execute_web_search {
         remove_unsupported_native_search(&mut body)?;
     }
+    validate_chat_attachments(&body)?;
     expand_local_compaction_history(&mut body);
     if input_has_native_compaction(&body) {
         return Err(NativeCompactionUnsupported::history().into());
     }
-    // agent 加密内容没有 Chat 文本映射。发送前明确拒绝；不按字段名猜测明文，
-    // 也不遍历工具参数/输出里的用户 JSON。reasoning 和 compaction 保持原契约。
-    if body
-        .get("input")
-        .is_some_and(input_has_encrypted_agent_content)
-    {
-        return Err(UnsupportedEncryptedAgentContent.into());
-    }
+    // agent_message 的 encrypted_content 片段在 multi_agent v2 里实际承载明文任务；
+    // 转换时按文本透传，opaque 内容则明确失败，避免静默发空任务。
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -467,7 +514,7 @@ pub(crate) fn responses_to_chat_completions_with_web_search(
     }
 
     if let Some(input) = body.get("input") {
-        append_responses_input(input, &mut messages);
+        append_responses_input(input, &mut messages)?;
     }
     // 必须在 enforce_tool_call_pairing 之前：配对一旦被错误摘除就无法恢复。
     relocate_interleaved_non_tool_messages(&mut messages);
@@ -513,24 +560,15 @@ pub(crate) fn responses_to_chat_completions_with_web_search(
 
     apply_chat_reasoning_options(&mut result, &body, model, standard);
 
-    let mut tool_context = build_codex_tool_context(body.get("tools"));
+    let ChatToolProjection {
+        context: tool_context,
+        tools: converted,
+    } = chat_tool_projection(&body, execute_web_search);
     // Codex 客户端把 tool_search 命中的 MCP 命名空间挂在历史里的 tool_search_output
     // item 上，却不会把它们提升进下一轮请求的 tools 数组。这里补上这一跳：先登记进
     // tool context（模型调用回来时才能还原 namespace），再用既有 namespace 链路展开
     // 成 mcp__<server>__<tool>，否则上游只看到命名空间外壳，调不到内层工具。
-    let harvested_namespaces = collect_tool_search_output_namespaces(&body);
-    for namespace_tool in &harvested_namespaces {
-        add_namespace_tools_to_context(&mut tool_context, namespace_tool);
-    }
     let mut has_chat_tools = false;
-    let mut converted = Vec::new();
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        converted = responses_tools_to_chat_tools(tools, &tool_context, execute_web_search);
-    }
-    for namespace_tool in &harvested_namespaces {
-        converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
-    }
-    dedup_chat_tools_by_name(&mut converted);
     if !converted.is_empty() {
         has_chat_tools = true;
         result["tools"] = json!(converted);
@@ -571,12 +609,17 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let mut context = build_codex_tool_context(original_request.get("tools"));
-    // 反向同样要认领 tool_search_output 里的命名空间，否则模型调用
-    // mcp__<server>__<tool> 回来时查不到 namespace，还原不成 Responses item。
-    for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
-        add_namespace_tools_to_context(&mut context, namespace_tool);
-    }
+    let context = chat_tool_projection(original_request, false).context;
+    chat_completion_to_response_with_context(body, &context, Some(original_request))
+}
+
+/// 服务端 Web Search 编排已经执行搜索调用，反向转换时必须把原生工具
+/// 保留在 tool context 中，才能还原成 Codex 认识的 `web_search_call`。
+pub(crate) fn chat_completion_to_response_with_web_search_request(
+    body: Value,
+    original_request: &Value,
+) -> anyhow::Result<Value> {
+    let context = chat_tool_projection(original_request, true).context;
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -942,6 +985,12 @@ pub struct CompactionSseConverter {
     sse_buffer: String,
     sse_utf8_remainder: Vec<u8>,
     responses_wire: bool,
+    completed: bool,
+}
+
+pub struct CompactionSseOutcome {
+    pub payload: Vec<u8>,
+    pub succeeded: bool,
 }
 
 impl CompactionSseConverter {
@@ -956,6 +1005,7 @@ impl CompactionSseConverter {
             sse_buffer: String::new(),
             sse_utf8_remainder: Vec::new(),
             responses_wire: true,
+            completed: false,
         }
     }
 
@@ -979,6 +1029,12 @@ impl CompactionSseConverter {
     /// 喂入上游流式响应的一个网络 chunk。SSE 事件可能被 TCP 拆开，
     /// 内部按 `\n\n` 边界缓冲；残缺块留在缓冲区等下一个 chunk。
     pub fn push_upstream_bytes(&mut self, bytes: &[u8]) {
+        let mut utf8 = self.sse_utf8_remainder.clone();
+        utf8.extend_from_slice(bytes);
+        if std::str::from_utf8(&utf8).is_err_and(|error| error.error_len().is_some()) {
+            self.fail("压缩响应包含无效 UTF-8".to_string(), Some("compaction_invalid_stream".to_string()));
+            return;
+        }
         append_utf8_safe(&mut self.sse_buffer, &mut self.sse_utf8_remainder, bytes);
         while let Some(block) = take_sse_block(&mut self.sse_buffer) {
             if block.trim().is_empty() {
@@ -1007,6 +1063,7 @@ impl CompactionSseConverter {
             return;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            self.fail("压缩响应包含无效 SSE JSON".to_string(), Some("compaction_invalid_stream".to_string()));
             return;
         };
         let event_type = chunk
@@ -1017,6 +1074,8 @@ impl CompactionSseConverter {
             event_type,
             "response.failed" | "response.incomplete" | "error"
         ) || chunk.get("error").is_some_and(|error| !error.is_null())
+            || chunk.pointer("/response/error").is_some_and(|error| !error.is_null())
+            || matches!(chunk.pointer("/response/status").and_then(Value::as_str), Some("failed" | "incomplete"))
         {
             let error = chunk
                 .pointer("/response/error")
@@ -1057,6 +1116,7 @@ impl CompactionSseConverter {
                     self.capture_final_summary(Some(&json!(text)));
                 }
                 "response.completed" => {
+                    self.completed = true;
                     let text = chunk
                         .get("response")
                         .map(extract_summary_text_from_responses)
@@ -1070,6 +1130,13 @@ impl CompactionSseConverter {
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
         {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                if reason == "stop" {
+                    self.completed = true;
+                } else {
+                    self.fail("压缩摘要没有正常完成".to_string(), Some("compaction_incomplete".to_string()));
+                }
+            }
             if let Some(content) = choice
                 .get("delta")
                 .and_then(|delta| delta.get("content"))
@@ -1104,7 +1171,11 @@ impl CompactionSseConverter {
     /// 链式推理上游（DeepSeek thinking 等）会把推理过程以 `<think>` 块
     /// 混进正文，这里统一剥掉首部完整 think 块，只保留真正的摘要答案；
     /// think 块未闭合（上游截断）时整个丢弃——剩下的只有推理残片。
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_with_outcome().payload
+    }
+
+    pub fn finish_with_outcome(mut self) -> CompactionSseOutcome {
         if let Some(final_summary) = self.final_summary.take() {
             self.summary = final_summary;
         }
@@ -1122,6 +1193,11 @@ impl CompactionSseConverter {
                 "上游返回了空摘要，无法完成压缩".to_string(),
                 Some("compaction_empty_summary".to_string()),
             ));
+        }
+        if self.failed.is_none() && (!self.completed || !self.sse_utf8_remainder.is_empty()
+            || self.sse_buffer.lines().any(|line| !line.trim().is_empty() && !line.starts_with(':')))
+        {
+            self.failed = Some(("上游压缩响应未完整结束，未生成 checkpoint".to_string(), Some("compaction_incomplete".to_string())));
         }
         let mut output = String::new();
         let mut response = json!({
@@ -1150,7 +1226,7 @@ impl CompactionSseConverter {
                 json!({"type": "response.failed", "sequence_number": 1, "response": response}),
             );
             output.push_str("data: [DONE]\n\n");
-            return output.into_bytes();
+            return CompactionSseOutcome { payload: output.into_bytes(), succeeded: false };
         }
         let compaction_item = json!({
             "id": self.compaction_id,
@@ -1184,7 +1260,7 @@ impl CompactionSseConverter {
             }),
         );
         output.push_str("data: [DONE]\n\n");
-        output.into_bytes()
+        CompactionSseOutcome { payload: output.into_bytes(), succeeded: true }
     }
 }
 
@@ -1203,6 +1279,7 @@ pub fn wrap_non_stream_response_as_compaction(
 ) -> anyhow::Result<Vec<u8>> {
     let upstream_json: Value = serde_json::from_slice(upstream_body)?;
     let mut converter = CompactionSseConverter::new(model);
+    let wire = if upstream_json.get("choices").is_some() { UpstreamWireApi::ChatCompletions } else { UpstreamWireApi::Responses };
     if let Some(error) = upstream_json.get("error").filter(|value| !value.is_null()) {
         converter.fail(
             error
@@ -1227,10 +1304,41 @@ pub fn wrap_non_stream_response_as_compaction(
         );
         return Ok(converter.finish());
     }
+    if validate_compaction_json_completion(&upstream_json, wire).is_err() {
+        converter.fail("上游压缩摘要未正常完成".to_string(), Some("compaction_incomplete".to_string()));
+        return Ok(converter.finish());
+    }
+    converter.completed = true;
     converter.push_summary_text(&text);
     Ok(converter.finish())
 }
 
+pub(crate) fn validate_compaction_json_completion(
+    body: &Value,
+    wire: UpstreamWireApi,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        body.get("error").is_none_or(Value::is_null),
+        "压缩上游返回错误"
+    );
+    let complete = match wire {
+        UpstreamWireApi::Responses => {
+            body.get("status").and_then(Value::as_str) == Some("completed")
+        }
+        UpstreamWireApi::ChatCompletions => {
+            body.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("stop")
+        }
+        UpstreamWireApi::AnthropicMessages => matches!(
+            body.get("stop_reason").and_then(Value::as_str),
+            Some("end_turn" | "stop_sequence")
+        ),
+        _ => false,
+    };
+    anyhow::ensure!(complete, "压缩上游没有正常完成状态");
+    Ok(())
+}
 /// 从 Responses JSON 响应（`output[].content[].text`）提取 assistant 文本。
 fn extract_summary_text_from_responses(response: &Value) -> String {
     let Some(items) = response.get("output").and_then(Value::as_array) else {
@@ -1324,7 +1432,7 @@ pub(crate) async fn read_limited_upstream_body(
 fn usable_compaction_content(item: &Value) -> Option<&str> {
     item.get("encrypted_content")?
         .as_str()
-        .filter(|content| !content.is_empty())
+        .filter(|content| !content.trim().is_empty())
 }
 
 fn json_compaction_count(value: &Value) -> Option<usize> {
@@ -1340,8 +1448,11 @@ fn json_compaction_count(value: &Value) -> Option<usize> {
 /// 非流式调用仍兼容 JSON output，但流式请求不能把 JSON 当作原生 v2 透传。
 fn upstream_compaction_item_count(body: &[u8], content_type: &str) -> Option<usize> {
     if response_body_is_stream(content_type, body) {
-        let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
+        let text = std::str::from_utf8(body).ok()?.replace("\r\n", "\n");
         let mut count = 0;
+        let mut completed = false;
+        let tail = text.rsplit("\n\n").next().unwrap_or("");
+        if tail.lines().any(|line| !line.trim().is_empty() && !line.starts_with(':')) { return None; }
         for block in text.split("\n\n") {
             let mut event_name = None;
             let mut data_parts = Vec::new();
@@ -1360,10 +1471,9 @@ fn upstream_compaction_item_count(body: &[u8], content_type: &str) -> Option<usi
             if data.trim() == "[DONE]" {
                 continue;
             }
-            let Ok(json) = serde_json::from_str::<Value>(&data) else {
-                continue;
-            };
+            let json = serde_json::from_str::<Value>(&data).ok()?;
             let event = event_name.or_else(|| json.get("type").and_then(Value::as_str));
+            if completed { return None; }
             match event {
                 Some("response.output_item.done")
                     if json
@@ -1379,17 +1489,21 @@ fn upstream_compaction_item_count(body: &[u8], content_type: &str) -> Option<usi
                 }
                 Some("response.completed") => {
                     json.get("response")?.get("id")?.as_str()?;
-                    return Some(count);
+                    if matches!(json.pointer("/response/status").and_then(Value::as_str), Some("failed" | "incomplete")) { return None; }
+                    completed = true;
                 }
                 Some("response.failed" | "response.incomplete" | "error") => return None,
                 _ => {}
             }
         }
-        return None;
+        return completed.then_some(count);
     }
     let Ok(json) = serde_json::from_slice::<Value>(body) else {
         return None;
     };
+    if json.get("error").is_some_and(|error| !error.is_null())
+        || json.get("status").and_then(Value::as_str).is_some_and(|status| status != "completed")
+    { return None; }
     json_compaction_count(&json)
 }
 
@@ -1533,16 +1647,9 @@ fn render_native_compaction_as_sse(body: &[u8]) -> Option<Vec<u8>> {
     Some(sse.into_bytes())
 }
 
-fn incomplete_compaction_stream(body: &[u8]) -> Vec<u8> {
-    let mut output = String::from_utf8_lossy(body)
-        .into_owned()
-        .replace("\r\n", "\n");
-    if !output.is_empty() && !output.ends_with("\n\n") {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('\n');
-    }
+fn incomplete_compaction_stream(_body: &[u8]) -> Vec<u8> {
+    // 验收未完成时绝不能先交付部分 checkpoint，再追加一个失败事件。
+    let mut output = String::new();
     push_sse(
         &mut output,
         "response.failed",
@@ -1697,8 +1804,9 @@ impl ChatSseToResponsesConverter {
     /// 因此第一轮不能立即发送 response.completed。
     pub(crate) fn with_web_search_orchestration(original_request: &Value) -> Self {
         Self {
+            state: ChatSseState::with_request_and_web_search(original_request, true),
             defer_completion: true,
-            ..Self::with_request(original_request)
+            ..Self::default()
         }
     }
 
@@ -2223,7 +2331,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     return native_compaction_unsupported_result(error);
                 }
             };
-        let is_compaction_request = compaction || probe_native_compaction;
+        let legacy_native_compaction = relay.protocol == RelayProtocol::Responses
+            && is_responses_compact_proxy_path(request_path);
+        let is_compaction_request = compaction || probe_native_compaction || legacy_native_compaction;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_request",
@@ -2483,6 +2593,32 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 .to_string();
         }
 
+        if legacy_native_compaction {
+            let body = read_limited_upstream_body(&mut upstream, MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES).await?;
+            let stream_response = response_body_is_stream(&content_type, &body);
+            let success = (200..300).contains(&status_code);
+            let terminal_failure = upstream_has_terminal_failure(&body, &content_type);
+            let valid = !success || terminal_failure
+                || upstream_compaction_item_count(&body, &content_type) == Some(1);
+            let (code, body, response_type) = if valid {
+                let body = if success && terminal_failure && stream_response {
+                    let mut converter = CompactionSseConverter::new("");
+                    converter.fail("原生压缩上游返回失败或不完整状态".to_string(), Some("compaction_failed".to_string()));
+                    converter.finish()
+                } else { body };
+                (status_code, body, content_type)
+            } else {
+                (502, serde_json::to_vec(&json!({"error":{"type":"compaction_incompatible",
+                    "code":"compaction_invalid_response", "message":"压缩上游未返回恰好一个完整有效的 checkpoint"}}))?,
+                    "application/json".to_string())
+            };
+            return Ok(UpstreamProxyResponse {
+                web_search_context: None,
+                status_code: code, content_type: response_type, is_stream: valid && stream_response,
+                wire_api, compaction: false, native_compaction_passthrough: valid && success,
+                buffered_body: Some(body), exec_adapted: false, exec_outcome: None, response: None,
+            });
+        }
         if probe_native_compaction {
             let success = (200..300).contains(&status_code);
             let probed = match read_limited_upstream_body(
@@ -2502,6 +2638,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 if !strict_aggregate_model {
                     crate::relay_rotation::record_relay_request_failure(&settings);
                 }
+                let probed = if stream_response && String::from_utf8_lossy(&probed)
+                    .replace("\r\n", "\n").split("\n\n").any(|block|
+                        matches!(sse_block_type(block).as_deref(), Some("response.completed" | "response.output_item.done")))
+                {
+                    let mut converter = CompactionSseConverter::new("");
+                    converter.fail("原生压缩上游返回失败或不完整状态".to_string(), Some("compaction_failed".to_string()));
+                    converter.finish()
+                } else { probed };
                 return Ok(UpstreamProxyResponse {
                     web_search_context: None,
                     status_code,
@@ -2946,7 +3090,7 @@ async fn execute_web_search_round(
     };
 
     if has_client_tool {
-        let mut response_json = match chat_completion_to_response_with_request(
+        let mut response_json = match chat_completion_to_response_with_web_search_request(
             chat_json_from_parsed(&first_response),
             original_request,
         ) {
@@ -3904,10 +4048,6 @@ async fn upstream_request_parts(
                 }
             }
             ImageHandling::Vlm => {
-                if !relay.vlm_api_key.is_empty()
-                    && !relay.vlm_model.is_empty()
-                    && !relay.vlm_base_url.is_empty()
-                {
                     let vlm_config = crate::vision::VlmConfig {
                         api_key: relay.vlm_api_key.clone(),
                         model: relay.vlm_model.clone(),
@@ -3924,10 +4064,9 @@ async fn upstream_request_parts(
                                 &model,
                                 relay.protocol == crate::settings::RelayProtocol::Responses,
                             )
-                            .await;
+                            .await?;
                         }
                     }
-                }
             }
         }
     }
@@ -4644,10 +4783,14 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
-        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
-        for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
-            add_namespace_tools_to_context(&mut tool_context, namespace_tool);
-        }
+        Self::with_request_and_web_search(original_request, false)
+    }
+
+    fn with_request_and_web_search(
+        original_request: &Value,
+        execute_web_search: bool,
+    ) -> Self {
+        let tool_context = chat_tool_projection(original_request, execute_web_search).context;
         Self {
             tool_context,
             original_request: Some(original_request.clone()),
@@ -5790,7 +5933,9 @@ fn normalize_responses_item_id(item: &mut Value) {
     item["id"] = json!(format!("{prefix}{suffix}"));
 }
 
-fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {
+fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::Result<()> {
+    // encrypted_content 片段可能携带无法在 Chat 协议里表达的 opaque 内容，报错向上传播（fail loud）。
+    // 错误最终在 launcher 层变成带可读 message 的失败响应，不会静默发空任务。
     match input {
         Value::String(text) => messages.push(json!({ "role": "user", "content": text })),
         Value::Array(items) => {
@@ -5804,7 +5949,7 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     &mut seen_tool_call_ids,
-                );
+                )?;
             }
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
             flush_reasoning(messages, &mut pending_reasoning);
@@ -5819,12 +5964,13 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
                 &mut seen_tool_call_ids,
-            );
+            )?;
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
             flush_reasoning(messages, &mut pending_reasoning);
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn append_responses_item(
@@ -5833,12 +5979,12 @@ fn append_responses_item(
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
     seen_tool_call_ids: &mut BTreeSet<String>,
-) {
+) -> anyhow::Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
             let name = responses_history_function_name(item);
             if name.is_empty() {
-                return;
+                return Ok(());
             }
             let call_id = item
                 .get("call_id")
@@ -5846,7 +5992,7 @@ fn append_responses_item(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
             pending_tool_calls.push(json!({
@@ -5868,7 +6014,7 @@ fn append_responses_item(
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             if !seen_tool_call_ids.contains(call_id) {
                 flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
@@ -5877,7 +6023,7 @@ fn append_responses_item(
                     call_id,
                     item.get("output").unwrap_or(&Value::Null),
                 ));
-                return;
+                return Ok(());
             }
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             messages.push(json!({
@@ -5899,7 +6045,7 @@ fn append_responses_item(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
             pending_tool_calls.push(json!({
@@ -5920,7 +6066,7 @@ fn append_responses_item(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
             pending_tool_calls.push(json!({
@@ -5937,14 +6083,14 @@ fn append_responses_item(
         Some("tool_search_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             let output = item.get("tools").unwrap_or(&Value::Null);
             if !seen_tool_call_ids.contains(call_id) {
                 flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
                 flush_reasoning(messages, pending_reasoning);
                 messages.push(orphan_tool_output_message(call_id, output));
-                return;
+                return Ok(());
             }
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             messages.push(json!({
@@ -5956,7 +6102,7 @@ fn append_responses_item(
         Some("custom_tool_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             if !seen_tool_call_ids.contains(call_id) {
                 flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
@@ -5965,7 +6111,7 @@ fn append_responses_item(
                     call_id,
                     item.get("output").unwrap_or(&Value::Null),
                 ));
-                return;
+                return Ok(());
             }
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             messages.push(json!({
@@ -5983,7 +6129,7 @@ fn append_responses_item(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if call_id.is_empty() {
-                    return;
+                    return Ok(());
                 }
                 seen_tool_call_ids.insert(call_id.to_string());
                 pending_tool_calls.push(json!({
@@ -6006,13 +6152,13 @@ fn append_responses_item(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if call_id.is_empty() {
-                return;
+                return Ok(());
             }
             let output = content.get("content").unwrap_or(content);
             if !seen_tool_call_ids.contains(call_id) {
                 flush_reasoning(messages, pending_reasoning);
                 messages.push(orphan_tool_output_message(call_id, output));
-                return;
+                return Ok(());
             }
             messages.push(json!({
                 "role": "tool",
@@ -6027,6 +6173,9 @@ fn append_responses_item(
                 }
             }
         }
+        Some("encrypted_content") => {
+            return Err(UnsupportedEncryptedAgentContent.into());
+        }
         Some(COMPACTION_TRIGGER_TYPE) => {
             // 控制项不进上游历史；正常请求不该出现，出现即忽略。
         }
@@ -6035,11 +6184,18 @@ fn append_responses_item(
             if let Some(content) = item.get("content") {
                 let role = responses_role_to_chat_role(item.get("role").and_then(Value::as_str));
                 if content.is_null() && role != "assistant" {
-                    return;
+                    return Ok(());
                 }
+                let allow_plaintext_encrypted_content = item.get("type").and_then(Value::as_str)
+                    == Some("agent_message")
+                    && agent_message_has_confirmed_plaintext_shape(content);
                 let mut message = json!({
                     "role": role,
-                    "content": responses_content_to_chat_content(role, content)
+                    "content": responses_content_to_chat_content(
+                        role,
+                        content,
+                        allow_plaintext_encrypted_content,
+                    )?
                 });
                 if role == "assistant" {
                     if !pending_reasoning.is_empty() && pending_tool_calls.is_empty() {
@@ -6054,6 +6210,7 @@ fn append_responses_item(
             }
         }
     }
+    Ok(())
 }
 
 fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
@@ -6610,13 +6767,44 @@ fn image_part_to_chat(part: &Value) -> Option<Value> {
     Some(json!({ "type": "image_url", "image_url": image_url }))
 }
 
-fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
+/// 已确认的 multi_agent v2 agent_message 明文形态：
+/// content[] 同时包含以 `Payload:` 结尾的 input_text 头部和 encrypted_content 载荷片段。
+/// 只有这一种结构允许把 encrypted_content 片段按明文文本透传；其余一律 fail closed。
+fn agent_message_has_confirmed_plaintext_shape(content: &Value) -> bool {
+    let Some(parts) = content.as_array() else {
+        return false;
+    };
+    let has_payload_header = parts.iter().any(|part| {
+        part.get("type").and_then(Value::as_str) == Some("input_text")
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim_end().ends_with("Payload:"))
+    });
+    let has_payload_fragment = parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("encrypted_content"));
+    has_payload_header && has_payload_fragment
+}
+
+fn responses_content_to_chat_content(
+    _role: &str,
+    content: &Value,
+    allow_plaintext_encrypted_content: bool,
+) -> anyhow::Result<Value> {
     if content.is_null() || content.is_string() {
-        return content.clone();
+        return Ok(content.clone());
     }
 
     let Some(parts) = content.as_array() else {
-        return content.clone();
+        // 本 PR 删除了原来的全局 encrypted preflight，对象形态的 content 必须在这里
+        // 自己守住防线，否则 {"type":"encrypted_content",...} 会原样发给 Chat 上游。
+        // 已确认的 agent_message 明文形态要求 content 是数组，因此对象形态没有合法
+        // 透传路径，一律 fail closed。
+        if content.get("type").and_then(Value::as_str) == Some("encrypted_content") {
+            return Err(UnsupportedEncryptedAgentContent.into());
+        }
+        return Ok(content.clone());
     };
     let mut chat_parts = Vec::new();
     let mut has_non_text_part = false;
@@ -6643,21 +6831,101 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
                     has_non_text_part = true;
                 }
             }
+            "encrypted_content" => {
+                // 只有已确认的 agent_message 明文形态才允许透传。普通 message、
+                // 缺少 Payload: 头部的 agent_message 及其它来源一律 fail closed，
+                // 不能依赖内容启发式来决定是否绕过旧的拒绝防线。
+                // 这里若吞掉，接收方模型只会看到空消息；值判定为 opaque 时也返回
+                // 明确的不支持错误（fail loud），绝不静默删除。
+                if !allow_plaintext_encrypted_content {
+                    return Err(UnsupportedEncryptedAgentContent.into());
+                }
+                let value = part
+                    .get("encrypted_content")
+                    .or_else(|| part.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if value.is_empty() || encrypted_content_value_is_opaque(value) {
+                    return Err(UnsupportedEncryptedAgentContent.into());
+                }
+                chat_parts.push(json!({ "type": "text", "text": value }));
+            }
             _ => {}
         }
     }
 
     if !has_non_text_part {
-        return Value::String(
+        return Ok(Value::String(
             chat_parts
                 .iter()
                 .filter_map(|part| part.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n"),
-        );
+        ));
     }
 
-    Value::Array(chat_parts)
+    Ok(Value::Array(chat_parts))
+}
+
+/// 在已确认的 agent_message 明文形态内，判定 encrypted_content 片段值是否为
+/// 无法在 Chat 协议中表达的 opaque 密文（二级防线，不承担来源范围判定）。
+///
+/// 实证依据：Codex Desktop（cli_version 0.162.0-alpha.2 / multi_agent_version v2）
+/// 的 120 个真实 rollout 会话里，agent_message 的 encrypted_content 片段共 216 处，
+/// 216/216 都是可打印明文（含中文、常规空格换行），0 处是纯 base64 高熵形态：
+/// 当前客户端在这条路径上的构造事实就是明文字符串，名义协议里的「加密」未在
+/// 该字段启用。但守卫不依赖这一点，只把最典型的密文形态判为 opaque，
+/// 两条路径都不静默丢内容——
+/// 1. 含 \t \n \r 之外的控制字符：明文文本不会携带，判为二进制；
+/// 2. 无空白的纯 base64 字母表（去填充后 ≥32 字符）且可解码，解出字节的
+///    可打印 ASCII 占比明显偏低（<60%）：分块加密输出的编码形态。
+///    明文句子 base64 后通常带空格，不命中前半段；单 token 明文解码回来仍是
+///    ASCII 文本，可打印占比高，不命中后半段。
+///
+/// 两个条件都不满足即按明文透传。
+fn encrypted_content_value_is_opaque(value: &str) -> bool {
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        return true;
+    }
+    let body = value.trim_end_matches('=');
+    if body.len() < 32
+        || !body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='))
+    {
+        return false;
+    }
+    // base64url 与标准字母表在字符集层面无法区分，解码前逐字符映射到标准表。
+    // 这里不能写成 replace(['-', '_'], "+/")：str::replace 会把每个匹配字符替换成
+    // 完整的 "+/" 两个字符，长度改变后解码必然失败，opaque 载荷会被误判为明文。
+    let canonical: String = body
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    let padded = format!("{canonical}{}", "=".repeat((4 - canonical.len() % 4) % 4));
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&padded) else {
+        // 长度不满足编码约束（解码失败）就不是合法的密文编码，按明文处理；
+        // 真实密文的编码必然满足长度约束。
+        // （len % 4 == 1 的输入也在这里被排除。）
+        return false;
+    };
+    if decoded.is_empty() {
+        return false;
+    }
+    // 明文（ASCII 文本再 base64）解码回来仍是高可打印文本；密文解码字节接近
+    // 均匀分布，可打印 ASCII 占比仅约 37%。阈值取 60%。
+    let printable = decoded
+        .iter()
+        .filter(|b| matches!(**b, 0x20..0x7f | b'\t' | b'\n' | b'\r'))
+        .count();
+    printable * 5 < decoded.len() * 3
 }
 
 fn responses_history_function_name(item: &Value) -> String {
@@ -7406,9 +7674,63 @@ fn custom_proxy_tool_with_original_definition(
 /// `add_namespace_tools_to_context` + `namespace_tool_to_chat_tools` 展开成
 /// `mcp__<server>__<tool>`。只取 namespace 名字的话上游只能看到外壳，
 /// 调不到内层工具，反向转换也还原不出 namespace 字段。
+fn merge_namespace_definition(collected: &mut Vec<Value>, tool: &Value) {
+    let Some(name) = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let kind = tool.get("type").and_then(Value::as_str);
+    let existing = collected.iter_mut().find(|entry| {
+        entry.get("name").and_then(Value::as_str) == Some(name)
+            && entry.get("type").and_then(Value::as_str) == kind
+    });
+    let Some(existing) = existing else {
+        collected.push(tool.clone());
+        return;
+    };
+    if kind != Some("namespace") {
+        *existing = tool.clone();
+        return;
+    }
+    let mut children = existing
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for child in tool
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let child_name = child.get("name").and_then(Value::as_str);
+        let child_type = child.get("type").and_then(Value::as_str);
+        if let Some(old) = children.iter_mut().find(|old| {
+            child_name.is_some()
+                && old.get("name").and_then(Value::as_str) == child_name
+                && old.get("type").and_then(Value::as_str) == child_type
+        }) {
+            // 后来的定义只决定下一轮调用的 schema，不改写旧 call/output。
+            if old.get("parameters") != child.get("parameters") {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.namespace_schema_updated",
+                    json!({"namespace":name, "tool":child_name, "policy":"current_then_latest_history"}),
+                );
+            }
+            *old = child.clone();
+        } else {
+            children.push(child.clone());
+        }
+    }
+    *existing = tool.clone();
+    existing["tools"] = json!(children);
+}
+
 fn collect_tool_search_output_namespaces(body: &Value) -> Vec<Value> {
     let mut collected: Vec<Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let Some(items) = body.get("input").and_then(Value::as_array) else {
         return collected;
     };
@@ -7421,22 +7743,72 @@ fn collect_tool_search_output_namespaces(body: &Value) -> Vec<Value> {
             continue;
         };
         for tool in tools {
-            let Some(name) = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            if seen.insert(name.to_string()) {
-                collected.push(tool.clone());
-            }
+            merge_namespace_definition(&mut collected, tool);
         }
     }
 
     collected
 }
 
+/// 出站与两种反向转换共享同一投影，已过滤的原生工具不能抢占同名客户端工具。
+struct ChatToolProjection {
+    tools: Vec<Value>,
+    context: CodexToolContext,
+}
+
+fn chat_tool_projection(body: &Value, execute_web_search: bool) -> ChatToolProjection {
+    let mut namespaces = collect_tool_search_output_namespaces(body);
+    let mut projected = Vec::new();
+    for tool in body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("web_search" | "web_search_preview") if execute_web_search => {
+                projected.push(tool.clone())
+            }
+            Some("web_search" | "web_search_preview") => {}
+            Some("namespace") => merge_namespace_definition(&mut namespaces, tool),
+            _ => projected.push(tool.clone()),
+        }
+    }
+    // 顶层当前定义最后合并，优先于所有历史定义；同名 namespace 新 children 不丢。
+    projected.extend(namespaces);
+    let value = json!(projected);
+    let mut context = build_codex_tool_context(Some(&value));
+    for tool in body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !execute_web_search
+            && matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("web_search" | "web_search_preview")
+            )
+        {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("web_search");
+            if !context.function_tools.contains_key(name)
+                && !context.custom_tools.contains_key(name)
+            {
+                context.rejected_native_search.insert(name.to_string());
+            }
+        }
+    }
+    let mut tools = responses_tools_to_chat_tools(
+        value.as_array().expect("tools array"),
+        &context,
+        execute_web_search,
+    );
+    dedup_chat_tools_by_name(&mut tools);
+    ChatToolProjection { tools, context }
+}
 /// chat tools 按函数名去重，保留首次出现。
 fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

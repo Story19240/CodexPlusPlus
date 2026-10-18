@@ -5,6 +5,10 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "设为当前 Key": "Select this key",
+  "Key 名称": "Key name",
+  "删除 Key": "Delete key",
+  "添加 Key": "Add key",
   "本地服务器状态": "Local server status",
   "调试连接状态": "Debug connection status",
   "当前配置无需本地服务器": "The current configuration does not require a local server",
@@ -271,7 +275,9 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex-Dream-Skin 风格主题和换图": "Codex-Dream-Skin style themes and image replacement",
   "Codex增强": "Codex enhancements",
   "Debug 端口": "Debug port",
-  "Fast 按钮": "Fast button",
+  "原生 Fast 强制解锁": "Force unlock native Fast",
+  "纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。":
+    "Restore the native Fast switch in API key mode; save and restart Codex to apply. Actual support and billing depend on the provider.",
   "GitHub Release 更新": "GitHub Release update",
   "GitHub Release 检查": "GitHub Release check",
   "Helper 端口": "Helper port",
@@ -762,8 +768,14 @@ export const EN_PLAIN: Record<string, string> = {
   "启用": "Enable",
   "启用 Codex 图片覆盖层": "Enable Codex image overlay",
   "启用 Codex增强": "Enable Codex enhancements",
-  "独立额度解锁": "Standalone quota unlock",
-  "官方登录 + 混入 API Key": "Official login + mixed API key",
+  "独立模式": "Standalone mode",
+  "增强总开关关闭后仍会生效的补丁。":
+    "Patches that still apply after the enhancement master switch is turned off.",
+  "官方额度解锁": "Official quota unlock",
+  "增强开启时此能力已自动生效；此开关只在关闭增强后生效。":
+    "This capability is already active while enhancements are on; the switch only applies after enhancements are turned off.",
+  "官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。":
+    "Official login + API providers can still send after the official subscription quota runs out. Only the client send state changes; real usage and billing are untouched. Restart Codex after saving.",
   "启用供应商配置切换": "Enable provider configuration switching",
   "启用此扩展项": "Enable this entry",
   "包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。":
@@ -918,8 +930,6 @@ export const EN_PLAIN: Record<string, string> = {
   "日志已复制。": "Logs copied.",
   "时间": "Time",
   "桌宠跟随真实鼠标": "Real-mouse pet look",
-  "显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna，其他模型按 Standard 发送。":
-    "Show the service-tier toggle button; Fast only supports gpt-5.4 / gpt-5.5, other models are sent as Standard.",
   "普通推荐": "Regular recommendations",
   "多模态模型（支持图片输入的模型）请保持 send-as-is。": "Keep send-as-is for multimodal models that support image input.",
   "暂无": "None",
@@ -986,6 +996,10 @@ export const EN_PLAIN: Record<string, string> = {
   "模式": "Mode",
   "模式。": " mode.",
   "正在下载安装包…": "Downloading installer…",
+  "正在准备下载安装包…": "Preparing installer download…",
+  "正在写入安装包并准备安装…": "Writing installer and preparing installation…",
+  "正在启动安装器…": "Launching installer…",
+  "更新包仍在处理中，请保持窗口打开；完成后会自动更新状态。": "The update package is still being processed. Keep this window open; the status will update automatically when it finishes.",
   "正在写入安装包…": "Writing installer…",
   "正在修复…": "Repairing…",
   "正在修复历史会话": "Repairing historical sessions",
@@ -1481,6 +1495,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 的 API Key": "API key for {0}",
   "文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。": "The document's context window is {0}, but the column holds {1}. The current value was kept; clear the window to use the document's value.",
   "{0} 个插件": "{0} plugins",
   "{0} / {1} 个插件": "{0} / {1} plugins",

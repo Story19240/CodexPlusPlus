@@ -154,6 +154,26 @@ pub fn windows_process_control_strategy() -> WindowsProcessControlStrategy {
 }
 
 impl CodexLaunch {
+    /// 启动命令携带的最终端口；包上下文 wrapper 可能改选过端口。
+    pub fn debug_port(&self) -> Option<u16> {
+        let tokens = match self {
+            Self::Process { command, .. } => command.iter().map(String::as_str).collect::<Vec<_>>(),
+            Self::PackagedActivation { arguments, .. } => arguments.split_whitespace().collect(),
+        };
+        let mut ports = tokens.iter().enumerate().filter_map(|(index, token)| {
+            token
+                .strip_prefix("--remote-debugging-port=")
+                .or_else(|| {
+                    (*token == "--remote-debugging-port")
+                        .then(|| tokens.get(index + 1).copied())
+                        .flatten()
+                })
+                .and_then(|value| value.parse::<u16>().ok())
+        });
+        let first = ports.next()?;
+        (first != 0 && ports.all(|port| port == first)).then_some(first)
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::PackagedActivation { process_id, .. } => *process_id,
@@ -406,6 +426,9 @@ pub trait LaunchHooks: Send + Sync {
         Ok(None)
     }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
+    async fn apply_native_fast_unlock_on_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn inject_bridge(
         &self,
         debug_port: u16,
@@ -666,7 +689,7 @@ where
     H: IntoLaunchHooks,
 {
     let hooks = hooks.into_launch_hooks();
-    let debug_port = hooks.select_debug_port(options.debug_port);
+    let mut debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
@@ -813,6 +836,7 @@ where
                 &LaunchInstance::from_options(&options),
             )
             .await?;
+        debug_port = launch.debug_port().unwrap_or(debug_port);
         launched = Some(launch.clone());
         keep_launched_on_error = true;
         timeline.mark("launch_codex_done", 80);
@@ -826,6 +850,14 @@ where
             timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
+                if settings.codex_app_native_fast_unlock
+                    && let Err(error) = hooks.apply_native_fast_unlock_on_launch(debug_port).await
+                {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.native_fast_unlock_failed",
+                        serde_json::json!({ "message": error.to_string() }),
+                    );
+                }
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
                 crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
@@ -1070,18 +1102,8 @@ impl LaunchHooks for DefaultLaunchHooks {
             .collect::<Vec<_>>()
             .join("\n\n"),
         );
-        if profile.relay_mode == crate::settings::RelayMode::Official
-            && !profile.official_mix_api_key
-        {
-            let auth_contents = (!profile.auth_contents.trim().is_empty())
-                .then_some(profile.auth_contents.as_str());
-            crate::relay_config::clear_relay_config_to_home_with_auth(&home, auth_contents)?;
-            return Ok(());
-        }
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            &home,
-            &profile,
-            &common_config,
+        crate::relay_config::apply_relay_profile_with_preservation(
+            &home, &profile, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
         )?;
         Ok(())
     }
@@ -1333,6 +1355,11 @@ impl LaunchHooks for DefaultLaunchHooks {
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         retry_injection(debug_port, helper_port).await
     }
+
+    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        apply_native_fast_unlock_on_launch(debug_port).await
+    }
+
     async fn capture_injected_launch_identity(&self, debug_port: u16) {
         #[cfg(windows)]
         {
@@ -2171,7 +2198,10 @@ async fn handle_protocol_proxy_connection(
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
                 let search_unsupported =
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedNativeWebSearch>();
-                let status = if unsupported.is_some() || search_unsupported.is_some() {
+                let file_unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedInputFile>();
+                let vlm_failure = error.downcast_ref::<crate::vision::VlmPreprocessError>();
+                let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
+                    || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {
                     "400 Bad Request"
                 } else {
                     "502 Bad Gateway"
@@ -2180,6 +2210,8 @@ async fn handle_protocol_proxy_connection(
                     &unsupported
                         .map(|error| error.response_body())
                         .or_else(|| search_unsupported.map(|error| error.response_body()))
+                        .or_else(|| file_unsupported.map(|error| error.response_body()))
+                        .or_else(|| vlm_failure.map(|error| error.response_body()))
                         .unwrap_or_else(
                             || serde_json::json!({"status":"failed","message":error.to_string()}),
                         ),
@@ -2313,10 +2345,17 @@ async fn handle_protocol_proxy_connection(
                     }
                 }
             }
-            let payload = converter.finish();
-            stream.write_all(&payload).await?;
+            if let Some(bridge) = anthropic_bridge.as_mut() {
+                let tail = bridge.finish();
+                converter.push_upstream_bytes(&tail);
+                if !bridge.has_successful_compaction_completion() {
+                    converter.fail("Anthropic 压缩流缺少正常 message_stop".to_string(), Some("compaction_incomplete".to_string()));
+                }
+            }
+            let outcome = converter.finish_with_outcome();
+            stream.write_all(&outcome.payload).await?;
             log_helper_response(
-                "helper.protocol_proxy_compaction_ok",
+                if outcome.succeeded { "helper.protocol_proxy_compaction_ok" } else { "helper.protocol_proxy_compaction_failed" },
                 method,
                 path,
                 "200 OK",
@@ -2409,6 +2448,16 @@ async fn handle_protocol_proxy_connection(
     };
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let original: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+            if let Err(error) = crate::protocol_proxy::validate_compaction_json_completion(&original, upstream.wire_api) {
+                let mut converter = crate::protocol_proxy::CompactionSseConverter::new("");
+                converter.fail(error.to_string(), Some("compaction_incomplete".to_string()));
+                write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &converter.finish()).await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        }
         let compaction_input = crate::anthropic_bridge::normalize_non_stream_body_for_compaction(
             upstream.wire_api,
             &upstream_body,
@@ -4106,20 +4155,17 @@ async fn launch_packaged_multi_instance(
     // 端口选择在写脚本之前定：脚本里的端口就是实例身份的一部分，必须能让调用方
     // 知道（否则注入会打到旧端口）。
     let known_ports = [debug_port, crate::ports::find_available_loopback_port()];
-    let Some(actual_port) = crate::packaged_launch::select_debug_port(debug_port, &known_ports)
-    else {
-        anyhow::bail!("找不到可用的回环调试端口（请求 {debug_port}）");
-    };
-
-    let wrapper_path = crate::packaged_launch::prepare_wrapper_script(
+    let wrapper = crate::packaged_launch::prepare_wrapper_script_with_port(
         state_dir,
         &executable,
         &resolved_codex_home,
         &resolved_sqlite_home,
         &user_data_dir,
-        actual_port,
+        debug_port,
         &known_ports,
     )?;
+    let actual_port = wrapper.debug_port;
+    let wrapper_path = wrapper.path;
     match crate::packaged_launch::activate_in_package_context(&app_user_model_id, &wrapper_path)
         .await
     {
@@ -4621,6 +4667,66 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         &[script],
     )
     .await
+}
+
+// 仅在用户启动 Codex 的流程里重载一次；心跳重注入不重载正在使用的页面。
+async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<()> {
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
+    let websocket_url = target
+        .web_socket_debugger_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
+    let probe = "JSON.stringify({ready:window.__codexPlusNativeFastAssetPatchReady===true,compiled:window.__codexPlusNativeFastCompiled==='v1',failed:['unsupported','failed'].includes(window.__codexPlusNativeFastPatchState)})";
+    let state = crate::bridge::evaluate_script(websocket_url, probe).await?;
+    let state = native_fast_launch_state(&state);
+    if state.1 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !state.2,
+        "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+    );
+    anyhow::ensure!(state.0, "原生 Fast 资源补丁未就绪，保留原生界面");
+    crate::bridge::send_cdp_command(
+        websocket_url,
+        "Page.reload",
+        serde_json::json!({ "ignoreCache": true }),
+    )
+    .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(result) = crate::bridge::evaluate_script(websocket_url, probe).await {
+            let state = native_fast_launch_state(&result);
+            anyhow::ensure!(
+                !state.2,
+                "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+            );
+            if state.1 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.native_fast_unlock_ready",
+                    serde_json::json!({ "debug_port": debug_port }),
+                );
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("当前 Codex 版本未完成原生 Fast 补丁加载，保留原生身份限制")
+}
+
+fn native_fast_launch_state(result: &Value) -> (bool, bool, bool) {
+    let Some(text) = result.pointer("/result/result/value").and_then(Value::as_str) else {
+        return (false, false, false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (false, false, false);
+    };
+    (
+        value.get("ready").and_then(Value::as_bool) == Some(true),
+        value.get("compiled").and_then(Value::as_bool) == Some(true),
+        value.get("failed").and_then(Value::as_bool) == Some(true),
+    )
 }
 
 async fn confirmed_pet_overlay_targets(
@@ -6120,6 +6226,83 @@ mod tests {
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_protocol_safety_rejects_files_before_upstream_and_checks_original_compaction_wire()
+     {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = Restore(crate::paths::set_settings_path_for_tests(Some(
+            path.clone(),
+        )));
+        async fn request(body: serde_json::Value) -> String {
+            let body = body.to_string();
+            let raw = format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8(send_raw_helper_request(raw.as_bytes()).await).unwrap()
+        }
+        let write_profile = |protocol: &str, url: &str| {
+            std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"relayProfilesEnabled":true,
+                "activeRelayId":"safety", "relayProfiles":[{"id":"safety","name":"Safety fixture","baseUrl":format!("{url}/v1"),
+                "apiKey":"fixture-only","protocol":protocol,"relayMode":"pureApi"}]})).unwrap()).unwrap();
+        };
+        for protocol in ["chatCompletions", "anthropicMessages"] {
+            let upstream = MockServer::start().await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(
+                serde_json::json!({"model":"fixture","input":[{"role":"user","content":[
+                {"type":"input_file","file_data":"private-file-payload"}]}]}),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("unsupported_input_file"));
+            assert!(response.contains("input[0].content[0]"));
+            assert!(!response.contains("private-file-payload"));
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+        let anthropic_prefix = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"model\":\"fixture\",\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n"
+        );
+        for (protocol, stream, payload, complete) in [
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"summary"},"finish_reason":"stop"}]}).to_string(),true),
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}).to_string(),false),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"summary"}],"stop_reason":"end_turn"}).to_string(),true),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":null}).to_string(),false),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"summary\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),true),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n".to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: {{\"type\":\"message_stop\"}}\n\n"),true),
+            ("anthropicMessages",true,anthropic_prefix.to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: [DONE]\n\n"),false),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+                .set_body_string(payload).insert_header("Content-Type", if stream {"text/event-stream"} else {"application/json"}))
+                .mount(&upstream).await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(serde_json::json!({"model":"fixture","stream":stream,"input":[{"type":"compaction_trigger"}]})).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert_eq!(response.contains("event: response.completed"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.output_item.done"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.failed"), !complete, "{protocol}: {response}");
+            assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
