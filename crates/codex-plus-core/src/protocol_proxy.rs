@@ -7176,7 +7176,7 @@ fn web_search_chat_tool() -> Value {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current information. Call this tool by itself; do not combine it with other tool calls in the same assistant message.",
+            "description": "Search the web for current information. Use this tool whenever the answer depends on recent facts or needs source verification. If you need multiple searches, call it once per query, inspect the result, and then decide whether another focused search is needed. Do not combine it with other tool calls in the same assistant message.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -9289,7 +9289,7 @@ mod response_compatibility_tests {
             converted["tools"][0]["function"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("Call this tool by itself")
+                .contains("call it once per query")
         );
         assert_eq!(
             converted["tools"][0]["function"]["parameters"]["required"],
