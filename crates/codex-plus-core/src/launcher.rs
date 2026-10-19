@@ -7632,8 +7632,16 @@ mod proxy_stream_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             output_types,
-            ["web_search_call", "custom_tool_call", "message"],
+            ["web_search_call", "custom_tool_call", "reasoning"],
             "completed output items must preserve client tool type, got: {response}"
+        );
+        assert!(
+            response.contains("event: response.reasoning_summary_text.delta"),
+            "search summary should render in reasoning, got: {response}"
+        );
+        assert!(
+            !response.contains("\"id\":\"msg_chatcmpl-mixed_web_search_results\""),
+            "search summary must not render as an assistant message"
         );
 
         assert_eq!(model_server.received_requests().await.unwrap().len(), 1);
@@ -8086,7 +8094,7 @@ mod proxy_stream_tests {
             !response.contains("Search content"),
             "history injection must use the compact summary instead of full result content"
         );
-        // 二段返回客户端工具时同样必须保持原类型收敛，搜索结果 message 紧随其后。
+        // 二段返回客户端工具时同样必须保持原类型收敛，搜索结果 reasoning 紧随其后。
         assert!(
             response.contains("\"type\":\"custom_tool_call\""),
             "apply_patch should close as custom_tool_call, got: {response}"
@@ -8104,8 +8112,16 @@ mod proxy_stream_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             output_types,
-            ["web_search_call", "custom_tool_call", "message"],
+            ["web_search_call", "custom_tool_call", "reasoning"],
             "completed output items must preserve client tool type, got: {response}"
+        );
+        assert!(
+            response.contains("event: response.reasoning_summary_text.delta"),
+            "search summary should render in reasoning, got: {response}"
+        );
+        assert!(
+            !response.contains("\"id\":\"msg_chatcmpl-patch_web_search_results\""),
+            "search summary must not render as an assistant message"
         );
 
         assert_eq!(

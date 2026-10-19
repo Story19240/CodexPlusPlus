@@ -1889,8 +1889,9 @@ impl ChatSseToResponsesConverter {
         output.into_bytes()
     }
 
-    /// 混合调用时，把服务端搜索结果落成普通 assistant message。
-    /// 客户端工具由 Codex 执行；下轮历史会携带这条消息，搜索结果不会丢。
+    /// 混合调用时，把服务端搜索结果落成 reasoning item。
+    /// 客户端工具由 Codex 执行；主时间线只显示为可折叠思考内容，
+    /// 下轮历史仍会转换成 reasoning_content，搜索结果不会丢。
     pub(crate) fn push_web_search_results(
         &mut self,
         outputs: &[crate::web_search::WebSearchToolOutput],
@@ -3476,22 +3477,23 @@ fn web_search_results_response_item(
     outputs: &[crate::web_search::WebSearchToolOutput],
 ) -> Value {
     let response_id = response.get("id").and_then(Value::as_str).unwrap_or("");
-    // 历史回填只用紧凑摘要：完整正文仅存在于当轮 followup 的 tool 输出中，
-    // 不能以 assistant 消息形态整段进入会话历史。
+    // 历史回填只用紧凑摘要，并放进 reasoning item：
+    // 主时间线不新增 assistant 正文，但下一轮重放时会转换成 reasoning_content。
+    // 完整正文仅存在于当轮 followup 的 tool 输出中。
     let text = outputs
         .iter()
         .map(|output| output.summary.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
+    let item_id = format!(
+        "rs_{}_web_search_results",
+        response_id_body(response_id)
+    );
     json!({
-        "id": format!(
-            "msg_{}_web_search_results",
-            response_id_body(response_id)
-        ),
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+        "id": item_id,
+        "type": "reasoning",
+        "reasoning_content": text,
+        "summary": [{ "type": "summary_text", "text": text }]
     })
 }
 
@@ -5383,15 +5385,14 @@ impl ChatSseState {
             .join("\n\n");
         let output_index = self.next_output_index();
         let item_id = format!(
-            "msg_{}_web_search_results",
+            "rs_{}_web_search_results",
             response_id_body(&self.response_id)
         );
         let item = json!({
             "id": item_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+            "type": "reasoning",
+            "reasoning_content": text,
+            "summary": [{ "type": "summary_text", "text": text }]
         });
 
         push_sse(
@@ -5402,44 +5403,55 @@ impl ChatSseState {
                 "output_index": output_index,
                 "item": {
                     "id": item_id,
-                    "type": "message",
+                    "type": "reasoning",
                     "status": "in_progress",
-                    "role": "assistant",
-                    "content": []
+                    "reasoning_content": "",
+                    "summary": []
                 }
             }),
         );
         push_sse(
             output,
-            "response.content_part.added",
+            "response.reasoning_summary_part.added",
             json!({
-                "type": "response.content_part.added",
+                "type": "response.reasoning_summary_part.added",
                 "item_id": item_id,
                 "output_index": output_index,
-                "content_index": 0,
-                "part": { "type": "output_text", "text": "", "annotations": [] }
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" }
             }),
         );
         push_sse(
             output,
-            "response.output_text.done",
+            "response.reasoning_summary_text.delta",
             json!({
-                "type": "response.output_text.done",
+                "type": "response.reasoning_summary_text.delta",
                 "item_id": item_id,
                 "output_index": output_index,
-                "content_index": 0,
+                "summary_index": 0,
+                "delta": text
+            }),
+        );
+        push_sse(
+            output,
+            "response.reasoning_summary_text.done",
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": 0,
                 "text": text
             }),
         );
         push_sse(
             output,
-            "response.content_part.done",
+            "response.reasoning_summary_part.done",
             json!({
-                "type": "response.content_part.done",
+                "type": "response.reasoning_summary_part.done",
                 "item_id": item_id,
                 "output_index": output_index,
-                "content_index": 0,
-                "part": { "type": "output_text", "text": text, "annotations": [] }
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": text }
             }),
         );
         push_sse(
@@ -9762,8 +9774,12 @@ mod response_compatibility_tests {
 
         assert_eq!(all.matches("event: response.created").count(), 1);
         assert_eq!(all.matches("event: response.completed").count(), 1);
-        // done 事件数量：web_search + apply_patch + 搜索结果 message = 3。
+        // done 事件数量：web_search + apply_patch + 搜索结果 reasoning = 3。
         assert_eq!(all.matches("event: response.output_item.done").count(), 3);
+        assert!(
+            search_results.contains("event: response.reasoning_summary_text.delta"),
+            "search summary should stream as reasoning summary, got: {search_results}"
+        );
         // 客户端工具的 done item 必须是 custom_tool_call，且带原始 call_id。
         assert!(
             all.contains("\"type\":\"custom_tool_call\""),
@@ -9787,7 +9803,15 @@ mod response_compatibility_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             output_types,
-            ["web_search_call", "custom_tool_call", "message"]
+            ["web_search_call", "custom_tool_call", "reasoning"]
+        );
+        assert!(
+            all.contains("\"id\":\"rs_chatcmpl-mixed_web_search_results\""),
+            "search results should use a reasoning item id"
+        );
+        assert!(
+            !all.contains("\"id\":\"msg_chatcmpl-mixed_web_search_results\""),
+            "search results must not be emitted as an assistant message"
         );
         assert_eq!(completed_response["response"]["output"][0]["status"], "completed");
         assert_eq!(completed_response["response"]["output"][1]["status"], "completed");
@@ -10084,7 +10108,7 @@ mod response_compatibility_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             output_types,
-            ["web_search_call", "custom_tool_call", "message"],
+            ["web_search_call", "custom_tool_call", "reasoning"],
             "{response_json}"
         );
         assert_eq!(response_json["output"][0]["status"], "completed");
@@ -10092,19 +10116,36 @@ mod response_compatibility_tests {
         assert_eq!(response_json["output"][1]["status"], "completed");
         assert_eq!(response_json["output"][1]["call_id"], "call_patch");
         assert_eq!(response_json["output"][1]["name"], "apply_patch");
+        assert_eq!(
+            response_json["output"][2]["id"],
+            "rs_chatcmpl-mixed_web_search_results"
+        );
+        let search_summary = response_json["output"][2]["summary"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(
-            response_json["output"][2]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("1. Codex result - https://example.com/codex")
+            search_summary.contains("1. Codex result - https://example.com/codex"),
+            "{response_json}"
         );
         assert!(
-            !response_json["output"][2]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Codex content"),
+            !search_summary.contains("Codex content"),
             "history injection must use the compact summary instead of full result content"
         );
+
+        let replay_request = responses_to_chat_completions(json!({
+            "model": "fixture-model",
+            "input": response_json["output"].clone()
+        }))
+        .unwrap();
+        let replay_messages = replay_request["messages"].as_array().unwrap();
+        let replay_reasoning = replay_messages
+            .iter()
+            .filter_map(|message| {
+                message["reasoning_content"].as_str()
+            })
+            .find(|reasoning| reasoning.contains("1. Codex result - https://example.com/codex"))
+            .expect("search summary should survive history replay");
+        assert!(!replay_reasoning.contains("Codex content"));
     }
 
     #[test]
