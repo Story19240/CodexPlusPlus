@@ -340,9 +340,7 @@ fn lookup_context_window(
     let request_short_name = provider_short_name(request_model);
     let normalized_matches: Vec<_> = map
         .iter()
-        .filter(|(key, _)| {
-            provider_short_name(key).eq_ignore_ascii_case(&request_short_name)
-        })
+        .filter(|(key, _)| provider_short_name(key).eq_ignore_ascii_case(&request_short_name))
         .collect();
 
     if let Some(provider) = request_model.split_once('/').map(|(provider, _)| provider) {
@@ -1074,6 +1072,10 @@ pub(crate) async fn strip_image_blocks_with_context(
     // 即使本轮没有图片，也要登记请求边界；usage 回来后下一轮仍可复用真实 token。
     crate::context_usage::remember_request_boundary(thread_id, request_model, messages);
     if all_image_msgs.is_empty() {
+        // 最近窗口没有图片不代表整段历史都没有：长对话里图片消息会被挤出
+        // 50 条分析窗口，漏发到纯文本上游（glm-5.3 等）会直接 400 且无法重试恢复。
+        // 这里必须沿用旧逻辑的全量兜底清理，只跳过 VLM 分析与描述注入。
+        strip_all_images(messages);
         return Ok(VlmPreprocessReport::default());
     }
 
@@ -2197,6 +2199,61 @@ mod tests {
         let parts = messages[0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["text"], "just text");
+    }
+
+    #[tokio::test]
+    async fn strip_image_blocks_still_strips_images_outside_recent_window() {
+        // 回归（issue：glm-5.3 纯文本上游对 image_url 直接 400）：
+        // 图片消息滑出最近 50 条 user/tool 分析窗口后，不允许原样发给上游。
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "old screenshot"},
+                {"type": "image_url", "image_url": {"url": "https://out-of-window.example.com/old.png"}},
+            ]
+        })];
+        for i in 0..(ANALYZE_DEPTH_LIMIT + 5) {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": format!("round {i}")}]
+            }));
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("reply {i}")
+            }));
+        }
+
+        let vlm_config = VlmConfig {
+            api_key: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+        };
+        strip_image_blocks_with_context(
+            &mut messages,
+            &vlm_config,
+            "{}",
+            "1000000",
+            "fixture-out-of-window-model",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let has_image = messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+                })
+        });
+        assert!(
+            !has_image,
+            "images outside the recent window must still be stripped"
+        );
     }
 
     #[tokio::test]
