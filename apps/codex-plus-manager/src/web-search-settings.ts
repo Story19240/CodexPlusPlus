@@ -6,6 +6,7 @@ export type WebSearchSettings = {
   tavilyApiKey: string;
   tavilyApiKeyEnv: string;
   resultLimit: number;
+  maxRounds: number;
   timeoutSeconds: number;
 };
 
@@ -20,6 +21,7 @@ export function defaultWebSearchSettings(): WebSearchSettings {
     tavilyApiKey: "",
     tavilyApiKeyEnv: "TAVILY_API_KEY",
     resultLimit: 5,
+    maxRounds: 3,
     timeoutSeconds: 20,
   };
 }
@@ -42,6 +44,7 @@ export function normalizeWebSearchSettings(
     tavilyApiKey: text(value?.tavilyApiKey),
     tavilyApiKeyEnv: text(value?.tavilyApiKeyEnv, defaults.tavilyApiKeyEnv),
     resultLimit: number(value?.resultLimit, defaults.resultLimit, 1, 20),
+    maxRounds: number(value?.maxRounds, defaults.maxRounds, 1, 10),
     timeoutSeconds: number(value?.timeoutSeconds, defaults.timeoutSeconds, 1, 60),
   };
 }

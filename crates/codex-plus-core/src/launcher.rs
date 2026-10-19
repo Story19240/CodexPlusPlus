@@ -34,10 +34,6 @@ const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
 const WEB_SEARCH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const WEB_SEARCH_FOLLOWUP_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const WEB_SEARCH_KEEPALIVE: &[u8] = b": codex-plus-web-search-keepalive\n\n";
-/// 同一个响应内最多执行 3 轮服务端搜索。最后一轮后的模型请求移除 web_search，
-/// 防止模型无限要求搜索而无法产出最终答案。
-const MAX_WEB_SEARCH_ROUNDS: usize = 3;
-
 /// 看门狗内跟踪重注入退避状态；持续健康一段时间或应用实例更换时重置。
 #[derive(Debug, Default)]
 struct BridgeReinjectBackoff {
@@ -3132,8 +3128,12 @@ async fn complete_web_search_with_results(
     converter: &mut crate::protocol_proxy::ChatSseToResponsesConverter,
     accumulated_search_outputs: &[crate::web_search::WebSearchToolOutput],
 ) -> anyhow::Result<()> {
-    let search_results = converter.push_web_search_results(accumulated_search_outputs);
-    stream.write_all(&search_results).await?;
+    // 没有任何已完成结果时（例如第一轮 provider 就失败）不回填空摘要，
+    // 只保留已流式内容并正常收尾。
+    if !accumulated_search_outputs.is_empty() {
+        let search_results = converter.push_web_search_results(accumulated_search_outputs);
+        stream.write_all(&search_results).await?;
+    }
     let completed = converter.finish();
     stream.write_all(&completed).await?;
     Ok(())
@@ -3299,6 +3299,8 @@ async fn forward_web_search_protocol_proxy_stream(
     let mut current_has_client_tool = first_has_client_tool;
     let mut accumulated_search_outputs = Vec::new();
     let mut search_round = 1usize;
+    // 上限限制的是单次用户请求内的 web_search 执行次数，可由前端设置调整。
+    let max_rounds = usize::from(context.settings.web_search.max_rounds);
 
     loop {
         if search_round > 1 {
@@ -3341,16 +3343,27 @@ async fn forward_web_search_protocol_proxy_stream(
         {
             Ok(Ok(outputs)) => outputs,
             Ok(Err(error)) => {
-                let failed = converter.fail_web_search_calls(
-                    error.to_string(),
-                    Some("web_search_provider_failed".to_string()),
-                );
-                stream.write_all(&failed).await?;
+                // 搜索 provider 失败只降级当前轮的 call item：
+                // 已流式输出的 reasoning/text 不丢，前面轮次已完成的结果
+                // 照常回填，响应仍以 completed 收尾。
+                let message = error.to_string();
+                let degraded = converter.degrade_web_search_calls("web_search_provider_failed", message);
+                stream.write_all(&degraded).await?;
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "web_search.failed",
-                    serde_json::json!({ "stage": "provider", "searchRound": search_round }),
+                    "web_search.degraded",
+                    serde_json::json!({
+                        "stage": "provider",
+                        "searchRound": search_round,
+                        "maxRounds": max_rounds
+                    }),
                 );
-                return Ok(Some(error.to_string()));
+                complete_web_search_with_results(
+                    stream,
+                    &mut converter,
+                    &accumulated_search_outputs,
+                )
+                .await?;
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
@@ -3379,7 +3392,7 @@ async fn forward_web_search_protocol_proxy_stream(
             return Ok(None);
         }
 
-        let retain_web_search_tool = search_round < MAX_WEB_SEARCH_ROUNDS;
+        let retain_web_search_tool = search_round < max_rounds;
         let followup_request =
             match crate::web_search::build_web_search_followup_request_with_web_search_tool(
                 &current_chat_request,
@@ -3615,19 +3628,30 @@ async fn forward_web_search_protocol_proxy_stream(
             break;
         }
         if !retain_web_search_tool {
-            let message = format!("Web 搜索超过 {MAX_WEB_SEARCH_ROUNDS} 轮上限");
-            let failed = converter
-                .fail_web_search_calls(message.clone(), Some("web_search_round_limit".to_string()));
-            stream.write_all(&failed).await?;
+            // 工具声明已移除但模型仍发起下一次 web_search：只把该次调用
+            // 落成 failed item，已完成轮次的结果照常回填，响应正常收尾。
+            let message = format!(
+                "本次用户请求内 web_search 已达上限（{max_rounds}/{max_rounds}），该次调用未执行。\
+                 请基于已返回的搜索结果直接作答；信息不足时说明缺什么，\
+                 本请求内不要再次调用 web_search，收到下一条用户消息后可继续搜索。"
+            );
+            let degraded = converter.degrade_web_search_calls("web_search_round_limit", message);
+            stream.write_all(&degraded).await?;
             let _ = crate::diagnostic_log::append_diagnostic_log(
-                "web_search.failed",
+                "web_search.degraded",
                 serde_json::json!({
                     "stage": "round_limit",
                     "searchRound": search_round,
-                    "maxRounds": MAX_WEB_SEARCH_ROUNDS
+                    "maxRounds": max_rounds
                 }),
             );
-            return Ok(Some(message));
+            complete_web_search_with_results(
+                stream,
+                &mut converter,
+                &accumulated_search_outputs,
+            )
+            .await?;
+            return Ok(None);
         }
 
         // 只继承消息历史；工具集继续从原始请求构建，避免多轮请求时丢失
@@ -7007,6 +7031,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {
@@ -7209,6 +7234,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {
@@ -7378,6 +7404,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {
@@ -7518,6 +7545,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {
@@ -7613,6 +7641,296 @@ mod proxy_stream_tests {
     }
 
     #[tokio::test]
+    async fn web_search_provider_failure_degrades_to_completed_response() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("provider down"))
+            .mount(&search_server)
+            .await;
+
+        let first_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-provider-fail\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"先分析问题\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&first_model_server)
+            .await;
+
+        // provider 失败必须原地降级，不能再发二段模型请求。
+        let followup_model_server = MockServer::start().await;
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", first_model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", followup_model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            max_rounds: 3,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("{}/v1/chat/completions", followup_model_server.uri()),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "web_search", "parameters": { "type": "object" } }
+                }]
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "hi",
+                "stream": true,
+                "tools": [{ "type": "web_search" }]
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: Some(format!("{}/search", search_server.uri())),
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(failure.is_none(), "provider failure must degrade: {failure:?}");
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        // 已流式输出的原始内容不能丢。
+        assert!(response.contains("先分析问题"));
+        // 超限/失败只落在 item 级，不允许把整个响应标成 failed。
+        assert!(response.contains("\"type\":\"web_search_call\""));
+        assert!(response.contains("\"status\":\"failed\""));
+        assert!(response.contains("\"code\":\"web_search_provider_failed\""));
+        assert!(response.contains("Exa 搜索返回 HTTP 500"));
+        assert!(response.contains("event: response.completed"));
+        assert!(!response.contains("event: response.failed"));
+        // 第一轮就失败：没有已完成结果，不能回填空摘要。
+        assert!(!response.contains("Web search results for"));
+        assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(followup_model_server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn web_search_round_limit_degrades_to_completed_response() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Search content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let first_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-first\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_first\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&first_model_server)
+            .await;
+
+        // 工具声明已被移除，模型仍在二段里发起下一次 web_search。
+        let followup_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-second\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_second\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Go\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&followup_model_server)
+            .await;
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", first_model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", followup_model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+            exec_adapted: false,
+            exec_outcome: None,
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            max_rounds: 1,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("{}/v1/chat/completions", followup_model_server.uri()),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "search once then again" }],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "web_search", "parameters": { "type": "object" } }
+                }]
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "search once then again",
+                "stream": true,
+                "tools": [{ "type": "web_search" }]
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: Some(format!("{}/search", search_server.uri())),
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(failure.is_none(), "round limit must degrade: {failure:?}");
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("event: response.completed"));
+        assert!(!response.contains("event: response.failed"));
+        // 超限调用只落成 item 级 failed，并给出可继续的指引。
+        assert!(response.contains("\"call_id\":\"call_second\""));
+        assert!(response.contains("\"status\":\"failed\""));
+        assert!(response.contains("\"code\":\"web_search_round_limit\""));
+        assert!(response.contains("已达上限（1/1）"));
+        // 已完成轮次的结果摘要照常回填。
+        assert!(response.contains("Web search results for query: Codex"));
+        assert!(response.contains("1. Codex result - https://example.com/codex"));
+        assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(followup_model_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn web_search_live_stream_returns_client_tool_after_search_with_results() {
         use crate::settings::{
             BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
@@ -7701,6 +8019,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {
@@ -7861,6 +8180,7 @@ mod proxy_stream_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let context = WebSearchExecutionContext {

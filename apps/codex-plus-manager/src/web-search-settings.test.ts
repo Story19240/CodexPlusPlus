@@ -11,6 +11,7 @@ test("web search defaults are disabled and provider settings normalize safely", 
   assert.equal(defaults.enabled, false);
   assert.equal(defaults.provider, "exa");
   assert.equal(defaults.resultLimit, 5);
+  assert.equal(defaults.maxRounds, 3);
   assert.equal(defaults.timeoutSeconds, 20);
 
   const normalized = normalizeWebSearchSettings({
@@ -19,10 +20,12 @@ test("web search defaults are disabled and provider settings normalize safely", 
     exaApiKey: " direct ",
     tavilyApiKeyEnv: "TAVILY_KEY",
     resultLimit: 99,
+    maxRounds: 0,
     timeoutSeconds: 0,
   });
   assert.equal(normalized.exaApiKey, "direct");
   assert.equal(normalized.resultLimit, 20);
+  assert.equal(normalized.maxRounds, 1);
   assert.equal(normalized.timeoutSeconds, 1);
 });
 

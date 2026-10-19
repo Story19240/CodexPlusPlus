@@ -639,6 +639,8 @@ pub struct WebSearchSettings {
     pub tavily_api_key: String,
     pub tavily_api_key_env: String,
     pub result_limit: u8,
+    /// 单次用户请求内允许执行的最大 web_search 轮数。
+    pub max_rounds: u8,
     pub timeout_seconds: u64,
 }
 
@@ -652,6 +654,7 @@ impl Default for WebSearchSettings {
             tavily_api_key: String::new(),
             tavily_api_key_env: "TAVILY_API_KEY".to_string(),
             result_limit: 5,
+            max_rounds: 3,
             timeout_seconds: 20,
         }
     }
@@ -664,6 +667,7 @@ impl WebSearchSettings {
         self.tavily_api_key = self.tavily_api_key.trim().to_string();
         self.tavily_api_key_env = self.tavily_api_key_env.trim().to_string();
         self.result_limit = self.result_limit.clamp(1, 20);
+        self.max_rounds = self.max_rounds.clamp(1, 10);
         self.timeout_seconds = self.timeout_seconds.clamp(1, 60);
     }
 }
@@ -3044,6 +3048,7 @@ mod tests {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
         let mut settings = BackendSettings::default();
+        assert_eq!(settings.web_search.max_rounds, 3);
         settings.web_search = WebSearchSettings {
             enabled: true,
             provider: WebSearchProvider::Tavily,
@@ -3052,6 +3057,7 @@ mod tests {
             tavily_api_key: "tavily-key".to_string(),
             tavily_api_key_env: "TAVILY_TEST_KEY".to_string(),
             result_limit: 99,
+            max_rounds: 99,
             timeout_seconds: 0,
         };
 
@@ -3065,6 +3071,7 @@ mod tests {
         assert_eq!(loaded.web_search.tavily_api_key, "tavily-key");
         assert_eq!(loaded.web_search.tavily_api_key_env, "TAVILY_TEST_KEY");
         assert_eq!(loaded.web_search.result_limit, 20);
+        assert_eq!(loaded.web_search.max_rounds, 10);
         assert_eq!(loaded.web_search.timeout_seconds, 1);
     }
 

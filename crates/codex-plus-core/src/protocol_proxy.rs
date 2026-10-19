@@ -1915,6 +1915,21 @@ impl ChatSseToResponsesConverter {
         bytes
     }
 
+    /// Web 搜索降级：只把当前未完成的 web_search_call 收敛成带错误信息的
+    /// failed item，不调用 fail()，响应仍按正常 completed 收尾。
+    /// provider 失败与轮数超限两个分支共用；已流式输出的 reasoning/text
+    /// 与已完成轮次的结果都不受影响。
+    pub(crate) fn degrade_web_search_calls(&mut self, code: &str, message: String) -> Vec<u8> {
+        let mut output = String::new();
+        let error = json!({ "code": code, "message": message });
+        self.state.complete_web_search_calls_with_error_into(
+            &mut output,
+            "failed",
+            Some(&error),
+        );
+        output.into_bytes()
+    }
+
     /// 二段输出沿用同一个 response id 与 output_index 序列，不再发送 response.created。
     pub(crate) fn resume_after_web_search(&mut self, first_response_id: &str) {
         self.state.resume_after_web_search(first_response_id);
@@ -5289,6 +5304,15 @@ impl ChatSseState {
     }
 
     fn complete_web_search_calls_into(&mut self, output: &mut String, status: &str) {
+        self.complete_web_search_calls_with_error_into(output, status, None);
+    }
+
+    fn complete_web_search_calls_with_error_into(
+        &mut self,
+        output: &mut String,
+        status: &str,
+        error: Option<&Value>,
+    ) {
         let keys: Vec<usize> = self.tools.keys().copied().collect();
         for key in keys {
             if self.tools.get(&key).map(|state| state.done).unwrap_or(true) {
@@ -5318,13 +5342,16 @@ impl ChatSseState {
             if state.output_index.is_none() {
                 state.output_index = Some(output_index);
             }
-            let item = json!({
+            let mut item = json!({
                 "id": web_search_item_id(&state.call_id),
                 "type": "web_search_call",
                 "status": status,
                 "call_id": state.call_id,
                 "action": web_search_action_from_arguments(&state.arguments)
             });
+            if let Some(error) = error {
+                item["error"] = error.clone();
+            }
             state.done = true;
             self.output_items.push((output_index, item.clone()));
             push_sse(
@@ -8367,6 +8394,9 @@ fn web_search_action_has_target(action: &Value) -> bool {
 fn invalid_web_search_output_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("web_search_call")
         && item.get("status").and_then(Value::as_str) != Some("completed")
+        // 带 error 的 failed item 是编排层有意降级的结果，允许正常收尾；
+        // 只有没有任何错误标记的未执行原生调用才视为非法上游输出。
+        && item.get("error").is_none()
 }
 
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
@@ -9808,6 +9838,7 @@ mod response_compatibility_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let relay = RelayProfile {
@@ -9953,6 +9984,7 @@ mod response_compatibility_tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let relay = RelayProfile {

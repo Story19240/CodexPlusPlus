@@ -5887,6 +5887,15 @@ function WebSearchSettingsPanel({ form, onFormChange }: {
                   onChange={(event) => updateWebSearch({ timeoutSeconds: clampNumber(Number(event.currentTarget.value), 1, 60) })}
                 />
               </Field>
+              <Field label={t("最大搜索轮数")}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={form.webSearch.maxRounds}
+                  onChange={(event) => updateWebSearch({ maxRounds: clampNumber(Number(event.currentTarget.value), 1, 10) })}
+                />
+              </Field>
             </div>
           </details>
           {issue ? <p className="field-hint" role="alert">{issue}</p> : null}

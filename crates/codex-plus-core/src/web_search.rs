@@ -288,6 +288,23 @@ pub(crate) async fn execute_web_search_calls_at(
         grouped_results[call_index].push((query, result));
     }
 
+    // 所有查询全部失败时视为 provider 整体故障：交给调用方按 item 级降级收尾，
+    // 不把失败文本伪装成正常结果继续二段编排。部分失败仍按原逻辑折叠。
+    if !calls.is_empty()
+        && grouped_results
+            .iter()
+            .flatten()
+            .all(|(_, result)| result.is_err())
+    {
+        if let Some((_, Err(error))) = grouped_results
+            .iter()
+            .flatten()
+            .find(|(_, result)| result.is_err())
+        {
+            return Err(anyhow::anyhow!("{error:#}"));
+        }
+    }
+
     let mut outputs = Vec::with_capacity(calls.len());
     for (call, call_results) in calls.iter().zip(grouped_results) {
         let (content, summary) = format_search_call_results(call_results);
@@ -778,6 +795,7 @@ mod tests {
             },
             tavily_api_key_env: String::new(),
             result_limit: 2,
+            max_rounds: 3,
             timeout_seconds: 5,
         }
     }
@@ -1314,6 +1332,7 @@ mod tests {
             tavily_api_key: String::new(),
             tavily_api_key_env: String::new(),
             result_limit: 1,
+            max_rounds: 3,
             timeout_seconds: 5,
         };
         let calls = (0..5)
