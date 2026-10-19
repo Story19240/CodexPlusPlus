@@ -3461,15 +3461,11 @@ fn web_search_results_response_item(
     outputs: &[crate::web_search::WebSearchToolOutput],
 ) -> Value {
     let response_id = response.get("id").and_then(Value::as_str).unwrap_or("");
+    // 历史回填只用紧凑摘要：完整正文仅存在于当轮 followup 的 tool 输出中，
+    // 不能以 assistant 消息形态整段进入会话历史。
     let text = outputs
         .iter()
-        .map(|output| {
-            format!(
-                "Web search results for {}:\n{}",
-                output.queries.join(", "),
-                output.content
-            )
-        })
+        .map(|output| output.summary.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
     json!({
@@ -5355,18 +5351,7 @@ impl ChatSseState {
 
         let text = outputs
             .iter()
-            .map(|search_output| {
-                format!(
-                    "Web search results for {}:\n{}",
-                    search_output
-                        .queries
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    search_output.content
-                )
-            })
+            .map(|search_output| search_output.summary.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
         let output_index = self.next_output_index();
@@ -9726,10 +9711,15 @@ mod response_compatibility_tests {
                 call_id: "call_search".to_string(),
                 queries: vec!["Codex".to_string()],
                 content: "Codex content".to_string(),
+                summary: "Web search results for query: Codex\n1. Codex result - https://example.com/codex".to_string(),
             },
         ]))
         .unwrap();
-        assert!(search_results.contains("Codex content"));
+        assert!(search_results.contains("1. Codex result - https://example.com/codex"));
+        assert!(
+            !search_results.contains("Codex content"),
+            "history injection must use the compact summary instead of full result content"
+        );
 
         let completed = String::from_utf8(converter.finish()).unwrap();
 
@@ -10074,7 +10064,14 @@ mod response_compatibility_tests {
             response_json["output"][2]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("Codex content")
+                .contains("1. Codex result - https://example.com/codex")
+        );
+        assert!(
+            !response_json["output"][2]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Codex content"),
+            "history injection must use the compact summary instead of full result content"
         );
     }
 

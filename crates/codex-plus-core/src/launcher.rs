@@ -7428,7 +7428,12 @@ mod proxy_stream_tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("\"call_id\":\"call_search\""));
-        assert!(response.contains("Codex content"));
+        assert!(response.contains("Web search results for query: Codex"));
+        assert!(response.contains("1. Codex result - https://example.com/codex"));
+        assert!(
+            !response.contains("Codex content"),
+            "history injection must use the compact summary instead of full result content"
+        );
         assert!(response.contains("event: response.completed"));
         assert!(!response.contains("event: response.failed"));
         assert_eq!(
@@ -7574,8 +7579,12 @@ mod proxy_stream_tests {
         assert!(response.contains("\"type\":\"web_search_call\""));
         assert!(response.contains("\"status\":\"completed\""));
         assert!(response.contains("\"name\":\"apply_patch\""));
-        assert!(response.contains("Web search results for Codex"));
-        assert!(response.contains("Search content"));
+        assert!(response.contains("Web search results for query: Codex"));
+        assert!(response.contains("1. Codex result - https://example.com/codex"));
+        assert!(
+            !response.contains("Search content"),
+            "history injection must use the compact summary instead of full result content"
+        );
         // 混合同轮调用时客户端工具必须保持原类型收敛（custom_tool_call），
         // 不能被 web_search 编排错误序列化成 web_search_call（id 前缀 ws_）。
         assert!(
@@ -7752,8 +7761,12 @@ mod proxy_stream_tests {
         assert!(!response.contains("event: response.failed"));
         assert!(response.contains("\"type\":\"web_search_call\""));
         assert!(response.contains("\"name\":\"apply_patch\""));
-        assert!(response.contains("Web search results for Codex"));
-        assert!(response.contains("Search content"));
+        assert!(response.contains("Web search results for query: Codex"));
+        assert!(response.contains("1. Codex result - https://example.com/codex"));
+        assert!(
+            !response.contains("Search content"),
+            "history injection must use the compact summary instead of full result content"
+        );
         // 二段返回客户端工具时同样必须保持原类型收敛，搜索结果 message 紧随其后。
         assert!(
             response.contains("\"type\":\"custom_tool_call\""),

@@ -34,7 +34,11 @@ pub struct WebSearchToolCall {
 pub struct WebSearchToolOutput {
     pub call_id: String,
     pub queries: Vec<String>,
+    /// 完整结果文本，仅用于当轮 followup 的 tool 输出，让模型读到内容片段。
     pub content: String,
+    /// 紧凑摘要，仅保留查询标题与「标题 - URL」列表，用于回填会话历史，
+    /// 避免完整搜索正文以 assistant 消息形态污染聊天记录。
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,10 +290,12 @@ pub(crate) async fn execute_web_search_calls_at(
 
     let mut outputs = Vec::with_capacity(calls.len());
     for (call, call_results) in calls.iter().zip(grouped_results) {
+        let (content, summary) = format_search_call_results(call_results);
         outputs.push(WebSearchToolOutput {
             call_id: call.call_id.clone(),
             queries: call.queries.clone(),
-            content: format_search_call_results(call_results),
+            content,
+            summary,
         });
     }
     Ok(outputs)
@@ -297,20 +303,29 @@ pub(crate) async fn execute_web_search_calls_at(
 
 fn format_search_call_results(
     results: Vec<(String, anyhow::Result<Vec<WebSearchResult>>)>,
-) -> String {
-    let mut output = String::new();
+) -> (String, String) {
+    let mut content = String::new();
+    let mut summary = String::new();
     for (query, result) in results {
-        if !output.is_empty() {
-            output.push('\n');
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        if !summary.is_empty() {
+            summary.push_str("\n\n");
         }
         match result {
-            Ok(results) => output.push_str(&format_search_results(&query, &results)),
-            Err(error) => output.push_str(&format!(
-                "Web search failed for query: {query}\nError: {error:#}"
-            )),
+            Ok(results) => {
+                content.push_str(&format_search_results(&query, &results));
+                summary.push_str(&summarize_search_results(&query, &results));
+            }
+            Err(error) => {
+                let failed = format!("Web search failed for query: {query}\nError: {error:#}");
+                content.push_str(&failed);
+                summary.push_str(&failed);
+            }
         }
     }
-    output
+    (content, summary)
 }
 
 pub fn parse_chat_response(body: &[u8], content_type: &str) -> anyhow::Result<ParsedChatResponse> {
@@ -591,6 +606,19 @@ pub fn format_search_results(query: &str, results: &[WebSearchResult]) -> String
             result.url,
             result.content
         ));
+    }
+    output
+}
+
+/// 历史回填用的紧凑摘要：只保留查询、标题和 URL，不带正文片段。
+/// 这条文本会以 assistant 消息形态进入会话历史，必须控制视觉与 token 体积。
+pub fn summarize_search_results(query: &str, results: &[WebSearchResult]) -> String {
+    if results.is_empty() {
+        return format!("No web search results for query: {query}");
+    }
+    let mut output = format!("Web search results for query: {query}");
+    for (index, result) in results.iter().enumerate() {
+        output.push_str(&format!("\n{}. {} - {}", index + 1, result.title, result.url));
     }
     output
 }
@@ -1109,6 +1137,7 @@ mod tests {
             call_id: "call_search".to_string(),
             queries: vec!["Codex".to_string()],
             content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
         }];
         let followup = build_web_search_followup_request(
             &json!({
@@ -1167,6 +1196,7 @@ mod tests {
             call_id: "call_search".to_string(),
             queries: vec!["Codex".to_string()],
             content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
         }];
 
         let followup = build_web_search_followup_request_with_web_search_tool(
@@ -1218,6 +1248,7 @@ mod tests {
             call_id: "call_search".to_string(),
             queries: vec!["Codex".to_string()],
             content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
         }];
 
         for tool_choice in [
