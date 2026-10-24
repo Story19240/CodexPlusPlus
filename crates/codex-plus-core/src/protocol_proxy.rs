@@ -1822,6 +1822,10 @@ impl ChatSseToResponsesConverter {
         self.state.latest_usage.as_ref()
     }
 
+    pub(crate) fn turn_usage(&self) -> Option<&Value> {
+        self.state.turn_usage.as_ref()
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -3091,6 +3095,13 @@ async fn execute_web_search_round(
             }
         };
     if search_calls.is_empty() {
+        if let Some(usage) = first_response.usage.as_ref() {
+            crate::context_usage::record_usage(
+                session_headers.thread_id,
+                &first_response.model,
+                usage,
+            );
+        }
         return converted_chat_response(
             &first_body,
             &first_content_type,
@@ -3150,6 +3161,14 @@ async fn execute_web_search_round(
             web_search_results_response_item(&response_json, &search_outputs);
         if let Some(output) = response_json.get_mut("output").and_then(Value::as_array_mut) {
             output.push(search_results_item);
+        }
+
+        if let Some(usage) = first_response.usage.as_ref() {
+            crate::context_usage::record_usage(
+                session_headers.thread_id,
+                &first_response.model,
+                usage,
+            );
         }
 
         let target_stream = request_wants_stream(original_request);
@@ -3298,6 +3317,9 @@ async fn execute_web_search_round(
             ));
         }
     };
+    if let Some(usage) = parsed.usage.as_ref() {
+        crate::context_usage::record_usage(session_headers.thread_id, &parsed.model, usage);
+    }
     let response_json = match chat_completion_to_response_with_request(
         chat_json_from_parsed(&parsed),
         original_request,
@@ -4792,6 +4814,7 @@ struct ChatSseState {
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
     usage_baseline: Option<Value>,
+    turn_usage: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
     original_request: Option<Value>,
@@ -4814,6 +4837,7 @@ impl Default for ChatSseState {
             output_items: Vec::new(),
             latest_usage: None,
             usage_baseline: None,
+            turn_usage: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             original_request: None,
@@ -4854,7 +4878,11 @@ impl ChatSseState {
 
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
             let current_usage = chat_usage_to_responses_usage(Some(usage));
-            self.latest_usage = Some(match self.usage_baseline.clone() {
+            // latest_usage 只保留最近一轮上游请求：response.completed 与
+            // context_usage 锚点都把它当作“当前上下文”解读。跨轮真实累计
+            // 单独记录到 turn_usage，供计费诊断观测。
+            self.latest_usage = Some(current_usage.clone());
+            self.turn_usage = Some(match self.usage_baseline.clone() {
                 Some(base_usage) => merge_responses_usage(&base_usage, &current_usage),
                 None => current_usage,
             });
@@ -5475,8 +5503,8 @@ impl ChatSseState {
         self.inline_think = InlineThinkState::default();
         self.tools.clear();
         self.finish_reason = None;
-        self.usage_baseline = self.latest_usage.clone();
-        self.latest_usage = self.usage_baseline.clone();
+        self.usage_baseline = self.turn_usage.clone();
+        self.latest_usage = None;
     }
 
     fn finalize_reasoning_into(&mut self, output: &mut String) {
@@ -9847,6 +9875,7 @@ mod response_compatibility_tests {
                     .set_body_string(concat!(
                         "data: {\"id\":\"chatcmpl-final\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n",
                         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n",
                         "data: [DONE]\n\n"
                     )),
             )
@@ -9919,6 +9948,11 @@ mod response_compatibility_tests {
             "tools": [{ "type": "web_search" }]
         });
 
+        let session_headers = ProxySessionHeaders {
+            session_id: None,
+            thread_id: Some("web-search-non-stream-round-usage"),
+            opencode_session: None,
+        };
         let mut response = execute_web_search_round(
             upstream,
             relay,
@@ -9928,7 +9962,7 @@ mod response_compatibility_tests {
             &settings,
             None,
             None,
-            ProxySessionHeaders::default(),
+            session_headers,
             Some(&format!("{}/search", search_server.uri())),
         )
         .await
@@ -9977,6 +10011,13 @@ mod response_compatibility_tests {
             .unwrap();
         let search_body: Value = serde_json::from_slice(&search_request.body).unwrap();
         assert_eq!(search_body["query"], "Codex");
+
+        let anchor = crate::context_usage::anchor_for(
+            Some("web-search-non-stream-round-usage"),
+            "fixture-model",
+        )
+        .expect("non-stream web search should record the followup usage anchor");
+        assert_eq!(anchor.context_used, 10);
     }
 
     #[tokio::test]

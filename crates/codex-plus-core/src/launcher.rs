@@ -3123,6 +3123,27 @@ fn record_chat_converter_usage(
     }
 }
 
+/// web_search 多轮编排会把一次用户请求拆成多次上游调用。最终响应只上报
+/// 最近一轮 usage，这里补记跨轮累计，避免真实计费消耗从诊断面消失。
+fn log_web_search_turn_usage(
+    converter: &crate::protocol_proxy::ChatSseToResponsesConverter,
+    upstream_request_count: usize,
+) {
+    let (Some(turn_usage), Some(latest_round_usage)) =
+        (converter.turn_usage(), converter.latest_usage())
+    else {
+        return;
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.turn_usage",
+        serde_json::json!({
+            "upstreamRequestCount": upstream_request_count,
+            "turnUsage": turn_usage,
+            "latestRoundUsage": latest_round_usage,
+        }),
+    );
+}
+
 async fn complete_web_search_with_results(
     stream: &mut tokio::net::TcpStream,
     converter: &mut crate::protocol_proxy::ChatSseToResponsesConverter,
@@ -3388,6 +3409,7 @@ async fn forward_web_search_protocol_proxy_stream(
             stream.write_all(&search_results).await?;
             let completed = converter.finish();
             stream.write_all(&completed).await?;
+            log_web_search_turn_usage(&converter, search_round);
             record_chat_converter_usage(session_headers.thread_id, &converter);
             return Ok(None);
         }
@@ -3664,6 +3686,7 @@ async fn forward_web_search_protocol_proxy_stream(
 
     let completed = converter.finish();
     stream.write_all(&completed).await?;
+    log_web_search_turn_usage(&converter, search_round + 1);
     record_chat_converter_usage(session_headers.thread_id, &converter);
     Ok(None)
 }
@@ -7063,12 +7086,17 @@ mod proxy_stream_tests {
             .await
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
+        let session_headers = ProxySessionHeaders {
+            session_id: None,
+            thread_id: Some("web-search-latest-round-usage"),
+            opencode_session: None,
+        };
         let forwarded = tokio::spawn(async move {
             let failure = forward_web_search_protocol_proxy_stream(
                 &mut writer,
                 &mut upstream,
                 context,
-                ProxySessionHeaders::default(),
+                session_headers,
             )
             .await
             .unwrap();
@@ -7095,10 +7123,35 @@ mod proxy_stream_tests {
         assert!(reasoning_at < search_at);
         assert!(search_at < answer_at);
         assert!(answer_at < completed_at);
-        assert!(response.contains("\"input_tokens\":17"));
-        assert!(response.contains("\"output_tokens\":7"));
-        assert!(response.contains("\"total_tokens\":24"));
-        assert!(response.contains("\"reasoning_tokens\":7"));
+        assert!(response.contains("\"input_tokens\":7"));
+        assert!(response.contains("\"output_tokens\":3"));
+        assert!(response.contains("\"total_tokens\":10"));
+        assert!(response.contains("\"reasoning_tokens\":5"));
+
+        let anchor = crate::context_usage::anchor_for(
+            Some("web-search-latest-round-usage"),
+            "fixture-model",
+        )
+        .expect("web search turn should record latest round usage anchor");
+        assert_eq!(anchor.context_used, 10);
+
+        let turn_usage_event = crate::diagnostic_log::recent_diagnostic_records()
+            .into_iter()
+            .filter(|record| record["event"] == "web_search.turn_usage")
+            .filter(|record| record["detail"]["turnUsage"]["input_tokens"] == 17)
+            .last()
+            .expect("web_search.turn_usage event missing");
+        assert_eq!(turn_usage_event["detail"]["upstreamRequestCount"], 2);
+        assert_eq!(turn_usage_event["detail"]["turnUsage"]["output_tokens"], 7);
+        assert_eq!(turn_usage_event["detail"]["turnUsage"]["total_tokens"], 24);
+        assert_eq!(
+            turn_usage_event["detail"]["latestRoundUsage"]["input_tokens"],
+            7
+        );
+        assert_eq!(
+            turn_usage_event["detail"]["latestRoundUsage"]["total_tokens"],
+            10
+        );
 
         let followup_request = followup_model_server
             .received_requests()

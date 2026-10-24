@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -7,9 +8,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 static TEST_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static MEMORY_LOG: OnceLock<Mutex<VecDeque<DiagnosticRecord>>> = OnceLock::new();
 
 const MAX_DIAGNOSTIC_LOG_BYTES: u64 = 50 * 1024 * 1024;
 const COMPACTED_DIAGNOSTIC_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_MEMORY_DIAGNOSTIC_RECORDS: usize = 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct DiagnosticRecord {
@@ -36,6 +39,7 @@ pub fn append_diagnostic_log(event: &str, detail: impl Serialize) -> std::io::Re
         event: event.to_string(),
         detail,
     };
+    remember_record(&record);
     let line = serde_json::to_string(&record).unwrap_or_else(|error| {
         json!({
             "timestamp_ms": now_ms(),
@@ -58,8 +62,43 @@ pub fn append_diagnostic_log(event: &str, detail: impl Serialize) -> std::io::Re
 }
 
 pub fn clear_diagnostic_log() -> std::io::Result<()> {
+    clear_memory_log();
     let path = diagnostic_log_path();
     clear_diagnostic_log_path(&path)
+}
+
+/// 进程内最近诊断事件的只读快照。测试用它做确定性断言，
+/// 避免并行测试共享日志文件时的时序抖动。
+#[cfg(test)]
+pub(crate) fn recent_diagnostic_records() -> Vec<Value> {
+    let lock = MEMORY_LOG.get_or_init(|| Mutex::new(VecDeque::new()));
+    let Ok(records) = lock.lock() else {
+        return Vec::new();
+    };
+    records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap_or(Value::Null))
+        .collect()
+}
+
+fn remember_record(record: &DiagnosticRecord) {
+    let lock = MEMORY_LOG.get_or_init(|| Mutex::new(VecDeque::new()));
+    let Ok(mut records) = lock.lock() else {
+        return;
+    };
+    records.push_back(record.clone());
+    while records.len() > MAX_MEMORY_DIAGNOSTIC_RECORDS {
+        records.pop_front();
+    }
+}
+
+fn clear_memory_log() {
+    let Some(lock) = MEMORY_LOG.get() else {
+        return;
+    };
+    if let Ok(mut records) = lock.lock() {
+        records.clear();
+    }
 }
 
 fn clear_diagnostic_log_path(path: &Path) -> std::io::Result<()> {
@@ -153,5 +192,16 @@ mod tests {
         let path = temp.path().join("missing.log");
 
         clear_diagnostic_log_path(&path).unwrap();
+    }
+
+    #[test]
+    fn memory_log_keeps_recent_records() {
+        let _ = append_diagnostic_log("memory.test", json!({ "value": 1 }));
+
+        assert!(
+            recent_diagnostic_records()
+                .iter()
+                .any(|record| record["event"] == "memory.test" && record["detail"]["value"] == 1)
+        );
     }
 }
