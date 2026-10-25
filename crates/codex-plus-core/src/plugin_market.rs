@@ -343,11 +343,14 @@ async fn fetch_index(source: Source) -> anyhow::Result<Vec<u8>> {
         "https://raw.githubusercontent.com/{}/main/plugin-index.json",
         source.repository
     );
-    let client = reqwest::Client::builder()
-        .user_agent("CodexPlusPlus/plugin-market")
-        .timeout(INDEX_TIMEOUT)
-        .build()
-        .context("无法建立插件市场连接")?;
+    // 插件索引走 GitHub raw，和更新检查一样必须尊重系统代理，否则在需要代理的
+    // 网络里会一直超时、表现为插件市场空白或加载失败（#1329 / #2442）。
+    let client = crate::http_client::proxied_client_with_timeouts(
+        "CodexPlusPlus/plugin-market",
+        INDEX_TIMEOUT,
+        INDEX_TIMEOUT,
+    )
+    .context("无法建立插件市场连接")?;
     match client.get(&url).send().await {
         Ok(mut response) if response.status().is_success() => {
             if response.content_length().unwrap_or_default() > MAX_INDEX_BYTES as u64 {
@@ -866,7 +869,8 @@ async fn resolve_git_proxy(work: &Path, url: &str) -> anyhow::Result<Option<Stri
         work,
         url,
         has_proxy_env,
-        crate::proxy::detect_system_proxy,
+        // 按仓库地址求值，Windows PAC / 自动检测代理也能生效（#2475）
+        || crate::proxy::detect_system_proxy_for_url(url),
     )
     .await
 }
@@ -1752,6 +1756,7 @@ fn installed_fallback(home: &Path, source: Source, installed: &InstalledPlugin) 
 /// 原生 UI 形状适配。虚拟市场的 read/install 由注入层独占拦截，不传给原生下载器。
 pub async fn native_request(home: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
     let home = prepare_home(home)?;
+    crate::relay_config::cleanup_legacy_official_marketplace_overrides_in_home(&home)?;
     let state = read_state(&home)?;
     let enabled = configured_plugin_enabled(&home)?;
     match method {
@@ -2328,6 +2333,41 @@ exit 1
             .unwrap();
         assert_eq!(document["plugins"].as_table().unwrap().len(), 2);
         assert_eq!(document["marketplaces"].as_table().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn enabling_a_plugin_preserves_mcp_servers_and_other_user_tables() {
+        // #353：切换插件启用状态时只应增改 marketplaces/plugins，用户手写的
+        // mcp_servers、skills 等表必须原样保留。
+        let temp = tempfile::tempdir().unwrap();
+        let home = prepare_home(temp.path()).unwrap();
+        let source = Source::parse("public").unwrap();
+        let plugin = entry();
+        let original = r#"model = "qwen3-coder"
+
+[mcp_servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+[skills.custom]
+enabled = true
+"#;
+        fs::write(home.join("config.toml"), original).unwrap();
+
+        let (_, updated) = updated_config(&home, source, &plugin).unwrap();
+        let document = updated.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["mcp_servers"]["memory"]["command"].as_str(),
+            Some("npx")
+        );
+        assert_eq!(
+            document["mcp_servers"]["memory"]["args"]
+                .as_array()
+                .map(|values| values.len()),
+            Some(2)
+        );
+        assert_eq!(document["skills"]["custom"]["enabled"].as_bool(), Some(true));
+        assert_eq!(document["model"].as_str(), Some("qwen3-coder"));
     }
 
     #[test]

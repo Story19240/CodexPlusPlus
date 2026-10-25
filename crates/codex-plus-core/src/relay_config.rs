@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -226,7 +227,7 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         }
 
         let uses_managed_openai_identity = root_key_string(&contents, OPENAI_BASE_URL_KEY)
-            .is_some_and(|value| value.trim() == managed_openai_base_url());
+            .is_some_and(|value| crate::protocol_proxy::is_managed_protocol_proxy_base_url(&value));
         if !uses_managed_openai_identity {
             return active;
         }
@@ -288,6 +289,45 @@ pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
         )
 }
 
+/// live `config.toml` 是否把 Codex 请求指向本机协议代理。
+///
+/// 覆盖两种形态：
+/// - 普通中转：活动 provider 的 `model_providers.<id>.base_url` 是本机代理地址；
+/// - 官方会话身份（Remote Control / 官方 + API 混合）：根键 `openai_base_url`
+///   指向本机代理。
+///
+/// 只认活动 provider，避免配置里残留的其它 provider 造成误判。管理器据此判断
+/// 「Codex 即使不经过 Codex++ 启动也会把请求发给本地代理」，从而决定是否常驻
+/// 本地 helper。
+pub fn live_config_uses_managed_protocol_proxy_in_home(home: &Path) -> bool {
+    let contents = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    live_config_contents_use_managed_protocol_proxy(&contents)
+}
+
+fn live_config_contents_use_managed_protocol_proxy(contents: &str) -> bool {
+    if root_key_string(contents, OPENAI_BASE_URL_KEY)
+        .is_some_and(|value| crate::protocol_proxy::is_managed_protocol_proxy_base_url(&value))
+    {
+        return true;
+    }
+    let Ok(doc) = parse_toml_document(contents) else {
+        return false;
+    };
+    let Some(provider_id) = active_provider_id(&doc) else {
+        return false;
+    };
+    doc.get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .is_some_and(|value| crate::protocol_proxy::is_managed_protocol_proxy_base_url(value))
+}
+
 pub fn ensure_active_protocol_proxy_config_in_home(
     home: &Path,
     settings: &BackendSettings,
@@ -297,6 +337,7 @@ pub fn ensure_active_protocol_proxy_config_in_home(
         return Ok(false);
     }
     let profile = settings.active_relay_profile();
+    let known_managed = managed_proxy_base_urls_for_profile(&profile);
     let transport_uses_proxy = settings.active_relay_transport_uses_protocol_proxy();
     let openai_identity_uses_proxy = settings.active_relay_session_provider()
         == RelaySessionProvider::Openai
@@ -385,7 +426,7 @@ pub fn ensure_active_protocol_proxy_config_in_home(
             .and_then(Item::as_str)
             .map(str::trim)
             .map(ToString::to_string);
-        update_remote_control_openai_base_url(&mut doc, true);
+        update_remote_control_openai_base_url_with_known(&mut doc, true, managed.clone(), &known_managed);
         let after = doc
             .get(OPENAI_BASE_URL_KEY)
             .and_then(Item::as_str)
@@ -783,7 +824,10 @@ pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::
     let mut target = parse_toml_document(config)?;
     let live = read_optional_text(&home.join("config.toml"))?;
     if live.trim().is_empty() { return Ok(normalize_optional_toml(target)); }
-    let live = parse_toml_document(&live)?;
+    // 同上：live 损坏时跳过补缺，不阻断切换。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live)) else {
+        return Ok(normalize_optional_toml(target));
+    };
     // 按项目补缺，不递归提升一个已有项目的 trust 权限。
     preserve_missing_table_keys(&mut target, &live, "projects");
     if target.get("notify").is_none() {
@@ -796,6 +840,37 @@ pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::
 /// 协议代理端口。多开实例各自运行一个 helper，必须在写入 config.toml 时使用
 /// 实例自己的端口，不能先写默认 57321 再依赖启动器补救。
 pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    proxy_port: u16,
+) -> anyhow::Result<RelayApplyResult> {
+    let previous_model = live_root_model(home);
+    let result =
+        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
+    // issue #2081：默认模型变了就记一笔，旧会话迁移留到下次启动前执行（opt-in）。
+    let new_model = live_root_model(home);
+    if let Err(error) = crate::codex_sqlite::record_pending_thread_model_migration(
+        home,
+        &previous_model,
+        &new_model,
+    ) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.record_thread_model_migration_failed",
+            serde_json::json!({ "message": error.to_string() }),
+        );
+    }
+    Ok(result)
+}
+
+fn live_root_model(home: &Path) -> String {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| root_key_string(&text, "model"))
+        .unwrap_or_default()
+}
+
+fn apply_relay_profile_to_home_inner(
     home: &Path,
     profile: &RelayProfile,
     common_config_contents: &str,
@@ -1011,7 +1086,7 @@ pub async fn test_relay_profile(
         crate::anthropic_bridge::CLAUDE_CODE_USER_AGENT
     } else if !profile.user_agent.trim().is_empty() { profile.user_agent.trim() }
     else { "CodexPlusPlus/RelayTest" };
-    let client = crate::http_client::proxied_client(user_agent)?;
+    let client = crate::http_client::proxied_client_for_profile(user_agent, &profile.id)?;
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => crate::protocol_proxy::responses_url(base_url),
         RelayProtocol::ChatCompletions => crate::protocol_proxy::chat_completions_url(base_url),
@@ -1084,8 +1159,14 @@ pub fn validate_relay_test_response(protocol: RelayProtocol, status: u16, text: 
     let state = match protocol {
         RelayProtocol::Responses => {
             if value.get("output").and_then(Value::as_array).is_none() { return failed(); }
+            // 测试请求自己把输出限制在 16 token，推理模型因此截断属正常，不算告警（#2638）
+            let truncated_by_test_limit = value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens");
             match value.get("status").and_then(Value::as_str) {
                 Some("completed") => "completed",
+                Some("incomplete") if truncated_by_test_limit => "completed",
                 Some("incomplete") => "incomplete",
                 _ => return failed(),
             }
@@ -1093,15 +1174,15 @@ pub fn validate_relay_test_response(protocol: RelayProtocol, status: u16, text: 
         RelayProtocol::ChatCompletions => {
             let Some(choices) = value.get("choices").and_then(Value::as_array).filter(|v| !v.is_empty()) else { return failed(); };
             if choices.iter().any(|c| !c.get("message").is_some_and(Value::is_object)) { return failed(); }
-            if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call"))) { "completed" }
+            if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call" | "length"))) { "completed" }
             else if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter"))) { "incomplete" }
             else { return failed(); }
         },
         RelayProtocol::AnthropicMessages => {
             if value.get("type").and_then(Value::as_str) != Some("message") || value.get("content").and_then(Value::as_array).is_none() { return failed(); }
             match value.get("stop_reason").and_then(Value::as_str) {
-                Some("end_turn" | "stop_sequence" | "tool_use") => "completed",
-                Some("max_tokens" | "pause_turn" | "refusal") => "incomplete",
+                Some("end_turn" | "stop_sequence" | "tool_use" | "max_tokens") => "completed",
+                Some("pause_turn" | "refusal") => "incomplete",
                 _ => return failed(),
             }
         },
@@ -1171,18 +1252,41 @@ fn managed_openai_base_url() -> String {
 }
 
 fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
-    let managed = managed_openai_base_url();
+    update_remote_control_openai_base_url_with(doc, enabled, managed_openai_base_url());
+}
+
+fn update_remote_control_openai_base_url_with(doc: &mut DocumentMut, enabled: bool, managed: String) {
+    update_remote_control_openai_base_url_with_known(
+        doc,
+        enabled,
+        managed,
+        &crate::protocol_proxy::managed_protocol_proxy_base_urls(),
+    );
+}
+
+fn update_remote_control_openai_base_url_with_known(
+    doc: &mut DocumentMut,
+    enabled: bool,
+    managed: String,
+    known_managed: &[String],
+) {
     let current = doc
         .get(OPENAI_BASE_URL_KEY)
         .and_then(Item::as_str)
         .map(str::trim)
         .map(ToString::to_string);
 
+    // 迁移两次及以上时，历史受管地址也必须跟进；其它回环地址原样保留。
+    let ours = |value: &str| {
+        let normalized = normalize_relay_endpoint(value);
+        normalized == normalize_relay_endpoint(&managed)
+            || known_managed.iter().any(|url| normalized == normalize_relay_endpoint(url))
+    };
     if enabled {
-        if current.as_deref().is_none_or(|value| value == managed) {
+        if current.as_deref().is_none_or(ours) {
             doc[OPENAI_BASE_URL_KEY] = toml_edit::value(managed);
         }
-    } else if current.as_deref() == Some(managed.as_str()) {
+    } else if current.as_deref().is_some_and(ours) {
         doc.as_table_mut().remove(OPENAI_BASE_URL_KEY);
     }
 }
@@ -1210,6 +1314,20 @@ pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResul
     clear_relay_config_to_home_with_auth(home, None)
 }
 
+/// 卸载 Codex++ 时调用：live `config.toml` 仍指向本机协议代理时恢复为官方配置。
+///
+/// 卸载后本地代理不再运行，残留的 `base_url = "http://127.0.0.1:57321/v1"`
+/// 会让官方 Codex 每次请求都 502（issue #406）。只在确认指向本机代理时才清理
+/// （等价于在管理器里「启用官方」，会先写备份）；直连远程中转站、官方登录等
+/// 其它配置原样保留。返回是否改动了 live 配置。
+pub fn clear_managed_proxy_config_for_uninstall(home: &Path) -> anyhow::Result<bool> {
+    if !live_config_uses_managed_protocol_proxy_in_home(home) {
+        return Ok(false);
+    }
+    clear_relay_config_to_home(home)?;
+    Ok(true)
+}
+
 pub fn clear_relay_config_to_home_with_auth(
     home: &Path,
     auth_contents: Option<&str>,
@@ -1228,15 +1346,36 @@ pub fn clear_relay_config_to_home_with_auth(
         .ok()
         .and_then(|doc| active_provider_id(&doc));
     let mut doc = parse_toml_document(&existing)?;
-    // 中转站与旧版 provider 的整段配置一律移除，不看它是否当前激活：
+    // 官方 HTTP provider 只改变传输方式，重启同步不能取消它，否则会重新启用 WebSocket。
+    // 只认可无额外路由/凭据字段的显式配置，不能仅凭 provider 名字保留第三方连接。
+    let preserve_official_http = active_provider
+        .as_deref()
+        .and_then(|id| doc.get("model_providers")?.get(id))
+        .and_then(Item::as_table_like)
+        .is_some_and(|provider| {
+            provider.get("wire_api").and_then(Item::as_str) == Some("responses")
+                && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
+                && provider.get("supports_websockets").and_then(Item::as_bool) == Some(false)
+                && provider.iter().all(|(key, _)| {
+                    matches!(
+                        key,
+                        "name" | "wire_api" | "requires_openai_auth" | "supports_websockets"
+                    )
+                })
+        });
+    // 除上面确认的官方 HTTP 配置外，中转站与旧版 provider 的整段配置一律移除：
     // 只删认证字段会留下 base_url（切回官方后请求仍发往中转站，issue #2216），
     // 而「未被激活就跳过」会让切走时残留的 token 继续留在文件里。
     // 这里清的是 Codex++ 自己管理的 provider（custom / 旧版名），
     // 用户自定义的其它 provider（如 custom1）不受影响。
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
-        remove_provider_table(&mut doc, legacy_provider);
+        if !preserve_official_http || active_provider.as_deref() != Some(*legacy_provider) {
+            remove_provider_table(&mut doc, legacy_provider);
+        }
     }
-    remove_provider_table(&mut doc, RELAY_PROVIDER);
+    if !preserve_official_http || active_provider.as_deref() != Some(RELAY_PROVIDER) {
+        remove_provider_table(&mut doc, RELAY_PROVIDER);
+    }
     let mut updated = normalize_optional_toml(doc);
     for key in [
         "OPENAI_API_KEY",
@@ -1249,13 +1388,17 @@ pub fn clear_relay_config_to_home_with_auth(
         "env_key",
         "requires_openai_auth",
     ] {
+        if key == "model_provider" && preserve_official_http {
+            continue;
+        }
         updated = remove_root_key(&updated, key);
     }
     // 只用在中转站 provider 名下时才清 model；用户手写的官方模型名要保留。
-    if active_provider.as_deref() == Some(RELAY_PROVIDER)
-        || active_provider
-            .as_deref()
-            .is_some_and(|provider| LEGACY_RELAY_PROVIDERS.contains(&provider))
+    if !preserve_official_http
+        && (active_provider.as_deref() == Some(RELAY_PROVIDER)
+            || active_provider
+                .as_deref()
+                .is_some_and(|provider| LEGACY_RELAY_PROVIDERS.contains(&provider)))
     {
         updated = remove_root_key(&updated, "model");
     }
@@ -1368,8 +1511,7 @@ pub fn backfill_relay_profile_from_home_with_common_and_policy(
         }
         if recognized_managed_proxy_endpoint(profile, &live_config)
             || live_endpoint.as_deref().is_some_and(|endpoint| {
-                normalize_relay_endpoint(endpoint)
-                    == normalize_relay_endpoint(&managed_openai_base_url())
+                crate::protocol_proxy::is_managed_protocol_proxy_base_url(endpoint)
             })
         {
             anyhow::bail!(
@@ -1521,13 +1663,16 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         return false;
     }
     // 存量版本以固定的保留端口识别本工具代理；不能放宽成任意 localhost。
-    if normalize_relay_endpoint(&live) == normalize_relay_endpoint(&managed_openai_base_url()) {
+    if crate::protocol_proxy::is_managed_protocol_proxy_base_url(&live) {
         return true;
     }
     let proxy_mode = profile.requires_protocol_proxy_conversion()
         || profile.has_model_routes()
         || profile.uses_no_auth()
+        || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
         || profile.relay_mode == RelayMode::Aggregate;
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
@@ -1543,6 +1688,24 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         && !is_loopback_responses_endpoint(&profile.upstream_base_url);
     (proxy_mode && (saved_endpoint_matches || legacy_upstream_matches))
         || (saved_endpoint_matches && saved_real_upstream)
+}
+
+fn managed_proxy_base_urls_for_profile(profile: &RelayProfile) -> Vec<String> {
+    let mut known = crate::protocol_proxy::managed_protocol_proxy_base_urls();
+    // 升级前已经迁移过的版本没有历史端口文件。只从既有归属校验确认的
+    // transport 快照补回旧地址，不能单凭 root 上的任意回环地址认领它。
+    if recognized_managed_proxy_endpoint(profile, &profile.config_contents)
+        && let Some(saved) = provider_string_from_config(&profile.config_contents, "base_url")
+    {
+        known.push(saved);
+    }
+    known
+}
+
+fn saved_proxy_endpoint_has_real_upstream(profile: &RelayProfile, endpoint: &str) -> bool {
+    is_loopback_responses_endpoint(endpoint)
+        && valid_relay_endpoint(&profile.upstream_base_url)
+        && !is_loopback_responses_endpoint(&profile.upstream_base_url)
 }
 
 pub(crate) fn live_endpoint_matches_profile(profile: &RelayProfile, config: &str) -> bool {
@@ -1598,6 +1761,22 @@ pub fn live_config_matches_other_profile_in_home(
     }))
 }
 
+/// 回填时发现实时配置的 endpoint 与供应商快照对不上：分不清是外部工具接管还是
+/// 用户手工改的，自动回填只能停下（#2666）。单独成类型，切换流程据此让用户
+/// 显式选择「导入为新供应商」或「放弃实时改动」，而不是只给一句报错。
+#[derive(Debug)]
+pub struct LiveEndpointChanged;
+
+impl std::fmt::Display for LiveEndpointChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。",
+        )
+    }
+}
+
+impl std::error::Error for LiveEndpointChanged {}
+
 fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> anyhow::Result<()> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return Ok(());
@@ -1626,9 +1805,7 @@ fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> 
     {
         return Ok(());
     }
-    anyhow::bail!(
-        "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。"
-    )
+    Err(LiveEndpointChanged.into())
 }
 
 /// 纯官方快照保留非认证设置，去掉第三方路由/认证和托管目录指针。
@@ -1993,7 +2170,16 @@ fn preserve_unmanaged_live_context_entries(
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
     let mut target_doc = parse_toml_document(config_text)?;
-    let live_doc = parse_toml_document(&live_config)?;
+    // live config.toml 已被上游/人工改坏时，切换供应商不应整次失败（#2478/#2500）：
+    // 无法从坏文件里捞用户托管条目，就直接按新配置写出；原文件已在 write_codex_live_atomic
+    // 的 create_live_backup 中备份，可手工恢复。
+    let Ok(live_doc) = parse_toml_document(&live_config) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy() }),
+        );
+        return Ok(ensure_trailing_newline(config_text.to_string()));
+    };
     let managed_doc =
         parse_toml_document(&sanitize_common_config_contents(managed_context_config))?;
     preserve_unmanaged_context_tables(
@@ -2204,12 +2390,21 @@ fn with_model_catalog_rollback<T>(
 
 fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::Result<String> {
     let live_config = read_optional_text(&home.join("config.toml"))?;
+    let mut target = parse_toml_document(config_text)?;
+    remove_legacy_official_marketplace_overrides(home, &mut target);
     if live_config.trim().is_empty() {
-        return Ok(config_text.to_string());
+        return Ok(ensure_trailing_newline(target.to_string()));
     }
 
-    let mut target = parse_toml_document(config_text)?;
-    let live = parse_toml_document(&live_config)?;
+    // live 文件损坏时不能让整次切换失败（#2478/#2500）：跳过补回，按新配置写出；
+    // 原文件在 write_codex_live_atomic 里已备份。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live_config)) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy(), "step": "marketplaces" }),
+        );
+        return Ok(ensure_trailing_newline(target.to_string()));
+    };
     let Some(live_marketplaces) = live.get("marketplaces").and_then(Item::as_table_like) else {
         return Ok(ensure_trailing_newline(target.to_string()));
     };
@@ -2240,7 +2435,54 @@ fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::
         }
     }
 
+    remove_legacy_official_marketplace_overrides(home, &mut target);
     Ok(ensure_trailing_newline(target.to_string()))
+}
+
+/// 旧版把官方目录注册成同名自定义市场，会使原生安装状态被保留名策略过滤。
+/// 只清理由本工具历史使用的目录，保留插件启用项与用户自己的市场。
+fn remove_legacy_official_marketplace_overrides(home: &Path, doc: &mut DocumentMut) -> bool {
+    let Some(markets) = doc.get_mut("marketplaces").and_then(Item::as_table_like_mut) else {
+        return false;
+    };
+    let legacy_root = home.join(".tmp").join("plugins");
+    let legacy_root = legacy_root.to_string_lossy().replace('\\', "/");
+    let legacy_root = legacy_root.trim_start_matches("//?/");
+    let mut changed = false;
+    for name in ["openai-curated", "openai-api-curated"] {
+        let managed = markets
+            .get(name)
+            .and_then(Item::as_table_like)
+            .is_some_and(|market| {
+                let source = market.get("source").and_then(Item::as_str).unwrap_or_default();
+                let source = source.replace('\\', "/");
+                market.get("source_type").and_then(Item::as_str) == Some("local")
+                    && source.trim_start_matches("//?/") == legacy_root
+            });
+        if managed {
+            markets.remove(name);
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn cleanup_legacy_official_marketplace_overrides_in_home(home: &Path) -> anyhow::Result<bool> {
+    let config_path = home.join("config.toml");
+    let text = read_optional_text(&config_path)?;
+    let mut doc = parse_toml_document(&text)
+        .map_err(|_| anyhow::anyhow!("Codex 配置格式错误，未修复历史插件市场注册"))?;
+    if !remove_legacy_official_marketplace_overrides(home, &mut doc) {
+        return Ok(false);
+    }
+    if read_optional_text(&config_path)? != text {
+        anyhow::bail!("Codex 配置已被其他窗口更新，请刷新插件列表重试");
+    }
+    crate::settings::atomic_write(
+        &config_path,
+        ensure_trailing_newline(doc.to_string()).as_bytes(),
+    )?;
+    Ok(true)
 }
 
 fn active_provider_id(doc: &DocumentMut) -> Option<String> {
@@ -2771,6 +3013,9 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     // 但 apply_relay_files_to_home / apply_relay_config_file_to_home 等入口不经过那一步，
     // 模板缺 plugins 段时会把用户的插件表整段丢掉（#890 / #597 / #609）。
     preserve_missing_table_keys(&mut target_doc, &live_doc, "plugins");
+    // `[memories]`（记忆的提取/整合模型等）同样是用户在 Codex 里的本机设置，
+    // 切换供应商或重启时不能被模板冲掉（#2021）。
+    preserve_missing_table_keys(&mut target_doc, &live_doc, "memories");
     // hooks 的定义部分（除 state 外的键）同样由用户/桌面端管理，模板里没有时
     // 从 live 补回，否则切换供应商会把定义整段丢掉，只剩 hooks.state。
     preserve_live_hook_definitions(&mut target_doc, &live_doc);
@@ -2816,7 +3061,17 @@ fn preserve_missing_table_keys(
 /// Normal-user launches cannot complete the elevated native Windows sandbox
 /// setup. Downgrade only that case; an elevated process keeps the user's mode.
 pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
-    if windows_process_is_elevated() {
+    ensure_windows_sandbox_usable_with(home, windows_process_is_elevated())
+}
+
+fn ensure_windows_sandbox_usable_with(home: &Path, process_elevated: bool) -> anyhow::Result<bool> {
+    if process_elevated {
+        return Ok(false);
+    }
+    // elevated 只在「首次初始化」时需要管理员权限；初始化完成后普通进程也能用。
+    // 过去不看初始化状态一律降级，已经完成初始化的用户每次经 Codex++ 启动都被改回
+    // unelevated，反而触发 `CreateProcessSecurityEnvironment failed`（#2615）。
+    if windows_elevated_sandbox_setup_present(home) {
         return Ok(false);
     }
     let config_path = home.join("config.toml");
@@ -2849,6 +3104,24 @@ pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Re
         }),
     );
     Ok(true)
+}
+
+/// Codex 的 Windows 沙箱初始化产物是否齐全：`.sandbox/setup_marker.json` 与
+/// `.sandbox-secrets/sandbox_users.json` 都存在、都带 `version` 且两者一致
+/// （与 Codex `sandbox_setup_is_complete` 的判据一致）。不写死 Codex 的
+/// SETUP_VERSION：版本升级后由 Codex 自己提示重新初始化，这里不替用户改配置。
+fn windows_elevated_sandbox_setup_present(home: &Path) -> bool {
+    let version = |path: PathBuf| -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?.get("version")?.as_u64()
+    };
+    match (
+        version(home.join(".sandbox").join("setup_marker.json")),
+        version(home.join(".sandbox-secrets").join("sandbox_users.json")),
+    ) {
+        (Some(marker), Some(users)) => marker == users,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -2975,7 +3248,15 @@ fn parse_optional_positive_u64(value: &str, label: &str) -> anyhow::Result<Optio
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let parsed = trimmed
+    // 用户常从文档或别处复制带千分位的数字（`1,050,000`）。此前会直接
+    // `InvalidDigit` 判整次保存失败，而语义上它就是个合法的 1050000，
+    // 静默接受比让整份配置保存不了更合理（issue #2590）。
+    let digits: String = trimmed
+        .chars()
+        .filter(|character| !matches!(character, ',' | '_' | '\u{FF0C}' | '\u{3000}'))
+        .collect();
+    let digits = digits.trim();
+    let parsed = digits
         .parse::<u64>()
         .with_context(|| format!("{label}必须是正整数"))?;
     if parsed == 0 {
@@ -3030,8 +3311,29 @@ fn apply_model_catalog_to_config(
     apply_model_catalog_to_config_with_live_policy(home, profile, config_text, true)
 }
 
-/// 只修复旧版生成的相对 catalog 指针，不重放供应商配置或改写用户外部目录。
-/// 新版 Codex 的部分读取路径没有反序列化基目录，只有绝对路径能稳定加载（#2529）。
+fn wsl_catalog_paths_enabled(home: &Path, config: &str) -> bool {
+    let read = |text: &str| -> Option<bool> {
+        let doc = parse_toml_document(text).ok()?;
+        doc.get("desktop")?.get("runCodexInWindowsSubsystemForLinux")?.as_bool()
+    };
+    // 与最终写盘的 preserve_live_app_settings 保持相同优先级：桌面运行环境
+    // 属于本机设置，不能让供应商快照里过期的 true/false 改变目录解析方式。
+    read_optional_text(&home.join("config.toml")).ok().and_then(|text| read(&text))
+        .or_else(|| read(config))
+        .unwrap_or(false)
+}
+
+pub(crate) fn managed_catalog_pointer(home: &Path, relative: &str, config: &str) -> anyhow::Result<String> {
+    if wsl_catalog_paths_enabled(home, config) {
+        // WSL 的 app-server 不能读取 C:\\...；相对路径由共享 CODEX_HOME 解析。
+        return Ok(relative.replace('\\', "/"));
+    }
+    Ok(std::path::absolute(home.join(relative))
+        .context("解析受管模型 catalog 绝对路径失败")?.to_string_lossy().to_string())
+}
+
+/// 只迁移当前 home 内的受管目录，不重放供应商配置或改写用户外部目录。
+/// 原生 Windows 需要绝对路径（#2529），WSL 则保留共享 home 下的相对路径（#2591）。
 pub fn migrate_managed_model_catalog_pointer_in_home(
     home: &Path,
     settings: &BackendSettings,
@@ -3057,12 +3359,14 @@ pub fn migrate_managed_model_catalog_pointer_in_home(
         return Ok(false);
     };
     let path = Path::new(raw_path);
-    if path.is_absolute() {
-        return Ok(false);
-    }
+    let absolute_home = std::path::absolute(home)?;
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(&absolute_home) else { return Ok(false); };
+        relative
+    } else { path };
     // 旧产物只有 model-catalogs/<id>.json 两层。拒绝 ..、嵌套目录与其它前缀，
     // 不使用 apply 时用于识别旧管理器目录的宽松启发式。
-    let mut components = path
+    let mut components = relative
         .components()
         .filter(|component| *component != std::path::Component::CurDir);
     let Some(std::path::Component::Normal(root)) = components.next() else {
@@ -3093,8 +3397,9 @@ pub fn migrate_managed_model_catalog_pointer_in_home(
             return Ok(false);
         }
     }
-    let absolute = std::path::absolute(catalog_path).context("解析模型 catalog 绝对路径失败")?;
-    doc["model_catalog_json"] = toml_edit::value(absolute.to_string_lossy().as_ref());
+    let pointer = managed_catalog_pointer(home, &relative.to_string_lossy(), &contents)?;
+    if raw_path == pointer { return Ok(false); }
+    doc["model_catalog_json"] = toml_edit::value(pointer);
     crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())
         .context("迁移模型 catalog 绝对路径失败")?;
     Ok(true)
@@ -3112,10 +3417,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     );
     // 不用 canonicalize：它在 Windows 会引入 \\?\ 前缀；absolute 也能处理相对
     // CODEX_HOME，同时保持受管文件原来的位置和符号链接语义。
-    let catalog_absolute = std::path::absolute(home.join(&catalog_relative))
-        .context("解析受管模型 catalog 绝对路径失败")?
-        .to_string_lossy()
-        .to_string();
+    let catalog_pointer = managed_catalog_pointer(home, &catalog_relative, config_text)?;
     let mut config_text = config_text.to_string();
     if let Some(catalog_json) = crate::aggregate_catalog::build_catalog_for_profile(profile)? {
         let catalog_path = home.join(&catalog_relative);
@@ -3136,7 +3438,7 @@ fn apply_model_catalog_to_config_with_live_policy(
         {
             doc["model"] = toml_edit::value(default_model);
         }
-        doc["model_catalog_json"] = toml_edit::value(catalog_absolute);
+        doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
         return Ok(normalize_optional_toml(doc));
     }
     let mut model_windows = parse_model_string_map(&profile.model_windows, "model_windows")?;
@@ -3200,7 +3502,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 该固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
     // 切换到 Codex++ profile 时应接管，否则旧 catalog 会继续覆盖本 profile 的模型元数据。
     if let Some(existing) = root_key_string(&config_text, "model_catalog_json") {
-        if existing != catalog_relative && existing != catalog_absolute {
+        if existing != catalog_relative && existing != catalog_pointer {
             if is_codex_plus_managed_model_catalog(home, &existing)
                 || is_cc_switch_model_catalog(&existing)
             {
@@ -3237,11 +3539,11 @@ fn apply_model_catalog_to_config_with_live_policy(
                         &catalog_relative,
                         &entries,
                         fallback,
-                        lite_supported,
+                        lite_supported || profile.trust_upstream_catalog_lite,
                     )?
                 {
                     let mut doc = parse_toml_document(&config_text)?;
-                    doc["model_catalog_json"] = toml_edit::value(catalog_absolute);
+                    doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
                     return Ok(normalize_optional_toml(doc));
                 }
                 return Ok(config_text);
@@ -3268,10 +3570,10 @@ fn apply_model_catalog_to_config_with_live_policy(
                 &catalog_relative,
                 &entries,
                 fallback,
-                lite_supported,
+                lite_supported || profile.trust_upstream_catalog_lite,
             )?
         {
-            doc["model_catalog_json"] = toml_edit::value(catalog_absolute);
+            doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
         } else {
             doc["model_catalog_json"] = toml_edit::value(external_catalog);
         }
@@ -3281,23 +3583,47 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     // 上游不认 tool_search 时必须落 catalog 关掉该能力，否则 Codex 照发、整单 400。
+    let catalog_path = home.join(&catalog_relative);
+    // 已经存在的托管 catalog 必须随当前模型列表重建：否则用户在供应商渠道里
+    // 增删/重命名模型后，Codex 重启读到的仍是旧 catalog，选择器不刷新
+    // （#2081）。「从没生成过 catalog 的平铺 model_list」保持不凭空创建。
+    // 仅限仍有多模型条目时刷新：模型列表收敛回单个无窗口模型时，平铺列表本身
+    // 就够用，继续落 catalog 会架空「关闭每模型覆盖即删除指针」的既有契约
+    // （见 tests/model_catalog_paths.rs）。
+    // 只数模型列表本身：entries 还会把当前 profile.model 放在最前面，
+    // 「列表 a + 默认模型 b」不能算成多模型。
+    let listed_models = model_list
+        .split(['\r', '\n', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>()
+        .len();
+    let existing_managed_catalog = catalog_path.exists()
+        && listed_models > 1
+        && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
+            pointer == catalog_relative || pointer == catalog_pointer
+        });
     if !should_write_managed_model_catalog(
         &entries,
         has_metadata_overrides,
         standard_responses,
         profile.has_model_routes(),
         official_deepseek_responses,
+        // 只有用户显式写了模型列表时，供应商级窗口才落 catalog：模型列表留空
+        // （典型是官方登录）时 catalog 里只剩 0~1 个模型，会替换 Codex 内置的
+        // 官方模型列表，选择器变空；这种情况沿用顶层 model_context_window。
+        fallback.is_some() && !model_list.trim().is_empty(),
     ) && !upstream_rejects_tool_search(profile)
+        && !existing_managed_catalog
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json")
-            .is_some_and(|pointer| pointer == catalog_relative || pointer == catalog_absolute)
+            .is_some_and(|pointer| pointer == catalog_relative || pointer == catalog_pointer)
         {
             doc.remove("model_catalog_json");
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3319,7 +3645,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     validate_managed_model_catalog(&catalog_json)?;
     crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
     let mut doc = parse_toml_document(&config_text)?;
-    doc["model_catalog_json"] = toml_edit::value(catalog_absolute);
+    doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
     Ok(normalize_optional_toml(doc))
 }
 
@@ -3449,8 +3775,13 @@ fn should_write_managed_model_catalog(
     standard_responses: bool,
     has_model_routes: bool,
     official_deepseek_responses: bool,
+    has_profile_window: bool,
 ) -> bool {
+    // profile 级窗口（`context_window`）也必须落 catalog：只配全局窗口、模型列表
+    // 不带后缀时，过去不会生成 catalog，Codex 继续用内置默认窗口，用户看到的仍是
+    // 272k（issue #2590）。有全局窗口时把每模型条目写成该窗口即可。
     metadata_overrides
+        || has_profile_window
         || entries.iter().any(|entry| {
             entry.suffix_window.is_some()
                 || entry.auto_compact_percent.is_some()
@@ -3514,6 +3845,21 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_profile_level_window_without_suffixes() {
+        // #2590：只配 profile 级 context_window、模型列表不带 [1M] 后缀时，
+        // 也必须生成 catalog，否则 Codex 继续按内置 272k 窗口压缩。
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
@@ -3522,17 +3868,18 @@ mod managed_catalog_predicate_tests {
         let mut window = entry("custom-model");
         window.suffix_window = Some(1_000_000);
         assert!(should_write_managed_model_catalog(
-            &[window], false, false, false, false
+            &[window], false, false, false, false, false
         ));
 
         let mut compact = entry("custom-model");
         compact.auto_compact_percent = Some(80_000_000);
         assert!(should_write_managed_model_catalog(
-            &[compact], false, false, false, false
+            &[compact], false, false, false, false, false
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("custom-model")],
             true,
+            false,
             false,
             false,
             false,
@@ -3547,6 +3894,7 @@ mod managed_catalog_predicate_tests {
             true,
             true,
             false,
+            false,
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("deepseek-v4-pro")],
@@ -3554,6 +3902,7 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             true,
+            false,
         ));
     }
 
@@ -3652,6 +4001,11 @@ pub(crate) fn apply_model_metadata_overrides(
                 continue;
             }
             model_object.insert(key.clone(), value.clone());
+        }
+        if user_override.get("codex_plus_reasoning_parameters").and_then(Value::as_str) == Some("omit") {
+            model["supported_reasoning_levels"] = json!([]);
+            model["default_reasoning_level"] = Value::Null;
+            model["supports_reasoning_summaries"] = json!(false);
         }
         crate::model_suffix::apply_model_fast_support(model, user_override.get("codex_plus_fast_support"));
     }
@@ -4389,7 +4743,24 @@ fn restore_profile_credentials_after_backfill(
         return Ok(());
     }
 
-    profile.auth_contents = live_auth.to_string();
+    // issue #2601：live auth.json 是 Codex 写的 API Key 登录态（如 `auth_mode = "apikey"`）
+    // 时，吸收进纯官方快照会被存储校验判为「不支持的官方认证存档格式」，整次切换/保存
+    // 失败。这类 live 认证不属于官方快照，保留原快照即可；可存储的格式维持原采纳语义。
+    if official_auth_snapshot_is_storable(live_auth) {
+        profile.auth_contents = live_auth.to_string();
+    } else {
+        profile.auth_contents = template_auth.to_string();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_backfill.official_auth.kept_snapshot",
+            json!({
+                "profileId": profile.id,
+                "reason": "live auth.json 不是可存入官方快照的认证格式，保留原快照",
+                "liveAuthMode": serde_json::from_str::<Value>(live_auth).ok().and_then(|value| {
+                    value.get("auth_mode").and_then(Value::as_str).map(str::to_string)
+                }),
+            }),
+        );
+    }
     let Some(token) = experimental_bearer_token_from_config(&profile.config_contents)? else {
         return Ok(());
     };
@@ -4635,6 +5006,26 @@ fn merge_proxy_key_into_auth_json(source: &str, bearer_token: &str) -> Option<St
         .map(|text| format!("{text}\n"))
 }
 
+/// 当前 live 配置里实际生效的 API 凭据：`auth.json` 的 `OPENAI_API_KEY` 与
+/// 当前 provider 的 `experimental_bearer_token`。读不到或解析失败时返回空列表。
+pub fn active_api_credentials_in_home(home: &Path) -> Vec<String> {
+    let mut credentials = Vec::new();
+    if let Ok(auth) = read_optional_text(&home.join("auth.json"))
+        && let Some(key) = codex_auth_api_key(&auth)
+    {
+        credentials.push(key);
+    }
+    if let Ok(config) = read_optional_text(&home.join("config.toml"))
+        && let Ok(Some(token)) = experimental_bearer_token_from_config(&config)
+    {
+        let token = token.trim().to_string();
+        if !token.is_empty() && !credentials.contains(&token) {
+            credentials.push(token);
+        }
+    }
+    credentials
+}
+
 fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
     let auth: Value = serde_json::from_str(auth_contents).ok()?;
     auth.get("OPENAI_API_KEY")
@@ -4691,20 +5082,23 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         );
     }
     let has_managed_proxy_config = provider_string_from_config(&profile.config_contents, "base_url")
-        .is_some_and(|base_url| base_url.trim() == managed_openai_base_url());
+        .is_some_and(|base_url| {
+            crate::protocol_proxy::is_managed_protocol_proxy_base_url(&base_url)
+                || saved_proxy_endpoint_has_real_upstream(profile, &base_url)
+        });
     if profile.has_model_routes()
         || profile.uses_no_auth()
+        || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
         || has_managed_proxy_config
     {
         if !profile.upstream_base_url.trim().is_empty() {
             return profile.upstream_base_url.trim().to_string();
         }
         if !profile.base_url.trim().is_empty()
-            && profile.base_url.trim()
-                != crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::protocol_proxy_port(),
-                )
+            && !crate::protocol_proxy::is_managed_protocol_proxy_base_url(&profile.base_url)
         {
             return profile.base_url.trim().to_string();
         }
@@ -4797,11 +5191,13 @@ fn complete_relay_profile_config_with_proxy_port(
     if uses_openai_provider && profile.protocol != RelayProtocol::Responses {
         anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
     }
-    update_remote_control_openai_base_url(
+    update_remote_control_openai_base_url_with_known(
         &mut doc,
         uses_openai_provider
             || (profile.relay_mode == crate::settings::RelayMode::Official
                 && profile.official_mix_api_key),
+        managed_openai_base_url(),
+        &managed_proxy_base_urls_for_profile(profile),
     );
     // `openai` is the Remote session identity, while the actual relay
     // transport remains in `model_providers.custom`.
@@ -4899,7 +5295,10 @@ fn complete_relay_profile_config_with_proxy_port(
     }
     let provider_base_url = if profile.has_model_routes()
         || profile.uses_no_auth()
+        || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
     {
         crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
     } else {
@@ -5125,6 +5524,22 @@ fn merge_model_into_model_list(model: &str, model_list: &str) -> String {
     models.join("\n")
 }
 
+/// 纯官方（非混合）快照能否原样落盘，口径与 `normalize_relay_profile_for_storage`
+/// 一致：空（显式退出）、ChatGPT 登录态，或只含 OPENAI_API_KEY 的旧快照。
+fn official_auth_snapshot_is_storable(contents: &str) -> bool {
+    if contents.trim().is_empty() || auth_contents_looks_like_chatgpt_auth(contents) {
+        return true;
+    }
+    serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.keys().all(|key| key == "OPENAI_API_KEY"))
+        })
+        .unwrap_or(false)
+}
+
 fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(contents) else {
         return false;
@@ -5295,6 +5710,42 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节（#585）。
+            // 不能按「没有 live 配置」返回空串：那样切换供应商会把 MCP、项目信任、
+            // Windows 沙箱等非供应商设置全部丢掉且毫无提示。这里按 UTF-8 宽松解码——
+            // TOML 结构与 ASCII 内容完整保留，只有无法识别的字节变成 U+FFFD；
+            // 原始字节先按内容哈希备份一次（同一内容重复读取不再重复备份）。
+            let bytes = std::fs::read(path)?;
+            let digest = sha2::Sha256::digest(&bytes);
+            let tag: String = digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+            let backup = path.with_file_name(format!(
+                "{}.invalid-utf8-{tag}.bak",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "config.toml".to_string()),
+            ));
+            let backup_result = if backup.exists() {
+                Ok(())
+            } else {
+                std::fs::write(&backup, &bytes)
+            };
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.non_utf8_config",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "backup": backup.to_string_lossy(),
+                    "backup_ok": backup_result.is_ok(),
+                    "error": error.to_string(),
+                }),
+            );
+            if backup_result.is_err() {
+                return Err(error).context(
+                    "config.toml 不是有效 UTF-8，且无法创建备份；原文件未修改",
+                );
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -5316,6 +5767,19 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
             Err(error) => Err(error.into()),
         },
     }
+}
+
+/// 放弃实时改动前把当前 config.toml / auth.json 原样备份，返回备份目录；
+/// 两个文件都不存在时没有可备份的内容，返回 None。
+pub fn backup_live_files(home: &Path) -> anyhow::Result<Option<String>> {
+    let read = |name: &str| match std::fs::read(home.join(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::from(error).context(format!("读取实时 {name} 失败"))),
+    };
+    let config = read("config.toml")?;
+    let auth = read("auth.json")?;
+    create_live_backup(home, config.as_deref(), auth.as_deref())
 }
 
 fn create_live_backup(
@@ -5458,6 +5922,247 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_config_detects_managed_protocol_proxy_for_active_provider_only() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let managed = managed_openai_base_url();
+        let direct = "https://upstream.example/v1";
+
+        // 没有 config.toml：不需要本地代理。
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 活动 provider 直连上游：不需要。
+        std::fs::write(
+            &config_path,
+            format!("model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{direct}'\n"),
+        )
+        .unwrap();
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 活动 provider 指向本地代理：需要常驻。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{managed}'\n"
+            ),
+        )
+        .unwrap();
+        assert!(live_config_uses_managed_protocol_proxy_in_home(home.path()));
+
+        // 只有非活动 provider 指向本地代理时不能误判，否则会拉起用不到的 helper。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{direct}'\n\
+                 [model_providers.other]\nbase_url = '{managed}'\n"
+            ),
+        )
+        .unwrap();
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 官方会话身份：根键 openai_base_url 指向本地代理。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'openai'\nopenai_base_url = '{managed}'\n\
+                 [model_providers.custom]\nbase_url = 'https://chatgpt.com/backend-api/codex'\n"
+            ),
+        )
+        .unwrap();
+        assert!(live_config_uses_managed_protocol_proxy_in_home(home.path()));
+    }
+
+    #[test]
+    fn independent_proxy_routes_responses_and_preserves_the_real_upstream() {
+        let state = tempfile::tempdir().unwrap();
+        let _scope = crate::relay_proxy::ProxyPathTestScope::new(state.path());
+        let mut profile = RelayProfile {
+            id: "independent-proxy-regression".to_string(),
+            relay_mode: RelayMode::PureApi,
+            protocol: RelayProtocol::Responses,
+            model: "fixture-model".to_string(),
+            base_url: "https://upstream.example/v1".to_string(),
+            api_key: "fixture-key".to_string(),
+            ..RelayProfile::default()
+        };
+        crate::relay_proxy::set_proxy_for_profile(&profile.id, "http://127.0.0.1:17890").unwrap();
+        normalize_relay_profile_for_storage(&mut profile).unwrap();
+        assert_eq!(relay_profile_base_url(&profile), "https://upstream.example/v1");
+        assert!(profile.config_contents.contains(&format!("base_url = \"{}\"", managed_openai_base_url())));
+
+        let settings = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: profile.id.clone(),
+            relay_profiles: vec![profile.clone()],
+            ..BackendSettings::default()
+        };
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        assert!(settings.active_relay_uses_protocol_proxy());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://upstream.example/v1'\n",
+        ).unwrap();
+        assert!(ensure_active_protocol_proxy_config_in_home(home.path(), &settings).unwrap());
+        let live = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(live.contains(&managed_openai_base_url()));
+
+        crate::relay_proxy::set_proxy_for_profile(&profile.id, "").unwrap();
+        normalize_relay_profile_for_storage(&mut profile).unwrap();
+        assert_eq!(relay_profile_base_url(&profile), "https://upstream.example/v1");
+        assert!(profile.config_contents.contains("base_url = \"https://upstream.example/v1\""));
+        assert!(!settings.active_relay_transport_uses_protocol_proxy());
+
+        // 同一个 sidecar 配置不能接管纯官方 OAuth。
+        crate::relay_proxy::set_proxy_for_profile(&profile.id, "http://127.0.0.1:17890").unwrap();
+        profile.relay_mode = RelayMode::Official;
+        profile.official_mix_api_key = false;
+        assert!(!profile.uses_independent_proxy());
+    }
+
+    #[test]
+    fn repeated_port_migrations_rewrite_only_known_managed_openai_base_urls() {
+        let known = [57321, 58077, 58088].map(crate::protocol_proxy::local_responses_proxy_base_url);
+        let current = crate::protocol_proxy::local_responses_proxy_base_url(58099);
+        for old in &known {
+            let mut doc: DocumentMut = format!("openai_base_url = '{old}'\n").parse().unwrap();
+            update_remote_control_openai_base_url_with_known(&mut doc, true, current.clone(), &known);
+            assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(current.as_str()));
+            let mut doc: DocumentMut = format!("openai_base_url = '{old}'\n").parse().unwrap();
+            update_remote_control_openai_base_url_with_known(&mut doc, false, current.clone(), &known);
+            assert!(doc.get(OPENAI_BASE_URL_KEY).is_none());
+            let mut doc: DocumentMut = format!("openai_base_url = '{old}/'\n").parse().unwrap();
+            update_remote_control_openai_base_url_with_known(&mut doc, true, current.clone(), &known);
+            assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(current.as_str()));
+        }
+        for custom in ["http://127.0.0.1:15721/v1", "http://localhost:58077/v1", "http://127.0.0.1:58077/other"] {
+            let mut doc: DocumentMut = format!("openai_base_url = '{custom}'\n").parse().unwrap();
+            update_remote_control_openai_base_url_with_known(&mut doc, true, current.clone(), &known);
+            assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(custom));
+            update_remote_control_openai_base_url_with_known(&mut doc, false, current.clone(), &known);
+            assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(custom));
+        }
+    }
+
+    #[test]
+    fn pre_history_snapshot_repairs_owned_old_port_but_preserves_custom_loopback() {
+        let old = "http://127.0.0.1:58113/v1";
+        let upstream = "https://upstream.example/v1";
+        let mut owned = RelayProfile {
+            id: "legacy-managed-port-regression".to_string(),
+            relay_mode: RelayMode::PureApi,
+            protocol: RelayProtocol::Responses,
+            base_url: upstream.to_string(),
+            upstream_base_url: upstream.to_string(),
+            api_key: "fixture-key".to_string(),
+            config_contents: format!(
+                "model_provider = 'openai'\nopenai_base_url = '{old}'\n[model_providers.custom]\nbase_url = '{old}'\nwire_api = 'responses'\n"
+            ),
+            ..RelayProfile::default()
+        };
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), &owned.config_contents).unwrap();
+        let settings = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: owned.id.clone(),
+            relay_profiles: vec![owned.clone()],
+            ..BackendSettings::default()
+        };
+        assert!(ensure_active_protocol_proxy_config_in_home(home.path(), &settings).unwrap());
+        let live = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert_eq!(root_key_string(&live, OPENAI_BASE_URL_KEY).as_deref(), Some(managed_openai_base_url().as_str()));
+        normalize_relay_profile_for_storage(&mut owned).unwrap();
+        assert_eq!(relay_profile_base_url(&owned), upstream);
+        assert_eq!(root_key_string(&owned.config_contents, OPENAI_BASE_URL_KEY).as_deref(), Some(managed_openai_base_url().as_str()));
+
+        // root 自定义回环 URL 与 transport 快照无关，不能借其它字段认领。
+        let mut custom_root = owned.clone();
+        custom_root.config_contents = format!(
+            "model_provider = 'openai'\nopenai_base_url = '{old}'\n[model_providers.custom]\nbase_url = '{upstream}'\nwire_api = 'responses'\n"
+        );
+        normalize_relay_profile_for_storage(&mut custom_root).unwrap();
+        assert_eq!(root_key_string(&custom_root.config_contents, OPENAI_BASE_URL_KEY).as_deref(), Some(old));
+
+        // 真正的自定义本地上游没有分离的真实 upstream，保持其 root 和 provider。
+        let mut custom_transport = owned;
+        custom_transport.base_url = old.to_string();
+        custom_transport.upstream_base_url = old.to_string();
+        custom_transport.config_contents = format!(
+            "model_provider = 'openai'\nopenai_base_url = '{old}'\n[model_providers.custom]\nbase_url = '{old}'\nwire_api = 'responses'\n"
+        );
+        normalize_relay_profile_for_storage(&mut custom_transport).unwrap();
+        assert_eq!(relay_profile_base_url(&custom_transport), old);
+        assert_eq!(root_key_string(&custom_transport.config_contents, OPENAI_BASE_URL_KEY).as_deref(), Some(old));
+    }
+
+    #[test]
+    fn migrated_proxy_port_rewrites_default_port_openai_base_url_only() {
+        // #1163：端口迁移后，根级 openai_base_url 必须跟到新端口；用户自己的本地代理不动。
+        let migrated = crate::protocol_proxy::local_responses_proxy_base_url(58077);
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(migrated.as_str()));
+
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:15721/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some("http://127.0.0.1:15721/v1"));
+
+        // 关闭时旧端口的托管值也要清掉。
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, false, migrated);
+        assert!(doc.get(OPENAI_BASE_URL_KEY).is_none());
+    }
+
+    #[test]
+    fn elevated_windows_sandbox_is_kept_once_setup_is_complete() {
+        // #2615：已完成 elevated 初始化的用户不能被每次启动降级成 unelevated。
+        let home = tempfile::tempdir().unwrap();
+        let config = "[windows]\nsandbox = \"elevated\"\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+
+        // 未初始化：普通权限进程照旧降级，避免卡在 updateRequired。
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let downgraded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(downgraded.contains("sandbox = \"unelevated\""), "{downgraded}");
+
+        // 初始化产物齐全且版本一致：保留用户的 elevated。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox")).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox-secrets")).unwrap();
+        std::fs::write(
+            home.path().join(".sandbox").join("setup_marker.json"),
+            r#"{"version":5,"offline_username":"CodexSandboxOffline","online_username":"CodexSandboxOnline"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":5,"offline":{},"online":{}}"#,
+        )
+        .unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let kept = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert_eq!(kept, config, "初始化完成后不应改写用户配置");
+
+        // 两份产物版本不一致（初始化未完成或被升级打断）：仍按未初始化处理。
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":4}"#,
+        )
+        .unwrap();
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+
+        // 管理员进程从不改写。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), true).unwrap());
+    }
 
     /// 回归 09-23 现场故障：裸的 [mcp_servers] 父表头把切块锚点钉在 mcp_servers，
     /// 之后两个重复的 [mcp_servers.node_repl] 落在同一块里，整块解析失败后退回
@@ -6224,4 +6929,42 @@ fn root_line_key(line: &str) -> Option<&str> {
         return None;
     }
     trimmed.split_once('=').map(|(key, _)| key.trim())
+}
+
+#[cfg(test)]
+mod window_value_parsing_tests {
+    use super::parse_optional_positive_u64;
+
+    #[test]
+    fn accepts_plain_digits() {
+        assert_eq!(parse_optional_positive_u64("1050000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64(" 1050000 ", "上下文大小").unwrap(), Some(1_050_000));
+    }
+
+    #[test]
+    fn accepts_thousand_separators() {
+        // 用户从文档复制 `1,050,000` 时，此前会判整次保存失败（issue #2590）。
+        assert_eq!(parse_optional_positive_u64("1,050,000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64("1_050_000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(
+            parse_optional_positive_u64("1，050，000", "上下文大小").unwrap(),
+            Some(1_050_000),
+            "全角逗号同样应被接受"
+        );
+    }
+
+    #[test]
+    fn still_rejects_non_numeric_and_zero() {
+        assert!(parse_optional_positive_u64("abc", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("0", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("1.05M", "上下文大小").is_err());
+        assert_eq!(parse_optional_positive_u64("   ", "上下文大小").unwrap(), None);
+    }
+
+    #[test]
+    fn separator_position_is_not_validated() {
+        // 逗号位置不规范（例如 1,0,5,0）仍按纯数字处理：这个字段的目标是拿到
+        // 用户想要的窗口值，不是校验排版。真正的非数字才拒绝。
+        assert_eq!(parse_optional_positive_u64("1,0,5,0", "上下文大小").unwrap(), Some(1_050));
+    }
 }

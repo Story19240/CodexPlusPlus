@@ -27,6 +27,7 @@ import {
   BookOpen,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Camera,
   CircleHelp,
   Copy,
@@ -53,7 +54,9 @@ import {
   MoreHorizontal,
   PackageOpen,
   FileCode2,
+  FolderOpen,
   Moon,
+  MousePointerClick,
   Network,
   Power,
   PowerOff,
@@ -65,6 +68,7 @@ import {
   Save,
   Search,
   Settings,
+  Sparkles,
   ShieldCheck,
   ShieldAlert,
   Star,
@@ -74,12 +78,17 @@ import {
   TestTube,
   Trash2,
   Wrench,
+  ArrowUp,
+  AppWindow,
+  Bug,
+  Server,
+  Tag,
   type LucideIcon,
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -90,10 +99,16 @@ import { Textarea } from "@/components/ui/textarea";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { AgentCachePanel } from "./agent-cache";
+import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
+import { ClaudeProviderPage } from "./ClaudeProviderPage";
+import { ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
+import { ReleaseNotes } from "./ReleaseNotes";
+import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications } from "./update-notification";
 import { McpPage, PageHeader } from "./ManagementPages";
-import { SkillsPage, SessionPage } from "./ManagementExtra";
+import { SkillsPage } from "./ManagementExtra";
+import { ProjectSessionPage } from "./ProjectSessionPage";
 import { ENHANCEMENT_SECTION_IDS, managerNavigationDestination, type EnhancementTab, type ManagerNavigationIntent } from "./enhancement-navigation";
 import { DEFAULT_AUTO_COMPACT_PERCENT, autoCompactOptions, normalizeAutoCompactPercent } from "./auto-compact";
 import { defaultWhaleBalanceSettings, normalizeWhaleBalanceSettings, whaleBalanceSettingsIssue, type WhaleBalanceIssue, type WhaleBalanceProtocol, type WhaleBalanceSettings } from "./whale-settings";
@@ -128,6 +143,7 @@ import {
   normalizeTokenCountInput,
   modelMetadataKey,
   modelFastSupportMode,
+  synchronizeModelMetadataLiteSupport,
   synchronizeModelMetadataFastSupport,
   type ModelFastSupportMode,
   parseModelMetadataDocument,
@@ -149,6 +165,9 @@ import {
   type ImportedModelMetadata,
 } from "./model-metadata";
 import {
+  independentProxyEnabled,
+  setIndependentProxyConfigured,
+  requestCompatibilityEnabled,
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
@@ -167,6 +186,9 @@ import {
   type ModelWindowRow,
 } from "./model-windows";
 import {
+  reasoningParameterMode,
+  setModelReasoningParameterMode,
+  type ReasoningParameterMode,
   formatReasoningLevelsLabel,
   normalizeReasoningLevels,
   REASONING_LEVELS,
@@ -182,11 +204,12 @@ import {
   normalizeAggregateDefaultRelayId,
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
-import { createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
+import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
-import { resolveProviderName } from "./provider-name";
+import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
+import { providerAvatarText, resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
   resolveProviderSyncCompletion,
@@ -199,6 +222,7 @@ import {
   defaultDreamSkinColors,
   isDreamSkinDraftDirty,
   normalizeDreamSkinTheme,
+  runExclusiveDreamSkinInstall,
   type DreamSkinCheck,
   type DreamSkinColors,
   type DreamSkinCommunityResult,
@@ -216,7 +240,7 @@ import {
   type DreamSkinThemeSummary,
   type DreamSkinVerificationResult,
 } from "./dream-skin";
-import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
+import { subscribeLanguage, getLanguage, t, tf, toggleLanguage } from "@/i18n";
 import { vlmTestTranslation } from "./vlm-test-translation";
 import {
   multiLaunchInstanceFailure,
@@ -227,6 +251,8 @@ import {
 } from "./multi-launch-model";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
+const isMacPlatform = /\bMacintosh\b/i.test(navigator.userAgent);
+const supportsPetRealMouseLook = isWindowsPlatform || isMacPlatform;
 
 /// 多开启动后轮询「就绪/失败」结论的节奏：worker 最长等 90 秒就绪，这里给到 2 分钟。
 const MULTI_LAUNCH_POLL_INTERVAL_MS = 3000;
@@ -259,6 +285,12 @@ type PendingDreamSkinRestart = {
   currentThemeName: string;
   pendingThemeKey: string;
   pendingThemeName: string;
+};
+
+type DreamSkinInstallOperation = {
+  source: "market" | "community" | "pending-community" | "import";
+  id: string;
+  name: string;
 };
 
 type PathState = {
@@ -322,6 +354,7 @@ type BackendSettings = WhaleBalanceSettings & {
   dictation: DictationSettings;
   webSearch: WebSearchSettings;
   providerSyncEnabled: boolean;
+  threadModelFollowSwitchEnabled?: boolean;
   ccsDbPath: string;
   providerSyncSavedProviders: string[];
   providerSyncManualProviders: string[];
@@ -333,6 +366,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
+  codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
   codexAppUsageStatusLine: boolean;
   codexAppPasteFix: boolean;
@@ -344,9 +378,25 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppNativeMenuPlacement: boolean;
   codexAppNativeBrowserRequireIdentification: boolean;
   codexAppNativeFastUnlock: boolean;
+  /** 纯 API Key 模式启动 Codex 前把 Work 视图写回 Codex，避开 Work browser access 报错。 */
+  codexAppDisableWorkView: boolean;
   codexAppPetRealMouseLook: boolean;
   codexAppActivityOverlayRight: boolean;
+  /** 协议代理内部自动重试（与 Rust `protocol_proxy_auto_retry` 对应）。 */
+  protocolProxyAutoRetry: boolean;
+  protocolProxyAutoRetryMaxAttempts: number;
+  protocolProxyAutoRetryIntervalSeconds: number;
+  /** 命中这些上游 HTTP 状态码时由代理退避重发；空数组表示不重试。与 Rust `protocol_proxy_auto_retry_status_codes` 对应。 */
+  protocolProxyAutoRetryStatusCodes: number[];
+  protocolProxyAutoRetryMode: "streaming" | "streaming-legacy" | "buffered";
+  /** 流式避震下首段可见输出后到提交的延迟（毫秒）；0 表示一出现可见输出立即提交。与 Rust `protocol_proxy_auto_retry_commit_delay_ms` 对应。 */
+  protocolProxyAutoRetryCommitDelayMs: number;
+  /** 把不在当前供应商模型列表里的请求模型（Codex 后台任务的 gpt-* / codex-auto-review）改写为该供应商默认模型。与 Rust `protocol_proxy_map_unlisted_models` 对应。 */
+  protocolProxyMapUnlistedModels: boolean;
+  /** 本地协议代理单次请求体上限（MiB，32~512，默认 128）。与 Rust `helper_max_request_body_mib` 对应。 */
+  helperMaxRequestBodyMib: number;
   codexAppCapacityAutoRetry: boolean;
+  codexAppTurnRewind: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
   codexAppStepwiseDirectSend: boolean;
@@ -458,6 +508,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
+  autoReviewModel?: string;
   customHeaders: { key: string; value: string }[];
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
@@ -465,6 +516,8 @@ export type RelayProfile = {
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
   webSearchHistoryCompat: boolean;
+  trustUpstreamCatalogLite?: boolean;
+  strictResponsesReasoning?: boolean;
   /** Anthropic 上游的认证字段：`x-api-key`（默认）或 `authorization`。 */
   anthropicAuthHeader?: string;
   /** Anthropic 的 `max_tokens` 兜底值，0/缺省表示用内置 8192；填了则优先于请求值。 */
@@ -556,6 +609,7 @@ const emptyContextSelection = (): RelayContextSelection => ({
 
 type UserScriptInventory = {
   enabled?: boolean;
+  skip_next_start?: boolean;
   scripts?: Array<{
     key: string;
     name: string;
@@ -569,6 +623,62 @@ type UserScriptInventory = {
     source_url?: string;
     homepage?: string;
   }>;
+};
+
+type RequestLogUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+};
+
+type RequestLogAttemptDetail = {
+  attempt: number;
+  code?: string | null;
+  message?: string | null;
+  delayMs?: number | null;
+};
+
+type RequestLogEntry = {
+  id: string;
+  timestampMs: number;
+  startedAtMs: number;
+  durationMs: number;
+  method: string;
+  path: string;
+  statusCode: number;
+  success: boolean;
+  stream: boolean;
+  model: string;
+  upstreamModel: string;
+  relayId: string;
+  relayName: string;
+  wireApi: string;
+  /** Codex 会话/线程 id（来自请求头；旧日志没有该字段）。 */
+  threadId?: string | null;
+  /** 会话标题（后端按 threadId 从 Codex 本地会话库补齐；可能缺失）。 */
+  threadTitle?: string | null;
+  attempts: number;
+  autoRetries: number;
+  retryReasons?: string[];
+  /** 每次自动重试前的失败尝试摘要；旧日志没有该字段。 */
+  attemptDetails?: RequestLogAttemptDetail[] | null;
+  /** 请求进行中时为 running；旧日志没有该字段。 */
+  state?: string | null;
+  /** 首字耗时（毫秒）。 */
+  firstTokenMs?: number | null;
+  /** 运行中按流式增量粗估的输出 token。 */
+  estimatedOutputTokens?: number | null;
+  error?: string | null;
+  streamOutcome?: string | null;
+  usage?: RequestLogUsage | null;
+  cacheHitRatio?: number | null;
+};
+
+type RequestLogsResult = {
+  status: Status;
+  message: string;
+  entries: RequestLogEntry[];
 };
 
 type SettingsResult = CommandResult<{
@@ -674,10 +784,16 @@ type RelaySwitchResult = CommandResult<{
   settingsPath: string;
   user_scripts: unknown;
   relay: RelayPayload;
+  /** 实时配置 endpoint 被外部改过而停下时才有（#2666）。 */
+  liveConflict?: { profileId: string; profileName: string };
 }>;
+
+/** 冲突弹窗里的两种继续方式，对应后端 LiveConflictResolution。 */
+type LiveConflictResolution = "importAsNewProfile" | "discardLiveChanges";
 
 type SettingsBackfillResult = CommandResult<{
   settings: BackendSettings;
+  liveConflict?: boolean;
 }>;
 
 type RelayProfileTestResult = CommandResult<{
@@ -861,6 +977,7 @@ type TaskProgress = {
   percent: number;
   message: string;
   indeterminate?: boolean;
+  failed?: boolean;
 };
 
 type UpdateStage = "downloading" | "writing" | "launching";
@@ -913,6 +1030,9 @@ type DiagnosticsResult = CommandResult<{
 type WatcherResult = CommandResult<{
   enabled: boolean;
   disabled_flag: string;
+  start_minimized: boolean;
+  start_codex: boolean;
+  start_codex_on_open: boolean;
 }>;
 
 // 与 Rust 侧 `auto_takeover::AutoTakeoverPayload`（rename_all = "camelCase"）逐字段对齐。
@@ -1022,10 +1142,10 @@ function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>)
 }
 
 const providerSyncSourceLabels: Record<ProviderSyncTargetSource, string> = {
-  config: t("配置"),
-  rollout: t("会话"),
-  sqlite: t("索引"),
-  manual: t("手动"),
+  get config() { return t("配置"); },
+  get rollout() { return t("会话"); },
+  get sqlite() { return t("索引"); },
+  get manual() { return t("手动"); },
 };
 
 function providerSyncTargetLabel(target: ProviderSyncTargetOption): string {
@@ -1067,6 +1187,9 @@ type StartupResult = CommandResult<{
 /** 左侧 Agent 切换栏的工具标识。后端 `list_tools` 返回同名字符串。 */
 type ToolId = string;
 
+/** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
+const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
+
 /** 品牌图标随应用打包，来源和许可见 assets/agents/LICENSE.txt。 */
 const TOOL_ICONS: Record<string, string> = {
   codex: new URL("./assets/agents/chatgpt.svg", import.meta.url).href,
@@ -1074,7 +1197,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claudeRelay" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1090,52 +1213,64 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
  */
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string }> = [
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
-  { id: "overview", label: t("概览"), icon: LayoutDashboard },
-  { id: "relay", label: t("供应商配置"), icon: KeyRound, tool: "codex" },
-  { id: "multiLaunch", label: t("Codex多开"), icon: Layers3, badge: "NEW", tool: "codex" },
-  { id: "grok", label: t("Grok 配置"), icon: Blocks, tool: "grok" },
-  { id: "claude", label: t("Claude 增强"), icon: Languages, tool: "claude" },
-  { id: "sessions", label: t("会话管理"), icon: MessageCircle, tool: "codex" },
+  { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
+  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
+  { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
+  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
+  { id: "claudeRelay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "claude" },
+  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
+  { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
-  { id: "weixin", label: t("微信连接"), icon: ScanLine, tool: "codex" },
-  { id: "enhance", label: t("Codex增强"), icon: Hammer, tool: "codex" },
-  { id: "dreamSkin", label: t("皮肤管理"), icon: Palette, tool: "codex" },
-  { id: "userScripts", label: t("拓展"), icon: FileCode2, tool: "codex" },
-  { id: "pluginMarket", label: t("Codex 插件市场"), icon: Store, tool: "codex" },
-  { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
+  { id: "weixin", get label() { return t("微信连接"); }, icon: ScanLine, tool: "codex" },
+  { id: "enhance", get label() { return t("Codex增强"); }, icon: Hammer, tool: "codex" },
+  { id: "dreamSkin", get label() { return t("皮肤管理"); }, icon: Palette, tool: "codex" },
+  { id: "userScripts", get label() { return t("拓展"); }, icon: FileCode2, tool: "codex" },
+  { id: "pluginMarket", get label() { return t("Codex 插件市场"); }, icon: Store, tool: "codex" },
+  { id: "recommendations", get label() { return t("推荐内容"); }, icon: ExternalLink },
   // 缓存清理覆盖多个 AI 应用，属于应用级页面，在各工具下均可访问。
-  { id: "agentCache", label: t("AI Agent 缓存清理"), icon: Trash2 },
+  { id: "agentCache", get label() { return t("AI Agent 缓存清理"); }, icon: Trash2 },
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
-  { id: "agentCollaboration", label: t("Agent 协作"), icon: GitBranch, badge: "实验" },
-  { id: "maintenance", label: t("安装维护"), icon: Wrench, tool: "codex" },
-  { id: "about", label: t("关于"), icon: Info },
-  { id: "settings", label: t("设置"), icon: Settings },
-  { id: "relayEnvironment", label: t("中转站环境配置检测"), icon: ShieldCheck, tool: "codex" },
+  { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
+  { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
+  { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
+  { id: "about", get label() { return t("关于"); }, icon: Info },
+  { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
+  // Agent 专属设置：目前只有 Codex 有专属选项（供应商测试模型、图片覆盖层、启动参数）。
+  // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
+  { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
+  { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
+  { id: "requestLog", get label() { return t("请求日志"); }, icon: List, tool: "codex" },
 ];
 
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
-    label: t("工作区"),
-    routes: ["overview", "relay", "multiLaunch", "grok", "claude"],
+    get label() { return t("工作区"); },
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claudeRelay", "claude", "agentSettings"],
   },
   {
-    label: t("全局管理"),
+    get label() { return t("全局管理"); },
     routes: ["context", "skills", "sessions"],
   },
   {
-    label: t("扩展"),
+    get label() { return t("扩展"); },
     routes: ["weixin", "enhance", "dreamSkin", "userScripts", "pluginMarket"],
   },
   {
-    label: t("系统"),
+    get label() { return t("系统"); },
     routes: ["maintenance"],
     placement: "bottom",
   },
 ];
 
-/** 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。 */
-const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about", "settings"];
+/**
+ * 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。
+ * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
+ * 所以和 Agent 协作一样放在这里，而不是重复出现在每个 Agent 的「扩展」分组里。
+ */
+const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "about", "settings"];
+// 最左栏里跟 Agent 图标排在一组的全局页（Computer Use 服务于所有 Agent），其余全局页放在底部。
+const railAgentGroupRoutes: Route[] = ["computerUse"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -1146,6 +1281,7 @@ const defaultSettings: BackendSettings = {
   dictation: defaultDictationSettings(),
   webSearch: defaultWebSearchSettings(),
   providerSyncEnabled: false,
+  threadModelFollowSwitchEnabled: false,
   ccsDbPath: "",
   providerSyncSavedProviders: [],
   providerSyncManualProviders: [],
@@ -1157,6 +1293,7 @@ const defaultSettings: BackendSettings = {
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
+  codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
   codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
@@ -1168,9 +1305,19 @@ const defaultSettings: BackendSettings = {
   codexAppNativeMenuPlacement: true,
   codexAppNativeBrowserRequireIdentification: false,
   codexAppNativeFastUnlock: false,
+  codexAppDisableWorkView: false,
   codexAppPetRealMouseLook: false,
   codexAppActivityOverlayRight: false,
+  protocolProxyAutoRetry: true,
+  protocolProxyAutoRetryMaxAttempts: 5,
+  protocolProxyAutoRetryIntervalSeconds: 2,
+  protocolProxyAutoRetryStatusCodes: [],
+  protocolProxyAutoRetryMode: "streaming",
+  protocolProxyAutoRetryCommitDelayMs: 1000,
+  protocolProxyMapUnlistedModels: false,
+  helperMaxRequestBodyMib: 128,
   codexAppCapacityAutoRetry: false,
+  codexAppTurnRewind: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
   codexAppStepwiseDirectSend: false,
@@ -1255,6 +1402,7 @@ const defaultSettings: BackendSettings = {
 };
 
 export function App() {
+  useSyncExternalStore(subscribeLanguage, getLanguage, getLanguage);
   const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
   const [enhancementTab, setEnhancementTab] = useState<EnhancementTab>("general");
@@ -1266,6 +1414,10 @@ export function App() {
     confirmText: string;
     cancelText: string;
     resolve: (confirmed: boolean) => void;
+  } | null>(null);
+  const [liveConflictDialog, setLiveConflictDialog] = useState<{
+    profileName: string;
+    resolve: (choice: LiveConflictResolution | null) => void;
   } | null>(null);
   const [sessionIndexCleanupDialog, setSessionIndexCleanupDialog] = useState<{
     candidates: SessionIndexCleanupCandidate[];
@@ -1294,6 +1446,8 @@ export function App() {
   const [dreamSkinLibraryLoading, setDreamSkinLibraryLoading] = useState(false);
   const [dreamSkinMarketLoading, setDreamSkinMarketLoading] = useState(false);
   const [dreamSkinCommunityLoading, setDreamSkinCommunityLoading] = useState(false);
+  const [dreamSkinInstallOperation, setDreamSkinInstallOperation] = useState<DreamSkinInstallOperation | null>(null);
+  const dreamSkinInstallLockRef = useRef(false);
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
   const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
@@ -1302,6 +1456,10 @@ export function App() {
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
+  const [updatePrompt, setUpdatePrompt] = useState<UpdateResult | null>(null);
+  const updateNotifications = useRef(new UpdateNotifications());
+  const updateCheckPending = useRef<{ manual: boolean } | null>(null);
+  const updateInstallPending = useRef(false);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -1407,9 +1565,11 @@ export function App() {
     const next = { ...settingsForm, activeTool: toolId };
     setSettingsForm(next);
     // 供应商页是跟着工具走的，切工具后如果当前页不属于新工具就跳到它自己的页。
+    // 设置页也只属于 Codex，同样按这条规则跳走。
     const currentRoute = routes.find((candidate) => candidate.id === route);
     if (toolId === "claude") {
-      setRoute("claude");
+      // 切到 Claude 时和 Codex 一样先落在供应商配置；正在看 Claude 自己的页面时不动。
+      if (currentRoute?.tool !== "claude") setRoute("claudeRelay");
     } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
       setRoute(toolId === "grok" ? "grok" : "relay");
     }
@@ -1531,6 +1691,14 @@ export function App() {
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     showResultNotice(t("本地拓展"), result);
     if (isSuccessStatus(result.status)) await reloadUserScripts();
+  };
+
+  const setUserScriptsSkipNextStart = async (skip: boolean) => {
+    const result = await run(() => call<SettingsResult>("set_user_scripts_skip_next_start", { skip }));
+    if (!result) return;
+    setSettings(result);
+    setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+    showResultNotice(t("本地拓展"), result);
   };
 
   const setUserScriptEnabled = async (key: string, enabled: boolean) => {
@@ -1669,6 +1837,16 @@ export function App() {
     return result;
   };
 
+  const listProjectSessions = async (cwd: string): Promise<LocalSession[]> => {
+    const result = await run(() => call<LocalSessionsResult>("list_project_sessions", { request: { cwd } }));
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showResultNotice(t("会话管理"), result);
+      return [];
+    }
+    showNotice(t("会话管理"), result.message, "ok");
+    return result.sessions;
+  };
+
 
   const requestDeleteLocalSession = (session: LocalSession) =>
     call<DeleteLocalSessionResult>("delete_local_session", {
@@ -1753,19 +1931,34 @@ export function App() {
     }
   };
 
+  const runDreamSkinInstallOperation = async <T,>(
+    operation: DreamSkinInstallOperation,
+    install: () => Promise<T>,
+  ): Promise<T | null> => runExclusiveDreamSkinInstall(
+    dreamSkinInstallLockRef,
+    (pending) => setDreamSkinInstallOperation(pending ? operation : null),
+    install,
+  );
+
   const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
-    const result = await run(() => call<DreamSkinCommunityResult>(
-      "install_dream_skin_community_theme",
-      { id: theme.id },
-    ));
-    if (!result) return false;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return false;
-    await refreshDreamSkinLibrary(true);
-    const draft = await loadDreamSkinThemeDraft(theme.themeId);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
-    return true;
+    const installed = await runDreamSkinInstallOperation(
+      { source: "community", id: theme.id, name: theme.name },
+      async () => {
+        const result = await run(() => call<DreamSkinCommunityResult>(
+          "install_dream_skin_community_theme",
+          { id: theme.id },
+        ));
+        if (!result) return false;
+        setDreamSkinCommunity(result);
+        showResultNotice(t("DreamSkin 社区"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        await refreshDreamSkinLibrary(true);
+        const draft = await loadDreamSkinThemeDraft(theme.themeId);
+        if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
+        return true;
+      },
+    );
+    return installed ?? false;
   };
 
   const refreshPendingDreamSkinCommunity = async () => {
@@ -1775,24 +1968,31 @@ export function App() {
   };
 
   const confirmPendingDreamSkinCommunity = async () => {
-    const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
-    if (!result) return;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return;
-    setPendingDreamSkinCommunity("");
-    setRoute("dreamSkin");
-    await refreshDreamSkinLibrary(true);
-    if (result.installedThemeId) {
-      const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-      if (draft) {
-        setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
-        await activateDreamSkinDraft(draft);
+    await runDreamSkinInstallOperation(
+      { source: "pending-community", id: pendingDreamSkinCommunity, name: t("网页一键换肤主题") },
+      async () => {
+        const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
+        if (!result) return false;
+        setDreamSkinCommunity(result);
+        showResultNotice(t("DreamSkin 社区"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        setPendingDreamSkinCommunity("");
+        setRoute("dreamSkin");
+        await refreshDreamSkinLibrary(true);
+        if (result.installedThemeId) {
+          const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
+          if (draft) {
+            setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
+            await activateDreamSkinDraft(draft);
+          }
+        }
+        return true;
       }
-    }
+    );
   };
 
   const dismissPendingDreamSkinCommunity = async () => {
+    if (dreamSkinInstallLockRef.current && dreamSkinInstallOperation?.source === "pending-community") return;
     const result = await run(() => call<PendingDreamSkinCommunityResult>("dismiss_pending_dream_skin_community"));
     if (!result) return;
     if (isSuccessStatus(result.status)) setPendingDreamSkinCommunity("");
@@ -1814,34 +2014,46 @@ export function App() {
     }
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (!path) return;
-    const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
-    const result = await run(() => call<DreamSkinThemeLibraryResult>(
-      "import_dream_skin_theme_package",
-      { path },
-    ));
-    if (!result) return;
-    showResultNotice(t("主题库"), result);
-    if (!isSuccessStatus(result.status)) return;
-    const library = { themes: result.themes, activeDraft: result.activeDraft };
-    setDreamSkinLibrary(library);
-    const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
-    if (imported) {
-      const draft = await loadDreamSkinThemeDraft(imported.id);
-      if (draft) setDreamSkinDraftSelection(imported.key, draft);
-    }
-    await refreshDreamSkinCommunity(true);
+    await runDreamSkinInstallOperation(
+      { source: "import", id: "local-package", name: t("本地主题包") },
+      async () => {
+        const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
+        const result = await run(() => call<DreamSkinThemeLibraryResult>(
+          "import_dream_skin_theme_package",
+          { path },
+        ));
+        if (!result) return false;
+        showResultNotice(t("主题库"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        const library = { themes: result.themes, activeDraft: result.activeDraft };
+        setDreamSkinLibrary(library);
+        const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
+        if (imported) {
+          const draft = await loadDreamSkinThemeDraft(imported.id);
+          if (draft) setDreamSkinDraftSelection(imported.key, draft);
+        }
+        await refreshDreamSkinCommunity(true);
+        return true;
+      },
+    );
   };
 
   const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
-    const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
-    if (!result) return false;
-    setDreamSkinMarket(result);
-    showResultNotice(t("主题市场"), result);
-    if (!isSuccessStatus(result.status)) return false;
-    await refreshDreamSkinLibrary(true);
-    const draft = await loadDreamSkinThemeDraft(theme.id);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
-    return true;
+    const installed = await runDreamSkinInstallOperation(
+      { source: "market", id: theme.id, name: theme.name },
+      async () => {
+        const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
+        if (!result) return false;
+        setDreamSkinMarket(result);
+        showResultNotice(t("主题市场"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        await refreshDreamSkinLibrary(true);
+        const draft = await loadDreamSkinThemeDraft(theme.id);
+        if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
+        return true;
+      },
+    );
+    return installed ?? false;
   };
 
   const runAfterDreamSkinDraftGuard = (action: () => void) => {
@@ -2081,19 +2293,20 @@ export function App() {
   const deleteLocalSession = async (session: LocalSession) => {
     const title = session.title || session.id;
     const confirmed = await confirmSessionDelete(t("删除会话"), tf("删除会话“{0}”？此操作会删除本地数据库记录和 rollout 文件，并创建备份。", [title]));
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const result = await run(() => requestDeleteLocalSession(session));
     if (result) {
       showResultNotice(t("会话删除"), result);
       await refreshLocalSessions(true, localSessions?.offset ?? 0);
     }
+    return !!result && isSuccessStatus(result.status);
   };
 
   const deleteLocalSessions = async (sessions: LocalSession[]) => {
     const uniqueSessions = Array.from(new Map(sessions.map((session) => [session.id, session])).values());
     if (!uniqueSessions.length) {
       showNotice(t("批量删除会话"), t("请先选择要删除的会话。"), "failed");
-      return;
+      return false;
     }
     const preview = uniqueSessions
       .slice(0, 6)
@@ -2104,7 +2317,7 @@ export function App() {
       t("批量删除会话"),
       tf("删除选中的 {0} 个会话？此操作会删除本地数据库记录和 rollout 文件，并为每个会话创建备份。\n\n{1}{2}", [uniqueSessions.length, preview, extraCount]),
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
 
     let succeeded = 0;
     const failed: string[] = [];
@@ -2127,6 +2340,23 @@ export function App() {
       showNotice(t("批量删除会话"), tf("已删除 {0} 个会话。", [succeeded]), "ok");
     }
     await refreshLocalSessions(true, localSessions?.offset ?? 0);
+    return true;
+  };
+
+  const archiveLocalSessions = async (sessions: LocalSession[], archived = true) => {
+    const uniqueSessions = Array.from(new Map(sessions.map((session) => [session.id, session])).values());
+    if (!uniqueSessions.length) return false;
+    const confirmed = await confirmSessionDelete(
+      archived ? t("归档会话") : t("取消归档会话"),
+      tf("{0} 个会话？这只更新本地归档状态，不删除 rollout 文件。", [uniqueSessions.length]),
+    );
+    if (!confirmed) return false;
+    const result = await run(() => call<CommandResult<{ succeeded: number; failed: number }>>("archive_local_sessions", {
+      request: { sessions: uniqueSessions, archived },
+    }));
+    if (result) showNotice(archived ? t("归档会话") : t("取消归档会话"), result.message, result.status);
+    await refreshLocalSessions(true, localSessions?.offset ?? 0);
+    return true;
   };
 
   const refreshLiveContextEntries = async (silent = false) => {
@@ -2258,7 +2488,7 @@ export function App() {
       await refreshDreamSkinMarket(true);
       await refreshDreamSkinCommunity(true);
     }
-    if (next === "settings" || next === "enhance") await refreshSettings(true);
+    if (next === "settings" || next === "agentSettings" || next === "enhance") await refreshSettings(true);
     if (next === "userScripts") {
       await refreshSettings(true);
       await refreshScriptMarket(true);
@@ -2501,28 +2731,77 @@ export function App() {
     }
   };
 
-  const checkUpdate = async (silent = false) => {
-    const result = await run(() => call<UpdateResult>("check_update"));
+  const setWatcherStartMinimized = async (minimized: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_minimized", { minimized }));
     if (result) {
-      setUpdate(result);
-      if (!silent || result.updateAvailable) {
-        showNotice(t("GitHub Release 检查"), result.message, result.status);
-      }
+      setWatcher(result);
+      showNotice(t("开机启动自动最小化"), result.message, result.status);
     }
   };
 
-  const performUpdate = async () => {
-    if (updateInstallProgress.active) return;
+  const setWatcherStartCodex = async (startCodex: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_codex", { startCodex }));
+    if (result) {
+      setWatcher(result);
+      showNotice(t("登录时自动启动 Codex"), result.message, result.status);
+    }
+  };
+
+  const setWatcherStartCodexOnOpen = async (enabled: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_codex_on_open", { enabled }));
+    if (result) {
+      setWatcher(result);
+      showNotice(t("打开 Codex++ 时自动启动 Codex"), result.message, result.status);
+    }
+  };
+
+  const checkUpdate = async (silent = false) => {
+    if (updateInstallPending.current) return;
+    if (updateCheckPending.current) {
+      // 手动检查复用正在进行的后台请求，但仍按用户主动检查显示结果。
+      if (!silent) updateCheckPending.current.manual = true;
+      return;
+    }
+    const request = { manual: !silent };
+    updateCheckPending.current = request;
+    try {
+      const result = await call<UpdateResult>("check_update");
+      // 后台检查失败时保留上次可用的安装包，手动检查仍显示错误。
+      if (request.manual || result.status !== "failed") setUpdate(result);
+      if (updateNotifications.current.shouldPrompt(result, request.manual)) {
+        setUpdatePrompt(result);
+      } else if (request.manual) {
+        showNotice(t("GitHub Release 检查"), result.message, result.status);
+      }
+    } catch (error) {
+      if (request.manual) showNotice(t("GitHub Release 检查"), stringifyError(error), "failed");
+    } finally {
+      updateCheckPending.current = null;
+    }
+  };
+
+  const closeUpdatePrompt = () => {
+    if (updatePrompt?.latestVersion) updateNotifications.current.dismiss(updatePrompt.latestVersion);
+    setUpdatePrompt(null);
+  };
+
+  const performUpdate = async (selectedUpdate = update) => {
+    if (updateInstallPending.current) return;
     const release =
-      update?.latestVersion && update.assetName && update.assetUrl
+      selectedUpdate?.latestVersion && selectedUpdate.assetName && selectedUpdate.assetUrl
         ? {
-            version: update.latestVersion,
+            version: selectedUpdate.latestVersion,
             url: "",
-            body: update.releaseSummary ?? "",
-            asset_name: update.assetName,
-            asset_url: update.assetUrl,
+            body: selectedUpdate.releaseSummary ?? "",
+            asset_name: selectedUpdate.assetName,
+            asset_url: selectedUpdate.assetUrl,
           }
         : null;
+    if (!release) {
+      showNotice(t("更新安装"), t("请先检查更新并选择可下载的 Release asset。"), "failed");
+      return;
+    }
+    updateInstallPending.current = true;
     setUpdateInstallProgress({
       active: true,
       percent: 0,
@@ -2555,12 +2834,13 @@ export function App() {
       });
       const result = await run(() => call<UpdateResult>("perform_update", { release }));
       if (result) {
-        setUpdate(result);
+        setUpdate({ ...selectedUpdate!, ...result });
         setUpdateInstallProgress({
           active: false,
           percent: result.progress ?? 100,
           indeterminate: false,
           message: result.message,
+          failed: result.status === "failed",
         });
         showNotice(t("更新安装"), result.message, result.status);
       } else {
@@ -2569,9 +2849,15 @@ export function App() {
           percent: 100,
           indeterminate: false,
           message: t("安装包更新失败，请查看错误提示后重试。"),
+          failed: true,
         });
       }
+    } catch (error) {
+      const message = stringifyError(error);
+      setUpdateInstallProgress({ active: false, percent: 0, indeterminate: false, message, failed: true });
+      showNotice(t("更新安装"), message, "failed");
     } finally {
+      updateInstallPending.current = false;
       window.clearTimeout(fallbackTimer);
       unlisten?.();
     }
@@ -2632,6 +2918,27 @@ export function App() {
     if (result) showNotice(t("设置保存"), result.message, result.status);
     // 保留草稿供用户重载后合并，不能拿最新版本号自动重试旧快照。
     return null;
+  };
+
+  /// 自动保存：不弹成功提示；校验不过就不保存，把原因交给页面显示，避免输入到一半就弹窗。
+  ///
+  /// 保存期间用户又改了表单时，保留新草稿、只同步版本号（否则下一次保存会撞版本冲突），
+  /// 草稿仍是「有修改」，由页面下一轮再存。
+  const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
+    const normalized = normalizeSettings(snapshot);
+    const issue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalized))
+      || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
+    if (issue) return { status: "invalid", message: issue };
+    try {
+      const result = await call<SettingsResult>("save_settings", { settings: normalized });
+      if (!isSuccessStatus(result.status)) return { status: "failed", message: result.message };
+      const saved = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => (backendSettingsEqual(current, snapshot) ? saved : { ...current, revision: saved.revision }));
+      return { status: "saved" };
+    } catch (error) {
+      return { status: "failed", message: stringifyError(error) };
+    }
   };
 
   const beginWeixinQrLogin = async () => {
@@ -2697,6 +3004,78 @@ export function App() {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
       showNotice(t("设置重置"), result.message, result.status);
+    }
+  };
+
+  const exportSettings = async () => {
+    try {
+      const selected = await saveDialog({
+        title: t("导出 Codex++ 配置"),
+        defaultPath: "codex-plus-plus-settings.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected) return;
+      const result = await run(() => call<CommandResult<{ path: string }>>("export_settings", {
+        path: selected,
+        settings: normalizeSettings(settingsForm),
+      }));
+      if (result) showNotice(t("导出 Codex++ 配置"), result.message, result.status);
+    } catch (error) {
+      showNotice(t("导出 Codex++ 配置"), stringifyError(error), "failed");
+    }
+  };
+
+  const importSettings = async () => {
+    try {
+      const selected = await open({
+        title: t("导入 Codex++ 配置"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (typeof selected !== "string" || !selected.trim()) return;
+      const result = await run(() => call<SettingsResult>("preview_import_settings", { path: selected }));
+      if (!result || !isSuccessStatus(result.status)) {
+        if (result) showNotice(t("导入 Codex++ 配置"), result.message, result.status);
+        return;
+      }
+      setSettings(settings ?? result);
+      setSettingsForm(normalizeSettings(result.settings));
+      showNotice(t("导入 Codex++ 配置"), result.message, "ok");
+    } catch (error) {
+      showNotice(t("导入 Codex++ 配置"), stringifyError(error), "failed");
+    }
+  };
+
+  const chooseSettingsPath = async () => {
+    try {
+      const selected = await saveDialog({
+        title: t("选择配置文件路径"),
+        defaultPath: "settings.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected) return;
+      const result = await run(() => call<SettingsResult>("set_settings_path", { path: selected }));
+      if (result) {
+        if (isSuccessStatus(result.status)) {
+          setSettings(result);
+          setSettingsForm(normalizeSettings(result.settings));
+        }
+        showNotice(t("配置文件路径"), result.message, result.status);
+      }
+    } catch (error) {
+      showNotice(t("配置文件路径"), stringifyError(error), "failed");
+    }
+  };
+
+  const resetSettingsPath = async () => {
+    const result = await run(() => call<SettingsResult>("reset_settings_path"));
+    if (result) {
+      if (isSuccessStatus(result.status)) {
+        setSettings(result);
+        setSettingsForm(normalizeSettings(result.settings));
+      }
+      showNotice(t("配置文件路径"), result.message, result.status);
     }
   };
 
@@ -3099,7 +3478,11 @@ export function App() {
     showNotice(t("纯 API 模式"), t("已切换到纯 API。"), "ok");
   };
 
-  const switchRelayProfile = async (next: BackendSettings, previousActiveRelayId = settingsForm.activeRelayId) => {
+  const switchRelayProfile = async (
+    next: BackendSettings,
+    previousActiveRelayId = settingsForm.activeRelayId,
+    liveConflictResolution?: LiveConflictResolution,
+  ) => {
     if (relaySwitching) {
       showNotice(t("供应商切换中"), t("上一次切换还没有完成，请稍后再试。"), "failed");
       return;
@@ -3127,7 +3510,10 @@ export function App() {
       showNotice(t("供应商配置可能不正确"), validationError, "failed");
       return;
     }
-    switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    // 用户已在冲突弹窗里做了选择时，回填交给后端按选择处理，不再先跑一遍注定失败的回填。
+    if (!liveConflictResolution) {
+      switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    }
     const selectedAfterSave = activeRelayProfile(switchSettings);
     const command = relayProfileSwitchCommand(selectedAfterSave);
 
@@ -3136,12 +3522,14 @@ export function App() {
       targetRelayName: selectedAfterSave.name,
       previousActiveRelayId,
       command,
+      liveConflictResolution: liveConflictResolution ?? null,
     });
+    let liveConflict: { profileId: string; profileName: string } | null = null;
     setRelaySwitching(true);
     try {
       const result = await run(() =>
         call<RelaySwitchResult>("switch_relay_profile", {
-          request: { settings: switchSettings, previousActiveRelayId },
+          request: { settings: switchSettings, previousActiveRelayId, liveConflictResolution },
         }),
       );
       if (!result) {
@@ -3172,18 +3560,36 @@ export function App() {
           status: result.status,
           message: result.message,
           activeRelayId: selectedSettings.activeRelayId,
+          liveConflict: !!result.liveConflict,
         });
-        showNotice(t("供应商切换"), result.message, result.status);
-        return;
+        // 实时 endpoint 被外部改过（#2666）：不只报错，弹窗让用户选怎么继续。
+        // 这里不能 return：弹窗在 finally 之后，return 会让它永远走不到。
+        if (result.liveConflict && !liveConflictResolution) {
+          liveConflict = result.liveConflict;
+        } else {
+          showNotice(t("供应商切换"), result.message, result.status);
+        }
+      } else {
+        const currentSelected = activeRelayProfile(selectedSettings);
+        logDiagnostic("switchRelayProfile.ok", {
+          targetRelayId: currentSelected.id,
+          status: result.status,
+        });
+        if (liveConflictResolution) showNotice(t("供应商切换"), result.message, result.status);
       }
-      const currentSelected = activeRelayProfile(selectedSettings);
-      logDiagnostic("switchRelayProfile.ok", {
-        targetRelayId: currentSelected.id,
-        status: result.status,
-      });
     } finally {
       setRelaySwitching(false);
     }
+    const conflict = liveConflict;
+    if (!conflict) return;
+    const choice = await new Promise<LiveConflictResolution | null>((resolve) => {
+      setLiveConflictDialog({ profileName: conflict.profileName, resolve });
+    });
+    logDiagnostic("switchRelayProfile.live_conflict_choice", {
+      profileId: conflict.profileId,
+      choice: choice ?? "cancel",
+    });
+    if (choice) await switchRelayProfile(next, previousActiveRelayId, choice);
   };
 
   const snapshotActiveRelayFilesBeforeSwitch = async (
@@ -3198,6 +3604,8 @@ export function App() {
       }),
     );
     if (!result) return next;
+    // endpoint 被外部改过（#2666）：紧接着的切换会弹窗让用户选择，这里不重复提示。
+    if (result.liveConflict) return next;
     const normalized = normalizeSettings(result.settings);
     // degraded = 后端跳过了回填（例如 live config.toml 有语法错误，issue #618）。
     // 切换本身照常继续，只是用原配置走；提示一下原因即可，不能按 failed 处理，
@@ -3273,6 +3681,12 @@ export function App() {
       await refreshPendingProviderImport(true);
       await refreshPendingDreamSkinCommunity();
     })();
+  }, []);
+
+  useEffect(() => {
+    // 长期开着管理器也能发现更新；后台检查失败不打扰当前操作。
+    const timer = window.setInterval(() => void checkUpdate(true), UPDATE_CHECK_INTERVAL_MS);
+    return () => window.clearInterval(timer);
   }, []);
 
   // 主题卡片的「更多操作」是原生 details 弹层：原生不会因为点了别处就收起，
@@ -3541,8 +3955,13 @@ export function App() {
       performUpdate,
       saveSettings,
       saveSettingsValue,
+      autoSaveSettings,
       refreshSettings,
       resetSettings,
+      exportSettings,
+      importSettings,
+      chooseSettingsPath,
+      resetSettingsPath,
       resetImageOverlaySettings,
       chooseCodexAppPath: async (mode: "folder" | "file") => {
         let selected: unknown;
@@ -3682,11 +4101,14 @@ export function App() {
       reloadUserScripts,
       installMarketScript,
       setUserScriptsEnabled,
+      setUserScriptsSkipNextStart,
       setUserScriptEnabled,
       deleteUserScript,
       refreshLocalSessions,
+      listProjectSessions,
       deleteLocalSession,
       deleteLocalSessions,
+      archiveLocalSessions,
       openExternalUrl,
       applyRelayInjection,
       applyPureApiInjection,
@@ -3719,17 +4141,21 @@ export function App() {
         showNotice(t("检查完成"), t("已刷新 Codex 应用、入口和 Watcher 状态。"), "ok");
       },
       setWatcherEnabled,
+      setWatcherStartMinimized,
+      setWatcherStartCodex,
+      setWatcherStartCodexOnOpen,
       setAutoTakeover,
       refreshAutoTakeover: () => refreshAutoTakeover(false),
       takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
       pauseAutoTakeover: () => runAutoTakeoverCommand("pause_auto_takeover_for_instance"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
+    [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart, getLanguage()],
   );
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   return (
     <div className={`shell ${theme} ${isGlobalPage ? "global-workspace" : ""}`}>
@@ -3742,6 +4168,8 @@ export function App() {
         onSelect={(toolId) => void switchTool(toolId)}
         onNavigate={(next) => void navigate(next)}
         onToggleTheme={actions.toggleTheme}
+        pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
+        onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
       />
       {!isGlobalPage ? (
         <aside className="sidebar">
@@ -3787,10 +4215,15 @@ export function App() {
       <main className="workspace">
         <header className="topbar" key={`topbar-${route}`}>
           <div>
-            <h1>{routeTitle(route)}</h1>
-            <p>{routeSubtitle(route)}</p>
+            <h1>{route === "agentSettings" ? tf("{0} 设置", [activeToolName]) : routeTitle(route)}</h1>
+            <p>
+              {route === "agentSettings"
+                ? tf("只作用于 {0}；界面主题、配置备份等整体设置在最左侧齿轮里。", [activeToolName])
+                : routeSubtitle(route)}
+            </p>
           </div>
-          <div className="topbar-actions">
+          {/* data-topbar-actions：页面级操作的挂载点，Claude 增强页把「启动增强版」portal 进来。 */}
+          <div className="topbar-actions" data-topbar-actions>
             {activeTool === "codex" && !isGlobalPage ? (
               <>
                 <span className="codex-app-state" aria-live="polite">
@@ -3813,13 +4246,18 @@ export function App() {
             ) : null}
           </div>
         </header>
-        <section className={`screen ${isManagementScreen ? "management-screen" : ""}`} key={route}>
+        <section
+          className={`screen ${isManagementScreen ? "management-screen" : ""} ${route === "requestLog" ? "request-log-screen" : ""}`.trim()}
+          key={route}
+        >
           {route === "overview" ? (
             <OverviewScreen
               overview={overview}
               ads={ads}
               activeTool={activeTool}
               toolEntries={toolEntries}
+              form={settingsForm}
+              onNavigate={(next) => void navigate(next)}
               actions={actions}
             />
           ) : null}
@@ -3837,19 +4275,37 @@ export function App() {
             <CodexMultiLaunchScreen form={settingsForm} actions={actions} />
           ) : null}
           {route === "relayEnvironment" ? (
-            <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+            <ProxySettingsScreen
+              dirty={settingsDirty}
+              overview={overview}
+              form={settingsForm}
+              relayEnvironment={relayEnvironment}
+              onFormChange={setSettingsForm}
+              actions={actions}
+            />
+          ) : null}
+          {route === "requestLog" ? (
+            <RequestLogScreen />
           ) : null}
           {route === "grok" ? (
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
+          {route === "claudeRelay" ? (
+            <ClaudeProviderPage
+              notify={actions.showMessage}
+              onProvidersChanged={() => void refreshTools()}
+              openUrl={(url) => void actions.openExternalUrl(url)}
+            />
+          ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? (
-            <SessionPage
+            <ProjectSessionPage
               sessions={localSessions}
               onRefresh={async (offset) => { await actions.refreshLocalSessions(false, offset ?? 0); }}
               onDelete={actions.deleteLocalSession}
               onDeleteMany={actions.deleteLocalSessions}
-              notify={actions.showMessage}
+              onArchiveMany={actions.archiveLocalSessions}
+              onListProjectSessions={actions.listProjectSessions}
               repairPanel={<SessionRepairPanel form={settingsForm} providerSyncProgress={providerSyncProgress}
                 sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
                 sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets}
@@ -3920,6 +4376,7 @@ export function App() {
               marketLoading={dreamSkinMarketLoading}
               community={dreamSkinCommunity}
               communityLoading={dreamSkinCommunityLoading}
+              installOperation={dreamSkinInstallOperation}
               draft={dreamSkinThemeDraft}
               dirty={dreamSkinDraftDirty}
               pendingRestart={pendingDreamSkinRestart}
@@ -3936,6 +4393,7 @@ export function App() {
           {route === "recommendations" ? <RecommendationsScreen ads={ads} actions={actions} /> : null}
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
+          {route === "computerUse" ? <ComputerUsePage /> : null}
           {route === "maintenance" ? (
             <MaintenanceScreen
               overview={overview}
@@ -3959,19 +4417,40 @@ export function App() {
             />
           ) : null}
           {route === "settings" ? (
-            <SettingsScreen
+            <GlobalSettingsScreen
               dirty={settingsDirty}
               settings={settings}
               theme={theme}
+              actions={actions}
+              onOpenAgentSettings={() => void (async () => {
+                if (activeTool !== "codex") await switchTool("codex");
+                await navigate("agentSettings");
+              })()}
+            />
+          ) : null}
+          {route === "agentSettings" ? (
+            <AgentSettingsScreen
+              dirty={settingsDirty}
               form={settingsForm}
-              activeTool={activeTool}
-              toolEntries={toolEntries}
               onFormChange={setSettingsForm}
               actions={actions}
             />
           ) : null}
         </section>
       </main>
+      {updatePrompt ? (
+        <UpdateDialog
+          update={updatePrompt}
+          progress={updateInstallProgress}
+          onClose={closeUpdatePrompt}
+          onMuteToday={() => {
+            updateNotifications.current.muteToday();
+            setUpdatePrompt(null);
+          }}
+          onUpdate={() => void performUpdate(updatePrompt)}
+          onOpenUrl={(url) => void openExternalUrl(url)}
+        />
+      ) : null}
       {notice ? (
         <NoticeDialog
           key={`${notice.title}-${notice.message}-${notice.status ?? ""}`}
@@ -3989,6 +4468,15 @@ export function App() {
           onConfirm={() => {
             confirmDialog.resolve(true);
             setConfirmDialog(null);
+          }}
+        />
+      ) : null}
+      {liveConflictDialog ? (
+        <LiveConflictDialog
+          profileName={liveConflictDialog.profileName}
+          onChoose={(choice) => {
+            liveConflictDialog.resolve(choice);
+            setLiveConflictDialog(null);
           }}
         />
       ) : null}
@@ -4037,6 +4525,8 @@ export function App() {
       ) : null}
       {pendingDreamSkinCommunity ? (
         <DreamSkinCommunityLinkDialog
+          installBlocked={Boolean(dreamSkinInstallOperation)}
+          installPending={dreamSkinInstallOperation?.source === "pending-community"}
           versionId={pendingDreamSkinCommunity}
           onConfirm={() => void confirmPendingDreamSkinCommunity()}
           onDismiss={() => void dismissPendingDreamSkinCommunity()}
@@ -4052,16 +4542,20 @@ function ModelReasoningLevelsCell({
   levels,
   inherited,
   defaultLevel,
+  parameterMode,
+  onParameterModeChange,
   onChange,
 }: {
   levels: string[];
+  parameterMode: ReasoningParameterMode;
+  onParameterModeChange: (mode: ReasoningParameterMode) => void;
   /// true = 当前值来自内置声明而非该模型的自定义配置。
   inherited: boolean;
   defaultLevel: string | null;
   onChange: (levels: string[], defaultLevel: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const label = formatReasoningLevelsLabel(levels);
+  const label = parameterMode === "omit" ? t("不发送思考参数") : formatReasoningLevelsLabel(levels);
   const toggleLevel = (level: string) => {
     const picked = levels.includes(level)
       ? levels.filter((item) => item !== level)
@@ -4105,6 +4599,13 @@ function ModelReasoningLevelsCell({
           role="listbox"
           style={menuStyle}
         >
+          <div className="relay-reasoning-default">
+            <span>{t("请求参数")}</span>
+            <div className="relay-reasoning-chips">
+              {([ ["auto", t("自动兼容")], ["passthrough", t("原样传等级（Chat）")], ["omit", t("不发送")] ] as const).map(([mode, text]) =>
+                <button key={mode} type="button" className={parameterMode === mode ? "selected" : ""} onClick={() => onParameterModeChange(mode)}>{text}</button>)}
+            </div>
+          </div>
           {REASONING_LEVELS.map((level) => {
             const selected = levels.includes(level);
             return (
@@ -4112,6 +4613,7 @@ function ModelReasoningLevelsCell({
                 aria-selected={selected}
                 className={`app-select-option ${selected ? "selected" : ""}`.trim()}
                 key={level}
+                disabled={parameterMode === "omit"}
                 onClick={() => toggleLevel(level)}
                 onMouseDown={(event) => event.preventDefault()}
                 role="option"
@@ -4127,6 +4629,7 @@ function ModelReasoningLevelsCell({
             <div className="relay-reasoning-chips">
               <button
                 className={defaultLevel ? "" : "selected"}
+                disabled={parameterMode === "omit"}
                 onClick={() => onChange(levels, null)}
                 type="button"
               >
@@ -4136,6 +4639,7 @@ function ModelReasoningLevelsCell({
                 <button
                   className={defaultLevel === level ? "selected" : ""}
                   key={level}
+                  disabled={parameterMode === "omit"}
                   onClick={() => onChange(levels, level)}
                   type="button"
                 >
@@ -4145,7 +4649,9 @@ function ModelReasoningLevelsCell({
             </div>
           </div>
           <p className="relay-reasoning-hint">
-            {inherited
+            {parameterMode === "omit" ? t("请求不发送思考参数；档位草稿保留，切回自动兼容后可恢复。")
+              : parameterMode === "passthrough" ? t("Chat 上游按原值接收 reasoning_effort，不按模型名改写档位。")
+              : inherited
               ? t("当前为内置默认，修改后保存为该模型的自定义思考等级。")
               : t("未设置时沿用内置默认；清空全部档位即恢复内置。")}
           </p>
@@ -4155,6 +4661,8 @@ function ModelReasoningLevelsCell({
     </div>
   );
 }
+
+type AutoSaveOutcome = { status: "saved" } | { status: "invalid" | "failed"; message: string };
 
 type Actions = {
   refreshCurrent: () => Promise<void>;
@@ -4173,8 +4681,13 @@ type Actions = {
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
+  autoSaveSettings: (settings: BackendSettings) => Promise<AutoSaveOutcome>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
+  exportSettings: () => Promise<void>;
+  importSettings: () => Promise<void>;
+  chooseSettingsPath: () => Promise<void>;
+  resetSettingsPath: () => Promise<void>;
   resetImageOverlaySettings: () => Promise<void>;
   chooseCodexAppPath: (mode: "folder" | "file") => Promise<void>;
   clearCodexAppPath: () => Promise<void>;
@@ -4219,11 +4732,15 @@ type Actions = {
   reloadUserScripts: () => Promise<void>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptsEnabled: (enabled: boolean) => Promise<void>;
+  setUserScriptsSkipNextStart: (skip: boolean) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
-  deleteLocalSession: (session: LocalSession) => Promise<void>;
-  deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
+  listProjectSessions: (cwd: string) => Promise<LocalSession[]>;
+  // 返回是否真正执行（用户取消时为 false），调用方据此决定是否清空选择。
+  deleteLocalSession: (session: LocalSession) => Promise<boolean>;
+  deleteLocalSessions: (sessions: LocalSession[]) => Promise<boolean>;
+  archiveLocalSessions: (sessions: LocalSession[], archived?: boolean) => Promise<boolean>;
   openExternalUrl: (url: string) => Promise<void>;
   applyRelayInjection: () => Promise<boolean>;
   applyPureApiInjection: () => Promise<boolean>;
@@ -4255,6 +4772,9 @@ type Actions = {
   copyDiagnostics: () => Promise<void>;
   goLogs: () => Promise<void>;
   setWatcherEnabled: (enabled: boolean) => Promise<void>;
+  setWatcherStartMinimized: (minimized: boolean) => Promise<void>;
+  setWatcherStartCodex: (startCodex: boolean) => Promise<void>;
+  setWatcherStartCodexOnOpen: (enabled: boolean) => Promise<void>;
   setAutoTakeover: (enabled: boolean) => Promise<void>;
   refreshAutoTakeover: () => Promise<void>;
   takeOverNow: () => Promise<void>;
@@ -4698,99 +5218,53 @@ function WeixinConnectScreen({
   );
 }
 
-/// 概览页的置顶推荐位。
+/// 概览页的两个独立广告位。
 ///
-/// 概览页和推荐内容页共用同一份数据、同一个渲染，所以两处看到的赞助商是
-/// 一致的 —— 以前概览页把赞助商内容硬编码在 JSX 里，跟推荐内容页各说各话。
-///
-/// 数据来自广告源里的 sponsor 条目。
-/// 概览页置顶赞助位。
-///
-/// 这个位置**不来自推荐池** —— 广告源里的 `top_ad` 可配置单个对象或数组，
-/// 多条时自动轮播。没有有效条目时不显示置顶赞助位。
+/// 这里只读取广告源的 `top_ad/topAds`，不会读取普通 `ads` 推荐池。
+/// `top_ad` 可以是单个对象，也可以是数组；最多显示前两个有效广告。
 function SponsorBoard({ ads, actions }: { ads: AdsResult | null; actions: Actions }) {
   const sourceAds = ads?.topAds?.length ? ads.topAds : ads?.topAd ? [ads.topAd] : [];
-  const featured = sourceAds.filter((ad) => !isExpiredAd(ad));
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [hovered, setHovered] = useState(false);
-  const [focusWithin, setFocusWithin] = useState(false);
-  const paused = hovered || focusWithin;
-
-  useEffect(() => {
-    if (featured.length < 2 || paused) return;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        setActiveIndex((index) => (index + 1) % featured.length);
-      }
-    }, 6000);
-    return () => window.clearInterval(timer);
-  }, [featured.length, paused]);
+  const featured = sourceAds.filter((ad) => !isExpiredAd(ad)).slice(0, 2);
 
   if (featured.length === 0) return null;
-  const activePosition = activeIndex % featured.length;
-  const ad = featured[activePosition];
-  const move = (offset: number) => {
-    setActiveIndex((index) => (index + offset + featured.length) % featured.length);
-  };
 
   return (
-    <div
-      className="sponsor-board"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocusCapture={() => setFocusWithin(true)}
-      onBlurCapture={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setFocusWithin(false);
-      }}
-    >
-      <Panel className="jojocode-overview">
-        <CardContent>
-          <div className="jojocode-overview-layout">
-            <div className="jojocode-overview-main">
-              {ad.image ? (
-                <img alt="" className="sponsor-logo" src={ad.image} />
-              ) : (
-                <div className="jojocode-overview-mark">
-                  <Network className="h-5 w-5" />
+    <div className={`sponsor-board ${featured.length === 1 ? "sponsor-board-single" : ""}`}>
+      {featured.map((ad) => (
+        <Panel className="jojocode-overview sponsor-slot" key={ad.id || ad.title}>
+          <CardContent>
+            <div className="sponsor-slot-content">
+              <div className="sponsor-slot-main">
+                {ad.image ? (
+                  <img alt="" className="sponsor-logo" src={ad.image} />
+                ) : (
+                  <div className="jojocode-overview-mark">
+                    <Network className="h-5 w-5" />
+                  </div>
+                )}
+                <div className="sponsor-slot-copy">
+                  <span className="eyebrow">{t("推荐内容")}</span>
+                  <h2>{formatAdTitle(ad.title)}</h2>
+                  <p className="recommendation-description" title={ad.description}>{ad.description}</p>
                 </div>
-              )}
-              <div aria-live={paused ? "polite" : "off"} className="sponsor-carousel-copy" key={ad.id || ad.title}>
-                <span className="eyebrow">{t("推荐内容")}</span>
-                <h2>{formatAdTitle(ad.title)}</h2>
-                <p className="recommendation-description" title={ad.description}>{ad.description}</p>
               </div>
-            </div>
-            <div className="jojocode-overview-side">
               {ad.highlights?.length ? (
-                <div className="jojocode-model-tags">
+                <div className="jojocode-model-tags sponsor-slot-tags">
                   {ad.highlights.map((item) => (
                     <span key={item}>{item}</span>
                   ))}
                 </div>
               ) : null}
-              <div className="sponsor-carousel-actions">
+              <div className="sponsor-slot-actions">
                 <Button onClick={() => void actions.openExternalUrl(ad.url)}>
                   <ExternalLink className="h-4 w-4" />
                   {t("打开推荐内容")}
                 </Button>
-                {featured.length > 1 ? (
-                  <div aria-label={t("赞助商轮播")} className="sponsor-carousel-controls" role="group">
-                    <Button aria-label={t("上一条")} onClick={() => move(-1)} size="icon" variant="outline">
-                      <ArrowLeft className="h-4 w-4" />
-                    </Button>
-                    <span aria-live={paused ? "polite" : "off"} className="sponsor-carousel-count">
-                      {activePosition + 1} / {featured.length}
-                    </span>
-                    <Button aria-label={t("下一条")} onClick={() => move(1)} size="icon" variant="outline">
-                      <ArrowRight className="h-4 w-4" />
-                    </Button>
-                  </div>
-                ) : null}
               </div>
             </div>
-          </div>
-        </CardContent>
-      </Panel>
+          </CardContent>
+        </Panel>
+      ))}
     </div>
   );
 }
@@ -4800,22 +5274,107 @@ function OverviewScreen({
   ads,
   activeTool,
   toolEntries,
+  form,
+  onNavigate,
   actions,
 }: {
   overview: OverviewResult | null;
   ads: AdsResult | null;
   activeTool: ToolId;
   toolEntries: ToolEntry[];
+  form: BackendSettings;
+  onNavigate: (route: Route) => void;
   actions: Actions;
 }) {
   const health = healthItems(overview);
   const tool = toolEntries.find((entry) => entry.id === activeTool);
+  const normalized = normalizeSettings(form);
+  const activeProfile = normalized.relayProfiles.find((profile) => profile.id === normalized.activeRelayId);
+  // 最近请求只在 Codex 概览里用；失败时静默显示空状态，不打断概览。
+  const [recent, setRecent] = useState<RecentRequestSummary | null>(null);
+  useEffect(() => {
+    if (activeTool !== "codex") return;
+    let cancelled = false;
+    void invoke<RequestLogsResult>("load_request_logs", { limit: 300 })
+      .then((result) => {
+        if (!cancelled) setRecent(summarizeRecentRequests(result.status === "ok" ? result.entries : [], Date.now()));
+      })
+      .catch(() => { if (!cancelled) setRecent(summarizeRecentRequests([], Date.now())); });
+    return () => { cancelled = true; };
+  }, [activeTool]);
+  const switchFromOverview = (profileId: string) => {
+    if (!profileId || profileId === normalized.activeRelayId) return;
+    void actions.switchRelayProfile(syncLegacyRelayFields({ ...normalized, activeRelayId: profileId }), normalized.activeRelayId);
+  };
   return (
     <>
       {/* 置顶推荐位两个工具下都显示，内容与「推荐内容」页同源。 */}
       <SponsorBoard ads={ads} actions={actions} />
       {activeTool === "codex" ? (
         <>
+          {/* 推荐位之下是最常用的两件事：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}
+          <div className="overview-top-grid">
+            <Panel className="overview-current-panel">
+              <CardHead title={t("当前供应商")} detail="" />
+              <CardContent className="overview-current">
+                {activeProfile ? (
+                  <>
+                    <div className="overview-current-main">
+                      <span className="relay-index">{providerInitial(activeProfile.name)}</span>
+                      <span className="overview-current-text">
+                        <strong>{activeProfile.name || t("未命名供应商")}</strong>
+                        <small>
+                          {[relayProfileModeLabel(activeProfile), relayProtocolLabel(activeProfile.protocol), activeProfile.model]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="overview-current-actions">
+                      <select
+                        aria-label={t("切换供应商")}
+                        className="request-log-filter overview-current-select"
+                        disabled={actions.relaySwitching || !normalized.relayProfilesEnabled || normalized.relayProfiles.length < 2}
+                        onChange={(event) => switchFromOverview(event.currentTarget.value)}
+                        title={!normalized.relayProfilesEnabled ? t("供应商配置切换已关闭，在供应商配置页打开后才能切换") : t("切换供应商")}
+                        value={normalized.activeRelayId}
+                      >
+                        {normalized.relayProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>{profile.name || t("未命名供应商")}</option>
+                        ))}
+                      </select>
+                      <Button onClick={() => onNavigate("relay")} variant="secondary">{t("管理供应商")}</Button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="overview-current-empty">
+                    <span>{t("还没有配置供应商。")}</span>
+                    <Button onClick={() => onNavigate("relay")}>{t("添加供应商")}</Button>
+                  </div>
+                )}
+              </CardContent>
+            </Panel>
+            <Panel className="overview-recent-panel">
+              <CardHead title={t("最近 24 小时请求")} detail="" />
+              <CardContent className="overview-recent">
+                {!recent ? (
+                  <span className="field-hint">{t("读取中…")}</span>
+                ) : recent.total === 0 ? (
+                  <span className="field-hint">{t("最近 24 小时没有经过本地代理的请求。直连且未开启协议转换时，请求不经过本地代理，这里不会有记录。")}</span>
+                ) : (
+                  <dl className="overview-recent-stats">
+                    <div><dt>{t("请求")}</dt><dd>{recent.total}</dd></div>
+                    <div data-state={recent.failed ? "warn" : "ok"}><dt>{t("成功率")}</dt><dd>{Math.round((recent.successRate ?? 0) * 100)}%</dd></div>
+                    <div><dt>{t("平均耗时")}</dt><dd>{((recent.avgDurationMs ?? 0) / 1000).toFixed(1)}s</dd></div>
+                    <div className="overview-recent-model"><dt>{t("常用模型")}</dt><dd title={recent.topModel ?? undefined}>{recent.topModel ?? "—"}</dd></div>
+                  </dl>
+                )}
+                <Button className="overview-recent-link" onClick={() => onNavigate("requestLog")} size="sm" variant="ghost">
+                  {t("查看请求日志")}
+                </Button>
+              </CardContent>
+            </Panel>
+          </div>
           <Panel>
             <CardHeader className="panel-head overview-health-header">
               <CardTitle>{t("健康检查")}</CardTitle>
@@ -4836,19 +5395,19 @@ function OverviewScreen({
             <CardContent>
               <div className="health-grid overview-health-grid">
                 <div className={`health-item ${overview?.codex_version ? "ok" : "needs-fix"}`}>
-                  {overview?.codex_version ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                  <span className={`health-icon ${overview?.codex_version ? "good" : "warn"}`}><Tag className="h-4 w-4" /></span>
                   <div>
                     <strong>{t("Codex 版本")}</strong>
-                    <span>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
+                    <span title={overview?.codex_version ?? undefined}>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
                   </div>
                   <Badge status={overview?.codex_version ? "ok" : "not_checked"} />
                 </div>
                 {health.map((item) => (
                   <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`} key={item.title}>
-                    {item.ok ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                    <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
                     <div>
                       <strong>{item.title}</strong>
-                      <span>{item.detail}</span>
+                      <span title={item.detail}>{item.detail}</span>
                     </div>
                     <Badge status={item.status} />
                   </div>
@@ -4858,6 +5417,7 @@ function OverviewScreen({
           </Panel>
         </>
       ) : (
+        <>
         <Panel>
           <CardHead title={tf("{0} 状态", [tool?.name ?? t("工具")])} detail={t("该工具由它自己的页签管理")} />
           <CardContent>
@@ -4889,8 +5449,794 @@ function OverviewScreen({
             </div>
           </CardContent>
         </Panel>
+        </>
       )}
     </>
+  );
+}
+
+function ProxySettingsScreen({
+  dirty,
+  overview,
+  form,
+  relayEnvironment,
+  onFormChange,
+  actions,
+}: {
+  dirty: boolean;
+  overview: OverviewResult | null;
+  form: BackendSettings;
+  relayEnvironment: RelayEnvironmentResult | null;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const proxyProfiles = useMemo(
+    () => (form.relayProfiles ?? []).filter((profile) => profile.relayMode !== "aggregate"),
+    [form.relayProfiles],
+  );
+  const proxyProfileKey = proxyProfiles.map((profile) => profile.id).join("|");
+  const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
+  // 已保存的值：输入与它一致时「保存」置灰，十几行供应商里一眼看出哪行改过。
+  const [savedProxyUrls, setSavedProxyUrls] = useState<Record<string, string>>({});
+  const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
+  const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
+  const [retryStatusInput, setRetryStatusInput] = useState("");
+  const setRetryStatusCodes = (codes: number[]) =>
+    onFormChange({ ...form, protocolProxyAutoRetryStatusCodes: normalizeRetryStatusCodes(codes) });
+  const addRetryStatusCodes = () => {
+    const next = retryStatusInput.split(/[,，\s]+/).map(Number);
+    if (!normalizeRetryStatusCodes(next).length) return;
+    setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...next]);
+    setRetryStatusInput("");
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = proxyProfileKey ? proxyProfileKey.split("|") : [];
+    void Promise.all(
+      ids.map(async (id) => {
+        try {
+          const result = await invoke<{ status: string; proxyUrl?: string; configured?: boolean }>(
+            "load_relay_proxy",
+            { profileId: id },
+          );
+          return { id, url: result.status === "ok" ? result.proxyUrl ?? "" : "", configured: result.configured === true };
+        } catch {
+          return { id, url: "", configured: false };
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const urls: Record<string, string> = {};
+      const configured: Record<string, boolean> = {};
+      entries.forEach((entry) => {
+        urls[entry.id] = entry.url;
+        configured[entry.id] = entry.configured;
+      });
+      setProxyUrls(urls);
+      setSavedProxyUrls(urls);
+      setProxyConfigured(configured);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [proxyProfileKey]);
+
+  const saveProviderProxy = async (profile: RelayProfile) => {
+    const profileId = profile.id;
+    setProxyBusyId(profileId);
+    try {
+      const result = await invoke<{
+        status: string;
+        message: string;
+        proxyUrl?: string;
+        configured?: boolean;
+      }>("set_relay_proxy", { profileId, proxyUrl: proxyUrls[profileId] ?? "" });
+      if (result.status === "ok") {
+        setProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setSavedProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setProxyConfigured((current) => ({ ...current, [profileId]: result.configured === true }));
+      }
+      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
+    } finally {
+      setProxyBusyId(null);
+    }
+  };
+
+  const localServer = overview?.runtime_health?.local_server;
+  const debuggerState = overview?.runtime_health?.debugger;
+  const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled === true;
+
+  return (
+    <div className="settings-page proxy-settings-page">
+      <Panel>
+        <CardHead
+          title={t("本地协议代理")}
+          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；退出 Codex++ 才关闭")}
+        />
+        <CardContent className="settings-content setting-rows">
+          {/* 与概览页健康检查同一套带图标状态卡。 */}
+          <div className="health-grid overview-health-grid proxy-status-grid">
+            {healthItems(overview)
+              .filter((item) => item.title !== t("Codex 应用"))
+              .map((item) => <HealthTile item={item} key={item.title} />)}
+          </div>
+          <SettingRow
+            title={t("请求体上限")}
+            description={t("长上下文会话超过上限会报 413；调大会增加本地代理的内存占用。")}
+            detail={t("默认 128 MiB，可填 32~512。长上下文会话（1M 窗口 + 截图历史）的请求体会超过旧的 32 MiB 硬上限并触发 413；调大后本地代理处理单次请求的内存占用也会增加。保存后立即对本地代理生效；环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES（字节）优先于本设置。")}
+          >
+            <div className="setting-input-unit">
+              <Input
+                max={512}
+                min={32}
+                step={16}
+                type="number"
+                value={form.helperMaxRequestBodyMib}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    helperMaxRequestBodyMib: clampNumber(Number(event.currentTarget.value), 32, 512),
+                  })
+                }
+              />
+              <span>MiB</span>
+            </div>
+          </SettingRow>
+          <p className="setting-footnote">
+            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
+          </p>
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <SwitchPanelHead
+          checked={form.protocolProxyAutoRetry}
+          detail={t("在本地代理内消化上游过载与限流，尽量不把错误交给 Codex")}
+          label={t("启用请求避震")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyAutoRetry: checked })}
+          title={t("请求避震")}
+        />
+        <CardContent className="settings-content setting-rows">
+          {form.protocolProxyAutoRetry ? (
+            <>
+              <SettingRow title={t("最多自动重试次数")} description={t("0–20 次；次数用尽后把错误交给 Codex。")}>
+                <div className="setting-input-unit">
+                  <Input
+                    max={20}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryMaxAttempts}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryMaxAttempts: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          20,
+                        ),
+                      })
+                    }
+                  />
+                  <span>{t("次")}</span>
+                </div>
+              </SettingRow>
+              <SettingRow title={t("首次重试间隔")} description={t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}>
+                <div className="setting-input-unit">
+                  <Input
+                    max={30}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryIntervalSeconds}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryIntervalSeconds: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          30,
+                        ),
+                      })
+                    }
+                  />
+                  <span>{t("秒")}</span>
+                </div>
+              </SettingRow>
+              {/* 状态码编辑不能放进 <label>（Field）：WebKit 会把点击转发给第一个按钮，一次删掉两个状态码。 */}
+              <SettingRow
+                stacked
+                title={t("重试的 HTTP 状态码")}
+                description={t("命中时退避重发。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
+              >
+                <div role="group" aria-label={t("重试的 HTTP 状态码")}>
+                  <div className="retry-status-editor">
+                    <div className="retry-status-list">
+                      {form.protocolProxyAutoRetryStatusCodes.map((status) => (
+                        <button
+                          key={status}
+                          className="retry-status-chip"
+                          onClick={() =>
+                            setRetryStatusCodes(
+                              form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
+                            )
+                          }
+                          title={t("点击移除")}
+                          type="button"
+                        >
+                          {status} ×
+                        </button>
+                      ))}
+                    </div>
+                    <div className="retry-status-input-row">
+                      <Input
+                        aria-label={t("输入状态码后回车")}
+                        inputMode="numeric"
+                        placeholder={t("输入状态码后回车，如 429")}
+                        value={retryStatusInput}
+                        onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            addRetryStatusCodes();
+                          }
+                        }}
+                      />
+                      <Button
+                        onClick={() =>
+                          setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                        }
+                        type="button"
+                        variant="outline"
+                      >
+                        {t("填入常用")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </SettingRow>
+              <SettingRow
+                title={t("避震模式")}
+                description={form.protocolProxyAutoRetryMode === "buffered"
+                  ? t("始终由代理重试，但要等整段生成完才显示。")
+                  : form.protocolProxyAutoRetryMode === "streaming-legacy"
+                    ? t("旧版流式行为，仅在新版有问题时使用。")
+                    : t("保留实时输出；正文出现前遇到过载由代理重试。")}
+                detail={t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
+              >
+                <select
+                  className="request-log-filter"
+                  value={form.protocolProxyAutoRetryMode}
+                  onChange={(event) =>
+                    onFormChange({
+                      ...form,
+                      protocolProxyAutoRetryMode:
+                        event.currentTarget.value === "buffered"
+                          ? "buffered"
+                          : event.currentTarget.value === "streaming-legacy"
+                            ? "streaming-legacy"
+                            : "streaming",
+                    })
+                  }
+                >
+                  <option value="streaming">{t("流式（推荐）")}</option>
+                  <option value="streaming-legacy">{t("流式（旧行为）")}</option>
+                  <option value="buffered">{t("整段缓冲")}</option>
+                </select>
+              </SettingRow>
+              {form.protocolProxyAutoRetryMode === "streaming" ? (
+                <SettingRow title={t("首字提交延迟")} description={t("出现正文后再缓冲的时长，0 表示立即提交。")}>
+                  <div className="setting-input-unit">
+                    <Input
+                      max={10000}
+                      min={0}
+                      step={100}
+                      type="number"
+                      value={form.protocolProxyAutoRetryCommitDelayMs}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
+                        })
+                      }
+                    />
+                    <span>ms</span>
+                  </div>
+                </SettingRow>
+              ) : null}
+              <p className="setting-footnote">
+                {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及上面选择的 HTTP 状态码。")}
+              </p>
+            </>
+          ) : (
+            <p className="setting-footnote">{t("已关闭：上游过载或限流时，错误直接交给 Codex。")}</p>
+          )}
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <SwitchPanelHead
+          checked={form.protocolProxyMapUnlistedModels}
+          detail={t("把 Codex 后台任务的固定模型名改写为当前供应商的默认模型")}
+          label={t("改写目录外模型名")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyMapUnlistedModels: checked })}
+          title={t("目录外模型映射")}
+        />
+        <CardContent className="settings-content setting-rows">
+          <p className="setting-footnote" title={t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}>
+            {t("自动审查、标题摘要等后台任务固定使用 gpt-* 内部模型名，第三方上游没有这些名字会报「模型不存在」。开启后，不在当前供应商模型列表里的模型会改写为该供应商的默认模型；官方登录与聚合供应商不受影响。")}
+          </p>
+          {form.protocolProxyMapUnlistedModels ? (
+            <p className="setting-warning">{t("注意：手填但没写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}</p>
+          ) : null}
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <CardHead
+          title={t("供应商独立代理")}
+          detail={t("为单个供应商单独指定 HTTP 代理；留空表示沿用系统代理")}
+        />
+        <CardContent className="settings-content">
+          {proxyProfiles.length ? (
+            <div className="proxy-provider-list">
+              {proxyProfiles.map((profile) => (
+                <div className="proxy-provider-row" key={profile.id}>
+                  <div className="proxy-provider-meta">
+                    <strong>{profile.name || t("未命名供应商")}</strong>
+                    <small>
+                      {relayProtocolLabel(profile.protocol)} ·{" "}
+                      {proxyConfigured[profile.id] ? t("已配置独立代理") : t("未配置独立代理")}
+                    </small>
+                  </div>
+                  <Input
+                    aria-label={tf("{0} 的独立代理", [profile.name || t("未命名供应商")])}
+                    placeholder={t("例如 http://127.0.0.1:7890，留空表示使用系统代理")}
+                    value={proxyUrls[profile.id] ?? ""}
+                    onChange={(event) =>
+                      setProxyUrls((current) => ({ ...current, [profile.id]: event.currentTarget.value }))
+                    }
+                  />
+                  <Button
+                    disabled={
+                      proxyBusyId === profile.id ||
+                      (proxyUrls[profile.id] ?? "").trim() === (savedProxyUrls[profile.id] ?? "").trim()
+                    }
+                    onClick={() => void saveProviderProxy(profile)}
+                    variant="secondary"
+                  >
+                    {proxyBusyId === profile.id ? t("保存中…") : t("保存")}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="field-hint">{t("还没有可配置独立代理的供应商。")}</p>
+          )}
+          <p className="field-hint">
+            {t("保存后需重新应用该供应商并重启 Codex，独立代理才会作用于会话请求。")}
+          </p>
+        </CardContent>
+      </Panel>
+
+      <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+
+      {dirty ? (
+        <div className="settings-save-bar">
+          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
+          <Button onClick={() => void actions.saveSettings()}>
+            <Save className="h-4 w-4" />
+            {t("保存设置")}
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatRequestLogTime(timestampMs: number) {
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0) return "-";
+  const date = new Date(timestampMs);
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  const time = date.toLocaleTimeString("zh-CN", { hour12: false });
+  return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+
+function formatRequestLogTokens(value?: number | null) {
+  if (value == null) return "-";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+/** 缓存命中率展示：≥99% 保留一位小数，只有完全命中才显示 100%。 */
+function formatRequestLogCacheHitRatio(
+  inputTokens?: number | null,
+  cachedTokens?: number | null,
+  ratio?: number | null,
+) {
+  const input = inputTokens ?? 0;
+  const cached = cachedTokens ?? 0;
+  if (input <= 0 || cached <= 0) return "-";
+  if (cached >= input) return "100%";
+  const percent = (ratio ?? cached / input) * 100;
+  if (percent >= 99) return `${percent.toFixed(1)}%`;
+  return `${Math.round(percent)}%`;
+}
+
+/** 会话 id 展示：UUIDv7 前缀按时间递增、容易重名，这里取末 8 位区分。 */
+function formatRequestLogSession(threadId?: string | null): string {
+  const value = (threadId ?? "").trim();
+  if (!value) return "-";
+  return value.length > 12 ? `…${value.slice(-8)}` : value;
+}
+
+function formatRequestLogDuration(durationMs: number) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return "-";
+  if (durationMs < 1000) return `${durationMs}ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+  return `${Math.floor(durationMs / 60_000)}m${Math.round((durationMs % 60_000) / 1000)}s`;
+}
+
+function requestLogRetryLabel(entry: RequestLogEntry) {
+  if (entry.autoRetries > 0) return tf("自动重试 ×{0}", [String(entry.autoRetries)]);
+  if (entry.attempts > 1) return tf("切换 ×{0}", [String(entry.attempts)]);
+  return "-";
+}
+
+function RequestLogScreen() {
+  const [entries, setEntries] = useState<RequestLogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
+  const [sessionFilter, setSessionFilter] = useState("all");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const hasRunning = entries.some((entry) => entry.state === "running");
+  useEffect(() => {
+    if (!hasRunning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunning]);
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const result = await invoke<RequestLogsResult>("load_request_logs", { limit: 300 });
+      if (result.status === "ok") {
+        setEntries(result.entries ?? []);
+        setError("");
+      } else {
+        setError(result.message || t("读取请求日志失败。"));
+      }
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load(true);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh]);
+
+  const clearLogs = async () => {
+    if (!window.confirm(t("清空全部请求日志？此操作不可撤销。"))) return;
+    setClearing(true);
+    try {
+      const result = await invoke<{ status: Status; message: string }>("clear_request_logs");
+      if (result.status !== "ok") setError(result.message);
+      await load(true);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const sessions = useMemo(() => {
+    const found = new Map<string, { id: string; title: string; count: number }>();
+    for (const entry of entries) {
+      const id = (entry.threadId ?? "").trim();
+      if (!id) continue;
+      const title = (entry.threadTitle ?? "").trim();
+      const session = found.get(id);
+      if (session) {
+        session.count += 1;
+        if (!session.title && title) session.title = title;
+      } else {
+        found.set(id, { id, title, count: 1 });
+      }
+    }
+    // entries 本身按时间倒序，Map 的插入顺序即「最近活跃的会话优先」。
+    return [...found.values()];
+  }, [entries]);
+
+  const hasUnknownSession = useMemo(
+    () => entries.some((entry) => !(entry.threadId ?? "").trim()),
+    [entries],
+  );
+
+  // 日志被清空/切换后，避免筛选项停留在已不存在的会话上。
+  useEffect(() => {
+    if (sessionFilter === "all" || sessionFilter === "__none__") return;
+    if (!sessions.some((session) => session.id === sessionFilter)) {
+      setSessionFilter("all");
+    }
+  }, [sessionFilter, sessions]);
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return entries.filter((entry) => {
+      const running = entry.state === "running";
+      if (filter === "running" && !running) return false;
+      if (filter === "success" && (running || !entry.success)) return false;
+      if (filter === "failed" && (running || entry.success)) return false;
+      if (filter === "retried" && entry.autoRetries === 0 && entry.attempts <= 1) return false;
+      const threadId = (entry.threadId ?? "").trim();
+      if (sessionFilter === "__none__") {
+        if (threadId) return false;
+      } else if (sessionFilter !== "all" && threadId !== sessionFilter) {
+        return false;
+      }
+      if (!needle) return true;
+      return [
+        entry.model,
+        entry.upstreamModel,
+        entry.relayName,
+        entry.path,
+        entry.threadId ?? "",
+        entry.error ?? "",
+        entry.wireApi,
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    });
+  }, [entries, filter, query]);
+
+  return (
+    <Panel className="request-log-panel">
+      <CardHead
+        title={t("请求日志")}
+        detail={tf("最近 {0} 条代理请求，含状态、模型、重试与 token 用量", [String(entries.length)])}
+      />
+      <CardContent className="request-log-content">
+        <div className="request-log-toolbar">
+          <div className="request-log-search">
+            <Search className="h-4 w-4" aria-hidden="true" />
+            <Input
+              aria-label={t("搜索模型 / 供应商 / 路径 / 错误")}
+              placeholder={t("搜索模型 / 供应商 / 路径 / 错误")}
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+          </div>
+          <select
+            aria-label={t("状态筛选")}
+            className="request-log-filter"
+            value={filter}
+            onChange={(event) => setFilter(event.currentTarget.value as typeof filter)}
+          >
+            <option value="all">{t("全部")}</option>
+            <option value="running">{t("进行中")}</option>
+            <option value="success">{t("仅成功")}</option>
+            <option value="failed">{t("仅失败")}</option>
+            <option value="retried">{t("含重试")}</option>
+          </select>
+          <select
+            aria-label={t("按会话筛选")}
+            className="request-log-filter request-log-session-filter"
+            onChange={(event) => setSessionFilter(event.currentTarget.value)}
+            title={t("按会话筛选")}
+            value={sessionFilter}
+          >
+            <option value="all">{t("全部会话")}</option>
+            {sessions.map((session) => (
+              <option key={session.id} value={session.id}>
+                {tf("{0}（{1} 条）", [
+                  session.title || tf("会话 {0}", [formatRequestLogSession(session.id)]),
+                  String(session.count),
+                ])}
+              </option>
+            ))}
+            {hasUnknownSession ? <option value="__none__">{t("未记录会话")}</option> : null}
+          </select>
+          <label className="check-row request-log-auto">
+            <input
+              checked={autoRefresh}
+              onChange={(event) => setAutoRefresh(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>{t("自动刷新")}</span>
+          </label>
+          <Button variant="secondary" onClick={() => void load()}>
+            <RefreshCw className="h-4 w-4" />
+            {t("刷新")}
+          </Button>
+          <Button disabled={clearing || entries.length === 0} variant="secondary" onClick={() => void clearLogs()}>
+            <Trash2 className="h-4 w-4" />
+            {t("清空")}
+          </Button>
+        </div>
+
+        {error ? (
+          <p className="field-hint request-log-error" role="alert">{error}</p>
+        ) : null}
+
+        {loading && entries.length === 0 ? (
+          <div className="empty">{t("正在读取请求日志…")}</div>
+        ) : filtered.length ? (
+          <div className="request-log-table" role="table" aria-label={t("请求日志")}>
+            <div className="request-log-row request-log-head" role="row">
+              <span>{t("时间")}</span>
+              <span>{t("状态")}</span>
+              <span>{t("来源")}</span>
+              <span>{t("模型")}</span>
+              <span>{t("重试")}</span>
+              <span>{t("输入")}</span>
+              <span>{t("输出")}</span>
+              <span>{t("缓存")}</span>
+              <span>{t("耗时")}</span>
+            </div>
+            {filtered.map((entry) => (
+              <Fragment key={entry.id}>
+                <button
+                  aria-expanded={expanded === entry.id}
+                  className={`request-log-row request-log-entry ${entry.state === "running" ? "running" : entry.success ? "ok" : "bad"}`}
+                  onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
+                  role="row"
+                  type="button"
+                >
+                  <span>{formatRequestLogTime(entry.startedAtMs || entry.timestampMs)}</span>
+                  {entry.state === "running" ? (
+                    <span className="request-log-status running">
+                      {t("运行中")}
+                    </span>
+                  ) : (
+                    <span
+                      className={`request-log-status ${entry.success ? "ok" : "bad"}`}
+                      title={entry.error ?? ""}
+                    >
+                      {entry.statusCode || "ERR"}
+                      {!entry.success ? (
+                        <small className="request-log-stream-failed">
+                          {entry.stream ? t("流失败") : t("失败")}
+                        </small>
+                      ) : null}
+                    </span>
+                  )}
+                  <span className="request-log-ellipsis" title={entry.relayName}>{entry.relayName || "-"}</span>
+                  <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
+                    {entry.model || "-"}
+                    {entry.upstreamModel && entry.upstreamModel !== entry.model ? (
+                      <small> → {entry.upstreamModel}</small>
+                    ) : null}
+                  </span>
+                  <span
+                    className={entry.autoRetries > 0 ? "request-log-retry" : "request-log-muted"}
+                    title={(entry.retryReasons ?? []).join("、")}
+                  >
+                    {requestLogRetryLabel(entry)}
+                  </span>
+                  <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
+                    {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.inputTokens)}
+                  </span>
+                  <span
+                    className="request-log-muted"
+                    title={entry.state === "running"
+                      ? t("按流式增量估算，完成后会更新为准确值")
+                      : ""}
+                  >
+                    {entry.state === "running"
+                      ? entry.estimatedOutputTokens
+                        ? `~${formatRequestLogTokens(entry.estimatedOutputTokens)}`
+                        : t("流式中")
+                      : formatRequestLogTokens(entry.usage?.outputTokens)}
+                  </span>
+                  <span>
+                    {entry.state === "running" ? (
+                      <span className="request-log-muted">{t("流式中")}</span>
+                    ) : entry.usage?.cachedTokens ? (
+                      <>
+                        {formatRequestLogTokens(entry.usage.cachedTokens)}
+                        <small>
+                          {" · "}
+                          {formatRequestLogCacheHitRatio(
+                            entry.usage.inputTokens,
+                            entry.usage.cachedTokens,
+                            entry.cacheHitRatio,
+                          )}
+                        </small>
+                      </>
+                    ) : "-"}
+                  </span>
+                  <span className="request-log-duration">
+                    {formatRequestLogDuration(
+                      entry.state === "running"
+                        ? Math.max(0, nowMs - entry.startedAtMs)
+                        : entry.durationMs,
+                    )}
+                    {entry.state === "running" ? (
+                      <small>{t("进行中")}</small>
+                    ) : entry.firstTokenMs != null ? (
+                      <small>{tf("首字 {0}", [formatRequestLogDuration(entry.firstTokenMs)])}</small>
+                    ) : null}
+                  </span>
+                </button>
+                {expanded === entry.id ? (
+                  <div className="request-log-detail">
+                    <dl>
+                      <div><dt>{t("请求 ID")}</dt><dd><code>{entry.id}</code></dd></div>
+                      <div>
+                        <dt>{t("会话 ID")}</dt>
+                        <dd>
+                          {entry.threadTitle ? <strong className="request-log-session-title">{entry.threadTitle}</strong> : null}
+                          <code>{entry.threadId || "-"}</code>
+                        </dd>
+                      </div>
+                      <div><dt>{t("路径")}</dt><dd><code>{entry.method} {entry.path}</code></dd></div>
+                      <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
+                      <div><dt>{t("上游模型")}</dt><dd>{entry.upstreamModel || "-"}</dd></div>
+                      <div><dt>{t("首字耗时")}</dt><dd>{entry.firstTokenMs == null ? (entry.state === "running" ? t("进行中") : "-") : formatRequestLogDuration(entry.firstTokenMs)}</dd></div>
+                      <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
+                      <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
+                      <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      {entry.attemptDetails?.length ? (
+                        <div className="request-log-attempts">
+                          <dt>{t("尝试明细")}</dt>
+                          <dd>
+                            <ul>
+                              {entry.attemptDetails.map((detail) => (
+                                <li key={`${detail.attempt}-${detail.code ?? ""}`}>
+                                  <strong>{tf("第 {0} 次", [detail.attempt])}</strong>
+                                  <code>{detail.code || "-"}</code>
+                                  {detail.delayMs != null ? (
+                                    <small>{tf("退避 {0}", [formatRequestLogDuration(detail.delayMs)])}</small>
+                                  ) : null}
+                                  {detail.message ? <small title={detail.message}>{detail.message}</small> : null}
+                                </li>
+                              ))}
+                            </ul>
+                          </dd>
+                        </div>
+                      ) : null}
+                      <div><dt>{t("流式")}</dt><dd>{entry.stream ? "SSE" : "JSON"}</dd></div>
+                      <div><dt>{t("流结果")}</dt><dd>{entry.streamOutcome || "-"}</dd></div>
+                      <div><dt>{t("推理 tokens")}</dt><dd>{formatRequestLogTokens(entry.usage?.reasoningTokens)}</dd></div>
+                      <div><dt>{t("错误")}</dt><dd>{entry.error || "-"}</dd></div>
+                    </dl>
+                  </div>
+                ) : null}
+              </Fragment>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">
+            {entries.length
+              ? t("没有匹配当前筛选条件的请求。")
+              : t("还没有请求日志。启动 Codex 发起一次对话后即可看到。")}
+          </div>
+        )}
+      </CardContent>
+    </Panel>
   );
 }
 
@@ -4920,7 +6266,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
       detail: result
         ? proxyVariables.length
           ? tf("检测到代理环境变量：{0}。请清理后重新启动 Codex。", [proxyVariableLabels.join(t("、"))])
-          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY 或 FTP_PROXY。")
+          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY 或 FTP_PROXY。")
         : t("等待检测。"),
     },
     {
@@ -4938,10 +6284,19 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 
   return (
     <Panel>
-      <CardHead
-        title={t("中转站环境配置检测")}
-        detail={result ? (allPassed ? t("三项检测全部通过") : t("检测到需要处理的环境问题")) : t("正在读取本机环境")}
-      />
+      {/* 「重新检测」放在标题栏右侧，与其它卡片的页面级操作同位，不再单独占一行。 */}
+      <CardHeader className="panel-head relay-environment-head">
+        <CardTitle>{t("中转站环境配置检测")}</CardTitle>
+        <div className="relay-environment-head-side">
+          <CardDescription>
+            {result ? (allPassed ? t("三项检测全部通过") : t("检测到需要处理的环境问题")) : t("正在读取本机环境")}
+          </CardDescription>
+          <Button onClick={() => void actions.refreshRelayEnvironment()} size="sm" variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            {t("重新检测")}
+          </Button>
+        </div>
+      </CardHeader>
       <CardContent>
         <div className="relay-environment-checks">
           {checks.map((check) => (
@@ -4957,19 +6312,13 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
             </div>
           ))}
         </div>
-        <Toolbar>
-          <Button onClick={() => void actions.refreshRelayEnvironment()}>
-            <RefreshCw className="h-4 w-4" />
-            {t("重新检测")}
-          </Button>
-        </Toolbar>
       </CardContent>
     </Panel>
   );
 }
 
 function RelayScreen({
-  settings: _settings,
+  settings,
   relayFiles,
   envConflicts,
   ccsProviders,
@@ -4987,14 +6336,25 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
-  const [providerView, setProviderView] = useState<ProviderViewKind>("direct");
+  // 目录页的搜索词放在这里：从模板进入编辑页再返回时，目录页会重新挂载，搜索不能丢。
+  const [providerCatalogQuery, setProviderCatalogQuery] = useState("");
+  // 进入时停在当前供应商所在的分区；找不到当前供应商时，没有直连项就展示协议转换分区。
+  const initialProviderView = (): ProviderViewKind => {
+    const active = normalized.relayProfiles.find((profile) => profile.id === normalized.activeRelayId);
+    if (active) return relayProviderView(active);
+    const views = normalized.relayProfiles.map(relayProviderView);
+    return !views.includes("direct") && views.includes("routing") ? "routing" : "direct";
+  };
+  const [providerView, setProviderView] = useState<ProviderViewKind>(initialProviderView);
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const thirdPartyImportTriggerRef = useRef<HTMLDivElement>(null);
-  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<{ top: number; right: number } | null>(null);
+  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<AnchoredMenuLayout | null>(null);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
   const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
+  // 路径草稿与已保存的不一致时，列表还是旧库的：先「应用」才能导入。
+  const ccsPathDirty = ccsDbPathDraft.trim() !== normalized.ccsDbPath;
   useEffect(() => setCcsDbPathDraft(normalized.ccsDbPath), [normalized.ccsDbPath]);
   const saveCcsDbPath = async (path = ccsDbPathDraft) => {
     setCcsPathSaving(true);
@@ -5053,18 +6413,12 @@ function RelayScreen({
     setProviderView(view);
   };
   useEffect(() => {
-    // 协议转换供应商归入独立分区；首次打开时如果没有直连项，直接展示该分区。
+    // 设置读回之前表单是默认值（自带一个 default 供应商），不能据此定分区。
     if (providerViewAutoSelectedRef.current) return;
-    if (!normalized.relayProfiles.length) return;
+    if (!settings || !normalized.relayProfiles.length) return;
     providerViewAutoSelectedRef.current = true;
-    if (
-      providerView === "direct"
-      && !normalized.relayProfiles.some((profile) => relayProviderView(profile) === "direct")
-      && normalized.relayProfiles.some((profile) => relayProviderView(profile) === "routing")
-    ) {
-      setProviderView("routing");
-    }
-  }, [normalized.relayProfiles, providerView]);
+    setProviderView(initialProviderView());
+  }, [settings, normalized.relayProfiles, normalized.activeRelayId]);
   // 分页仅控制渲染。卡片的删除、复制和排序必须基于完整配置，避免隐藏的
   // 当前供应商被 syncLegacyRelayFields 当成不存在，改写成直连列表第一项。
   const switchRelayProfileFromList = (profileId: string) => {
@@ -5092,10 +6446,12 @@ function RelayScreen({
     if (next) {
       // 菜单改为 fixed 定位：它原本挂在 .mg-content（overflow:auto）里，
       // 面板较矮时后半截会被裁掉（ccswitch 导入按钮、刷新列表都看不到）。
+      // 高度必须按触发按钮的位置收窄，否则 cc-switch 供应商一多（几十行），
+      // 菜单底部会超出窗口下沿，最后那排按钮永远点不到（issue #1906）。
       const rect = thirdPartyImportTriggerRef.current?.getBoundingClientRect();
       setThirdPartyImportPosition(
         rect
-          ? { top: Math.round(rect.bottom + 8), right: Math.round(Math.max(12, window.innerWidth - rect.right)) }
+          ? resolveAnchoredMenuLayout(rect, { width: window.innerWidth, height: window.innerHeight })
           : null,
       );
     }
@@ -5112,12 +6468,18 @@ function RelayScreen({
     };
     document.addEventListener("pointerdown", handlePointerDown, true);
     window.addEventListener("resize", close);
-    // capture 监听内层 .mg-content 的滚动。
-    window.addEventListener("scroll", close, { capture: true, passive: true });
+    // capture 监听内层 .mg-content 的滚动：页面滚了菜单会跟触发按钮错位，得收起。
+    // 但供应商列表自己也会滚（滚轮、拖滚动条），scroll 事件同样会冒到 window 的
+    // capture 阶段——不排除掉它，列表一动菜单就关，等于列表不能滚（issue #1906）。
+    const handleScroll = (event: Event) => {
+      if (thirdPartyImportTriggerRef.current?.contains(event.target as Node)) return;
+      close();
+    };
+    window.addEventListener("scroll", handleScroll, { capture: true, passive: true });
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
       window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, { capture: true });
+      window.removeEventListener("scroll", handleScroll, { capture: true });
     };
   }, [thirdPartyImportOpen]);
   if (detailProfile) {
@@ -5128,16 +6490,20 @@ function RelayScreen({
         form={normalized}
         isNew={isNewProfile}
         initialAggregateMode={isNewProfile ? newAggregateMode : null}
+        // 从目录页选模板进来时目录页状态还开着：返回只清掉草稿，回到目录页继续挑。
         onBack={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
         }}
         onFormChange={saveRelaySettings}
+        // 保存后回到供应商列表，目录页一并关掉。
         onSaved={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
         }}
         actions={actions}
       />
@@ -5148,11 +6514,16 @@ function RelayScreen({
     return (
       <ProviderCatalogScreen
         form={normalized}
-        onBack={() => setProviderCatalogOpen(false)}
+        query={providerCatalogQuery}
+        onQueryChange={setProviderCatalogQuery}
+        onBack={() => {
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
+        }}
+        // 不关目录页：编辑页优先渲染，从编辑页返回时回到这里而不是供应商列表。
         onSelect={(profile) => {
           setNewProfileDraft(profile);
           setNewAggregateMode(null);
-          setProviderCatalogOpen(false);
         }}
       />
     );
@@ -5164,32 +6535,24 @@ function RelayScreen({
         icon={<KeyRound className="h-5 w-5" />}
         title={t("供应商列表")}
         actions={(
-          <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
-            <Plus className="h-4 w-4" />
-            {t("添加供应商")}
-          </Button>
-        )}
-      />
-      <div className="mg-content">
-        <Panel className="relay-management-panel">
-          <CardContent>
-          <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
-          <label className="switch-row relay-master-switch">
-            <input
-              checked={normalized.relayProfilesEnabled}
-              onChange={(event) => {
-                const next = { ...normalized, relayProfilesEnabled: event.currentTarget.checked };
-                void saveRelaySettings(next);
-              }}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启用供应商配置切换")}</strong>
-              <small>{t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
-          <div className="relay-add-row">
+          <>
+            {/* 总开关很少改动：收成标题栏里的小开关，完整说明放在悬停提示里；关闭时下方另有提示条。 */}
+            <label
+              className="switch-row compact relay-master-switch relay-master-switch-compact"
+              title={t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
+            >
+              <input
+                aria-label={t("启用供应商配置切换")}
+                checked={normalized.relayProfilesEnabled}
+                onChange={(event) => {
+                  const next = { ...normalized, relayProfilesEnabled: event.currentTarget.checked };
+                  void saveRelaySettings(next);
+                }}
+                type="checkbox"
+              />
+              <span>{t("配置切换")}</span>
+              <ToggleVisual />
+            </label>
             <div className="third-party-import" ref={thirdPartyImportTriggerRef}>
               <Button
                 onClick={openThirdPartyImport}
@@ -5202,117 +6565,181 @@ function RelayScreen({
                 <div
                   className="third-party-import-menu"
                   style={thirdPartyImportPosition
-                    ? { position: "fixed", top: thirdPartyImportPosition.top, right: thirdPartyImportPosition.right }
+                    ? {
+                      position: "fixed",
+                      top: thirdPartyImportPosition.top,
+                      right: thirdPartyImportPosition.right,
+                      maxHeight: thirdPartyImportPosition.maxHeight,
+                    }
                     : undefined}
                 >
-                  <label>
-                    {t("cc-switch 数据库路径")}
-                    <Input value={ccsDbPathDraft} onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)} placeholder={t("留空使用默认路径")} />
-                  </label>
-                  <button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} type="button">{t("选择数据库")}</button>
-                  <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
-                  {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
-                  {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
-                  {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
-                    {provider.name}
-                    <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
-                      <option value="">{t("自动识别来源或新增")}</option>
-                      {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                    </select>
-                  </label>)}
-                  <button
-                    disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
-                    onClick={() => {
-                      setThirdPartyImportOpen(false);
-                      void actions.importCcsProviders(ccsBindings);
-                    }}
-                    type="button"
-                  >
-                    <strong>ccswitch</strong>
-                    <span>{ccsProviderSummary(ccsProviders)}</span>
-                  </button>
-                  <button
-                    onClick={() => void actions.refreshCcsProviders()}
-                    type="button"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    {t("刷新列表")}
-                  </button>
+                  <div className="third-party-import-head">
+                    <strong>{t("从 cc-switch 导入")}</strong>
+                    <small>{t("只读取 cc-switch 的数据库，不会改动它。")}</small>
+                  </div>
+                  <div className="third-party-import-source">
+                    <div className="third-party-import-path">
+                      <Input
+                        aria-label={t("cc-switch 数据库路径")}
+                        onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)}
+                        placeholder={t("默认 ~/.cc-switch/cc-switch.db")}
+                        value={ccsDbPathDraft}
+                      />
+                      <Button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} size="sm" title={t("选择数据库")} variant="secondary">
+                        <FolderOpen className="h-4 w-4" />
+                        {t("选择")}
+                      </Button>
+                      {ccsPathDirty ? (
+                        <Button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} size="sm">
+                          {ccsPathSaving ? t("应用中") : t("应用")}
+                        </Button>
+                      ) : null}
+                    </div>
+                    {ccsProviders && isSuccessStatus(ccsProviders.status) ? (
+                      <small className="third-party-import-meta" title={ccsProviders.dbPath}>{t("实际来源")}：{ccsProviders.dbPath}</small>
+                    ) : null}
+                    {ccsProviders?.fallbackReason ? <small className="third-party-import-warning">{ccsProviders.fallbackReason}</small> : null}
+                  </div>
+                  {/* 供应商列表单独滚动：cc-switch 里几十个供应商时，底部按钮仍然可见可点（issue #1906）。 */}
+                  <div className="third-party-import-list">
+                    {ccsProviders?.providers.length ? (
+                      <div className="third-party-import-list-head">
+                        <span>{tf("Codex 供应商 {0} 个", [ccsProviders.providers.length])}</span>
+                        <span>{t("导入为")}</span>
+                      </div>
+                    ) : (
+                      <p className="third-party-import-empty">{ccsProviderSummary(ccsProviders)}</p>
+                    )}
+                    {ccsProviders?.providers.map((provider) => (
+                      <label className="third-party-import-row" key={provider.sourceId}>
+                        <span className="third-party-import-name">
+                          <strong title={provider.name}>{provider.name}</strong>
+                          <small title={provider.baseUrl}>{urlHost(provider.baseUrl) || t("未填写地址")}</small>
+                        </span>
+                        <select
+                          aria-label={tf("{0} 导入为", [provider.name])}
+                          onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}
+                          value={ccsBindings[provider.sourceId] || ""}
+                        >
+                          <option value="">{t("新增（同名自动关联）")}</option>
+                          {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                        </select>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="third-party-import-actions">
+                    {ccsPathDirty ? <small className="third-party-import-warning">{t("路径已修改，点「应用」读取新数据库后再导入。")}</small> : null}
+                    <div className="third-party-import-footer">
+                      <Button aria-label={t("刷新列表")} onClick={() => void actions.refreshCcsProviders()} size="icon" title={t("刷新列表")} variant="ghost">
+                        <RefreshCw className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        disabled={ccsPathSaving || ccsPathDirty || !ccsProviders?.providers.length}
+                        onClick={() => {
+                          setThirdPartyImportOpen(false);
+                          void actions.importCcsProviders(ccsBindings);
+                        }}
+                      >
+                        <Download className="h-4 w-4" />
+                        {ccsProviders?.providers.length ? tf("导入 {0} 个供应商", [ccsProviders.providers.length]) : t("导入")}
+                      </Button>
+                    </div>
+                  </div>
                 </div>
               ) : null}
             </div>
-          </div>
-          <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
-            <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
-              <Cable className="h-4 w-4" />
-              <span>{t("直连")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
-              <Layers3 className="h-4 w-4" />
-              <span>{t("模型聚合")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
-              <GitBranch className="h-4 w-4" />
-              <span>{t("需协议转换")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
-              <ArrowRightLeft className="h-4 w-4" />
-              <span>{t("故障转移")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-          </div>
-          {providerView === "direct" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有直连供应商")}</strong>
-              <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
+            <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
+              <Plus className="h-4 w-4" />
+              {t("添加供应商")}
+            </Button>
+          </>
+        )}
+      />
+      <div className="mg-content">
+        <Panel className="relay-management-panel">
+          <CardContent>
+          <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
+          {!normalized.relayProfilesEnabled ? (
+            <p className="relay-switch-off-note" role="status">
+              {t("供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。")}
+            </p>
           ) : null}
-          {providerView === "routing" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
-              <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
+          {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
+          {normalized.relayProfilesEnabled ? (
+            <>
+            <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+                <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
+                  <Cable className="h-4 w-4" />
+                  <span>{t("直连")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
+                  <Layers3 className="h-4 w-4" />
+                  <span>{t("模型聚合")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
+                  <GitBranch className="h-4 w-4" />
+                  <span>{t("需协议转换")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
+                  <ArrowRightLeft className="h-4 w-4" />
+                  <span>{t("故障转移")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+              </div>
+              {providerView === "direct" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有直连供应商")}</strong>
+                  <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "routing" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
+                  <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "failover" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有故障转移配置")}</strong>
+                  <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
+                </div>
+              ) : null}
+              {providerView === "modelAggregation" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有模型聚合配置")}</strong>
+                  <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
+                </div>
+              ) : null}
+              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
+                <div className="provider-aggregate-toolbar">
+                  <Button
+                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
+                  </Button>
+                </div>
+              ) : null}
+              <RelayProfileList
+                form={normalized}
+                visibleProfiles={visibleProfiles}
+                onEdit={(profileId) => void editRelayProfile(profileId)}
+                onFormChange={saveRelaySettings}
+                onSwitchProfile={switchRelayProfileFromList}
+                disabled={actions.relaySwitching}
+                actions={actions}
+              />
+            </>
           ) : null}
-          {providerView === "failover" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有故障转移配置")}</strong>
-              <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
-              <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
-            </div>
-          ) : null}
-          {providerView === "modelAggregation" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有模型聚合配置")}</strong>
-              <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
-              <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
-            </div>
-          ) : null}
-          {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
-            <div className="provider-aggregate-toolbar">
-              <Button
-                onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
-                size="sm"
-                variant="secondary"
-              >
-                <Plus className="h-4 w-4" />
-                {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
-              </Button>
-            </div>
-          ) : null}
-          <RelayProfileList
-            form={normalized}
-            visibleProfiles={visibleProfiles}
-            onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveRelaySettings}
-            onSwitchProfile={switchRelayProfileFromList}
-            disabled={actions.relaySwitching}
-            actions={actions}
-          />
           </CardContent>
         </Panel>
       </div>
@@ -5467,14 +6894,17 @@ function CodexMultiLaunchScreen({
 
 function ProviderCatalogScreen({
   form,
+  query,
+  onQueryChange: setQuery,
   onBack,
   onSelect,
 }: {
   form: BackendSettings;
+  query: string;
+  onQueryChange: (value: string) => void;
   onBack: () => void;
   onSelect: (profile: RelayProfile) => void;
 }) {
-  const [query, setQuery] = useState("");
   const categories: Array<{ id: ProviderPreset["category"]; label: string }> = [
     { id: "official", label: t("账号登录") },
     { id: "cn_official", label: t("模型厂商") },
@@ -5509,30 +6939,36 @@ function ProviderCatalogScreen({
             value={query}
           />
         </div>
-        <div className="provider-add-results">
-          <button className="provider-add-result provider-add-custom-result" onClick={() => selectPreset()} type="button">
-            <span className="provider-add-icon">✦</span>
-            <span><strong>{t("自定义配置")}</strong><small>{t("手动填写请求地址和 API Key")}</small></span>
-          </button>
-        </div>
+        <button className="provider-add-custom" onClick={() => selectPreset()} type="button">
+          <span className="provider-add-icon"><Sparkles className="h-4 w-4" /></span>
+          <span className="provider-add-text">
+            <strong>{t("自定义配置")}</strong>
+            <small>{t("手动填写请求地址和 API Key，适合中转站和自建服务")}</small>
+          </span>
+          <ChevronRight className="provider-add-chevron h-4 w-4" />
+        </button>
         {categories.map((category) => {
           const presets = filteredPresets.filter((preset) => preset.category === category.id);
           if (!presets.length) return null;
           return (
             <section className="provider-add-section" key={category.id}>
-              <h3>{category.label}</h3>
+              <h3>{category.label}<span>{presets.length}</span></h3>
               <div className="provider-add-results">
                 {presets.map((preset) => (
-                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
-                    <span className="provider-add-icon">{preset.name.slice(0, 1).toUpperCase()}</span>
-                    <span><strong>{preset.name}</strong><small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small></span>
+                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} title={preset.baseUrl} type="button">
+                    <span className="provider-add-icon">{providerInitial(preset.name)}</span>
+                    <span className="provider-add-text">
+                      <strong>{preset.name}</strong>
+                      <small>{urlHost(preset.websiteUrl || preset.baseUrl)}</small>
+                    </span>
+                    <span className="provider-add-protocol">{preset.protocol === "chatCompletions" ? "Chat" : "Responses"}</span>
                   </button>
                 ))}
               </div>
             </section>
           );
         })}
-        {!filteredPresets.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
+        {!filteredPresets.length ? <div className="provider-add-empty">{tf("没有匹配「{0}」的预设，可以用上面的「自定义配置」手动填写。", [query.trim()])}</div> : null}
         <p className="provider-add-hint">{t("选择供应商后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
       </main>
     </div>
@@ -5649,6 +7085,16 @@ type DictationLocalModelState = {
   message?: string;
 };
 
+type GlobalDictationHotkeyState = {
+  enabled: boolean;
+  hotkey: string;
+};
+// 后端失败分支的 payload 是 `{}`：只在确实带有热键字段时才当作新状态。
+function hotkeyStateFrom(result: Partial<GlobalDictationHotkeyState> | null | undefined): GlobalDictationHotkeyState | null {
+  if (!result || typeof result.hotkey !== "string") return null;
+  return { enabled: result.enabled === true, hotkey: result.hotkey };
+}
+
 function DictationSettingsPanel({ form, onFormChange }: {
   form: BackendSettings;
   onFormChange: (value: BackendSettings) => void;
@@ -5658,6 +7104,13 @@ function DictationSettingsPanel({ form, onFormChange }: {
   const [localModelState, setLocalModelState] = useState<DictationLocalModelState | null>(null);
   const [localModelDownloading, setLocalModelDownloading] = useState(false);
   const [localModelError, setLocalModelError] = useState("");
+  const [globalHotkey, setGlobalHotkey] = useState<GlobalDictationHotkeyState>({ enabled: false, hotkey: "Ctrl+Shift+Space" });
+  const [globalHotkeyBusy, setGlobalHotkeyBusy] = useState(false);
+  useEffect(() => {
+    void invoke<CommandResult<GlobalDictationHotkeyState>>("load_global_dictation_hotkey")
+      .then((result) => { const next = hotkeyStateFrom(result); if (next) setGlobalHotkey(next); })
+      .catch(() => {});
+  }, []);
   useEffect(() => {
     if (form.dictation.provider !== "sensevoice") return;
     let active = true;
@@ -5682,6 +7135,20 @@ function DictationSettingsPanel({ form, onFormChange }: {
     }
   };
   const downloading = localModelDownloading || localModelState?.phase === "downloading";
+  const saveGlobalHotkey = async () => {
+    setGlobalHotkeyBusy(true);
+    try {
+      const result = await invoke<CommandResult<GlobalDictationHotkeyState>>("set_global_dictation_hotkey", globalHotkey);
+      // 校验/保存失败时后端 payload 为空对象，不能用它覆盖用户刚输入的热键。
+      const next = hotkeyStateFrom(result);
+      if (next) setGlobalHotkey(next);
+      window.alert(result.message);
+    } catch (error) {
+      window.alert(String(error));
+    } finally {
+      setGlobalHotkeyBusy(false);
+    }
+  };
   const updateDictation = (patch: Partial<DictationSettings>) => onFormChange({
     ...form,
     dictation: { ...form.dictation, ...patch },
@@ -5699,6 +7166,23 @@ function DictationSettingsPanel({ form, onFormChange }: {
             checked={form.dictation.enabled}
             onChange={(enabled) => updateDictation({ enabled })}
           />
+          <label className="switch-row compact">
+            <input
+              checked={globalHotkey.enabled}
+              disabled={globalHotkeyBusy || !form.enhancementsEnabled}
+              onChange={(event) => setGlobalHotkey((current) => ({ ...current, enabled: event.currentTarget.checked }))}
+              type="checkbox"
+            />
+            <span><strong>{t("全局听写热键")}</strong><small>{t("Windows 首版：按一次开始录音，再按一次停止并插入文字。")}</small></span>
+            <ToggleVisual />
+          </label>
+          <div className="form-row">
+            <Field label={t("全局热键") }>
+              <Input value={globalHotkey.hotkey} onChange={(event) => setGlobalHotkey((current) => ({ ...current, hotkey: event.currentTarget.value }))} placeholder="Ctrl+Shift+Space" />
+            </Field>
+            <Button disabled={globalHotkeyBusy} onClick={() => void saveGlobalHotkey()} type="button" variant="secondary">{t("保存全局热键")}</Button>
+          </div>
+          <p className="field-hint">{t("热键冲突会在保存时明确报告；macOS 首版暂不注册系统级热键。")}</p>
           <div className="form-row">
             <Field label={t("语音服务预设")}>
               <AppSelect
@@ -5794,7 +7278,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
             <Info className="h-4 w-4" />
             <span>{form.dictation.provider === "sensevoice"
               ? t("下载模型并保存配置后，可在 Codex 输入框录音，停止后在本机转写并插入文字。")
-              : t("保存后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
+              : t("开启后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
           </div>
         </div>
       </CardContent>
@@ -6035,6 +7519,82 @@ function StepwiseSettingsPanel({ form, onFormChange, actions }: {
   );
 }
 
+/** 增强页改动后多久自动保存：开关点完马上存，文本框停止输入后再存。 */
+const ENHANCE_AUTO_SAVE_DELAY_MS = 500;
+
+type AutoSaveState =
+  | { state: "idle" | "pending" | "saving" | "saved" }
+  | { state: "invalid" | "failed"; message: string; retry: () => void };
+
+/// 增强页的自动保存。
+///
+/// - 防抖：同一轮连续改动只存一次；
+/// - 同一时间只有一个保存在途，期间的改动等它回来后再存（App 会同步版本号并触发下一轮）；
+/// - 离开页面时还有没存的改动就立即补存一次，不丢草稿。
+function useEnhanceAutoSave(
+  dirty: boolean,
+  form: BackendSettings,
+  save: (settings: BackendSettings) => Promise<AutoSaveOutcome>,
+): AutoSaveState {
+  const [status, setStatus] = useState<AutoSaveState>({ state: "idle" });
+  const savingRef = useRef(false);
+  const latest = useRef({ dirty, form, save });
+  latest.current = { dirty, form, save };
+
+  const flush = useCallback(async () => {
+    if (savingRef.current) return;
+    const { dirty: pending, form: snapshot, save: persist } = latest.current;
+    if (!pending) return;
+    savingRef.current = true;
+    setStatus({ state: "saving" });
+    const outcome = await persist(snapshot);
+    savingRef.current = false;
+    setStatus(outcome.status === "saved"
+      ? { state: "saved" }
+      : { state: outcome.status, message: outcome.message, retry: () => void flush() });
+  }, []);
+
+  useEffect(() => {
+    if (!dirty) return;
+    setStatus((current) => (current.state === "saving" || current.state === "invalid" ? current : { state: "pending" }));
+    const timer = window.setTimeout(() => void flush(), ENHANCE_AUTO_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [dirty, form, flush]);
+
+  useEffect(() => () => {
+    if (latest.current.dirty && !savingRef.current) void latest.current.save(latest.current.form);
+  }, []);
+
+  return status;
+}
+
+function AutoSaveStatus({ state }: { state: AutoSaveState }) {
+  if (state.state === "invalid" || state.state === "failed") {
+    return (
+      <>
+        <span className="is-error" role="alert" title={state.message}>
+          {state.state === "invalid" ? tf("未保存：{0}", [t(state.message)]) : tf("自动保存失败：{0}", [t(state.message)])}
+        </span>
+        {state.state === "failed" ? (
+          <Button onClick={state.retry} size="sm" variant="secondary">
+            <RefreshCw className="h-4 w-4" />
+            {t("重试")}
+          </Button>
+        ) : null}
+      </>
+    );
+  }
+  const label = state.state === "saving" ? t("正在保存…")
+    : state.state === "pending" ? t("即将自动保存…")
+      : t("改动会自动保存");
+  return (
+    <span className={state.state === "saved" || state.state === "idle" ? "" : "is-dirty"} role="status">
+      {state.state === "saved" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+      {state.state === "saved" ? t("已自动保存") : label}
+    </span>
+  );
+}
+
 function EnhanceScreen({
   dirty,
   activeTab,
@@ -6051,11 +7611,7 @@ function EnhanceScreen({
   actions: Actions;
 }) {
   const setEnhanceFlag = (key: keyof BackendSettings, value: boolean) => onFormChange({ ...form, [key]: value });
-  const setPersistedEnhanceFlag = (key: keyof BackendSettings, value: boolean) => {
-    const next = { ...form, [key]: value };
-    onFormChange(next);
-    void actions.saveSettingsValue(next, true);
-  };
+  const autoSave = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
   const masterEnabled = form.enhancementsEnabled;
   const tabs: Array<{ value: EnhancementTab; label: string }> = [
     { value: "general", label: t("常用增强") },
@@ -6083,39 +7639,38 @@ function EnhanceScreen({
             </span>
             <ToggleVisual />
           </label>
-          <div className="enhance-save-actions">
-            <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
-            <Button disabled={!dirty} onClick={() => void actions.saveSettings()}>
-              <Save className="h-4 w-4" />
-              {t("保存增强设置")}
-            </Button>
-          </div>
         </div>
-        <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
-          {tabs.map((tab, index) => (
-            <button
-              key={tab.value}
-              id={`enhance-tab-${tab.value}`}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.value}
-              aria-controls={`enhance-pane-${tab.value}`}
-              tabIndex={activeTab === tab.value ? 0 : -1}
-              onClick={() => selectTab(tab.value)}
-              onKeyDown={(event) => {
-                const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                    : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
-                if (nextIndex === null) return;
-                event.preventDefault();
-                const nextTab = tabs[nextIndex].value;
-                selectTab(nextTab);
-                document.getElementById(`enhance-tab-${nextTab}`)?.focus();
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
+        {/* 开关独占一行靠右；保存状态移到分页栏右侧。 */}
+        <div className="enhance-tabs-row">
+          <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
+            {tabs.map((tab, index) => (
+              <button
+                key={tab.value}
+                id={`enhance-tab-${tab.value}`}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.value}
+                aria-controls={`enhance-pane-${tab.value}`}
+                tabIndex={activeTab === tab.value ? 0 : -1}
+                onClick={() => selectTab(tab.value)}
+                onKeyDown={(event) => {
+                  const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
+                    : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                      : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+                  if (nextIndex === null) return;
+                  event.preventDefault();
+                  const nextTab = tabs[nextIndex].value;
+                  selectTab(nextTab);
+                  document.getElementById(`enhance-tab-${nextTab}`)?.focus();
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="enhance-save-actions">
+            <AutoSaveStatus state={autoSave} />
+          </div>
         </div>
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-general" role="tabpanel" aria-labelledby="enhance-tab-general" hidden={activeTab !== "general"}>
@@ -6142,10 +7697,13 @@ function EnhanceScreen({
                 </> : null}
                 <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
                 <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
+                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
               </FeatureGroup>
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
+                <FeatureToggle title={t("旁支保存")} detail={t("在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。")} checked={form.codexAppSideChatSave} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSideChatSave", value)} />
+                <FeatureToggle title={t("轮次回退（实验性）")} detail={t("在回答菜单中撤销本轮及后续轮次的可恢复操作，AI 报告全部完成后才截断会话。仅支持本地聊天；恢复记录保存在本机，不是系统快照。")} checked={form.codexAppTurnRewind} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppTurnRewind", value)} />
+                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
                 <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
@@ -6153,7 +7711,7 @@ function EnhanceScreen({
                 <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
                   <span>
                     <strong>{t("打字特效（彩虹 P）")}</strong>
-                    <small>{t("在 Codex 输入框的光标附近显示特效，保存后生效；系统减少动态效果时暂停。")}</small>
+                    <small>{t("在 Codex 输入框的光标附近显示特效；系统减少动态效果时暂停。")}</small>
                   </span>
                   <AppSelect<TypingEffect>
                     ariaLabel={t("打字特效（彩虹 P）")}
@@ -6182,7 +7740,7 @@ function EnhanceScreen({
                   onChange={(value) => setEnhanceFlag("codexAppWhaleWidgetEnabled", value)}
                 />
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
-                {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
+                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
                 {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
                 <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
@@ -6227,7 +7785,7 @@ function StandaloneModeGroup({
         title={t("官方额度解锁")}
         detail={masterEnabled
           ? t("增强开启时此能力已自动生效；此开关只在关闭增强后生效。")
-          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。")}
+          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。")}
         checked={form.codexAppStandaloneQuotaUnlock}
         onChange={(value) => onFormChange({ ...form, codexAppStandaloneQuotaUnlock: value })}
       />
@@ -6244,6 +7802,7 @@ function DreamSkinScreen({
   marketLoading,
   community,
   communityLoading,
+  installOperation,
   draft,
   dirty,
   pendingRestart,
@@ -6262,6 +7821,7 @@ function DreamSkinScreen({
   marketLoading: boolean;
   community: DreamSkinCommunityResult | null;
   communityLoading: boolean;
+  installOperation: DreamSkinInstallOperation | null;
   draft: DreamSkinThemeDraft | null;
   dirty: boolean;
   pendingRestart: PendingDreamSkinRestart | null;
@@ -6501,9 +8061,11 @@ function DreamSkinScreen({
             </div>
             {themeView === "local" ? (
               <Toolbar>
-                <Button variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
-                  <PackageOpen className="h-4 w-4" />
-                  {t("导入主题包")}
+                <Button disabled={Boolean(installOperation)} variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
+                  {installOperation?.source === "import"
+                    ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+                    : <PackageOpen className="h-4 w-4" />}
+                  {installOperation?.source === "import" ? t("导入中…") : t("导入主题包")}
                 </Button>
                 <Button variant="secondary" onClick={() => void actions.createDreamSkinTheme()}>
                   <ImagePlus className="h-4 w-4" />
@@ -6513,10 +8075,15 @@ function DreamSkinScreen({
             ) : null}
           </div>
 
+          {installOperation ? (
+            <DreamSkinInstallProgress label={dreamSkinInstallOperationLabel(installOperation)} />
+          ) : null}
+
           {themeView === "community" ? (
             <DreamSkinCommunitySection
               community={community}
               communityLoading={communityLoading}
+              installOperation={installOperation}
               actions={actions}
               onInstalled={() => setThemeView("local")}
             />
@@ -6553,6 +8120,7 @@ function DreamSkinScreen({
                   {market.themes.map((item) => (
                     <DreamSkinMarketCard
                       actions={actions}
+                      installOperation={installOperation}
                       key={item.id}
                       onInstalled={() => setThemeView("local")}
                       theme={item}
@@ -6985,12 +8553,16 @@ function DreamSkinColorField({
 function DreamSkinMarketCard({
   theme,
   actions,
+  installOperation,
   onInstalled,
 }: {
   theme: DreamSkinMarketTheme;
   actions: Actions;
+  installOperation: DreamSkinInstallOperation | null;
   onInstalled: () => void;
 }) {
+  const installing = installOperation?.source === "market" && installOperation.id === theme.id;
+  const installBlocked = Boolean(installOperation);
   const status = theme.updateAvailable
     ? t("可更新")
     : theme.installed
@@ -7025,18 +8597,23 @@ function DreamSkinMarketCard({
       </div>
       <div className="dream-skin-market-actions">
         <Button
+          aria-busy={installing}
+          disabled={installBlocked}
           onClick={async () => {
             if (await actions.installDreamSkinMarketTheme(theme)) onInstalled();
           }}
           size="sm"
         >
-          <Download className="h-4 w-4" />
-          {theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
+          {installing
+            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+            : <Download className="h-4 w-4" />}
+          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
         </Button>
         <Button onClick={() => void actions.openExternalUrl(theme.sourceUrl)} size="sm" variant="outline">
           <ExternalLink className="h-4 w-4" />
           {t("来源")}
         </Button>
+        {installing ? <DreamSkinInstallProgress /> : null}
       </div>
     </article>
   );
@@ -7045,11 +8622,13 @@ function DreamSkinMarketCard({
 function DreamSkinCommunitySection({
   community,
   communityLoading,
+  installOperation,
   actions,
   onInstalled,
 }: {
   community: DreamSkinCommunityResult | null;
   communityLoading: boolean;
+  installOperation: DreamSkinInstallOperation | null;
   actions: Actions;
   onInstalled: () => void;
 }) {
@@ -7124,6 +8703,7 @@ function DreamSkinCommunitySection({
           {items.map((item) => (
             <DreamSkinCommunityCard
               actions={actions}
+              installOperation={installOperation}
               key={item.id}
               onInstalled={onInstalled}
               theme={item}
@@ -7151,12 +8731,16 @@ function DreamSkinCommunitySection({
 function DreamSkinCommunityCard({
   theme,
   actions,
+  installOperation,
   onInstalled,
 }: {
   theme: DreamSkinCommunityTheme;
   actions: Actions;
+  installOperation: DreamSkinInstallOperation | null;
   onInstalled: () => void;
 }) {
+  const installing = installOperation?.source === "community" && installOperation.id === theme.id;
+  const installBlocked = Boolean(installOperation);
   const status = theme.updateAvailable
     ? t("可更新")
     : theme.installed
@@ -7189,22 +8773,42 @@ function DreamSkinCommunityCard({
       </div>
       <div className="dream-skin-community-actions">
         <Button
-          disabled={!theme.applyCompatible}
+          aria-busy={installing}
+          disabled={installBlocked || !theme.applyCompatible}
           onClick={async () => {
             if (await actions.installDreamSkinCommunityTheme(theme)) onInstalled();
           }}
           size="sm"
           title={theme.applyCompatible ? t("下载、校验并安装主题包") : t("此主题仅支持在线预览或下载")}
         >
-          <Download className="h-4 w-4" />
-          {theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
+          {installing
+            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+            : <Download className="h-4 w-4" />}
+          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
         </Button>
         <Button onClick={() => void actions.openExternalUrl(`https://dreamskin.cc/preview?themeVersion=${encodeURIComponent(theme.id)}`)} size="sm" variant="outline">
           <Eye className="h-4 w-4" />
           {t("预览")}
         </Button>
+        {installing ? <DreamSkinInstallProgress /> : null}
       </div>
     </article>
+  );
+}
+
+function dreamSkinInstallOperationLabel(operation: DreamSkinInstallOperation): string {
+  if (operation.source === "import") return t("正在导入并校验本地主题包…");
+  return tf("正在下载、校验并安装“{0}”…", [operation.name]);
+}
+
+function DreamSkinInstallProgress({ label = t("正在下载、校验并安装主题包…") }: { label?: string }) {
+  return (
+    <div aria-live="polite" className="dream-skin-install-progress" role="status">
+      <span>{label}</span>
+      <div aria-label={label} className="dream-skin-install-progress-bar" role="progressbar">
+        <div />
+      </div>
+    </div>
   );
 }
 
@@ -7343,6 +8947,14 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             >
               {inventory?.enabled === false ? t("开启本地拓展") : t("关闭本地拓展")}
             </Button>
+            <Button
+              onClick={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
+              disabled={!inventory}
+              variant={inventory?.skip_next_start ? "secondary" : "outline"}
+              title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}
+            >
+              {inventory?.skip_next_start ? t("取消下次启动安全模式") : t("下次启动跳过拓展")}
+            </Button>
             <Button onClick={() => void actions.refreshScriptMarket()}>
               <RefreshCw className="h-4 w-4" />
               {t("刷新市场")}
@@ -7367,7 +8979,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
           title={t("市场拓展")}
           detail={
             market?.market.updatedAt
-              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [market.market.updatedAt, filteredMarketScripts.length, marketScripts.length])
+              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [formatMarketUpdatedAt(market.market.updatedAt), filteredMarketScripts.length, marketScripts.length])
               : t("从 GitHub 静态清单加载")
           }
         />
@@ -7450,7 +9062,43 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
   const providerTargets = providerSyncTargets?.targets ?? [];
   const selectedProviderTarget = providerTargets.find((target) => target.id === selectedProviderSyncTarget);
   const canRepairProviderSessions = Boolean(selectedProviderTarget && isProviderSyncTargetSelectable(selectedProviderTarget));
-  return <Panel className="sessions-overview-panel"><CardHead title={t("会话修复")} detail={t("预览并修复本地会话与索引")} /><CardContent>
+  const maintenanceBusy = providerSyncProgress.active || sessionIndexRepairActive;
+  const maintenanceHasError = Boolean(
+    sessionIndexRepairReportError
+    || providerSyncProgress.result?.status === "failed"
+    || providerSyncProgress.result?.syncStatus === "partial_failure"
+    || providerSyncProgress.result?.recoveryErrors?.length
+    || sessionIndexRepairReport?.abortedReason
+    || sessionIndexRepairReport?.warnings?.length,
+  );
+  const maintenanceNeedsAttention = maintenanceBusy || maintenanceHasError;
+  const [maintenanceExpanded, setMaintenanceExpanded] = useState(maintenanceNeedsAttention);
+
+  useEffect(() => {
+    if (maintenanceNeedsAttention) setMaintenanceExpanded(true);
+  }, [maintenanceNeedsAttention, providerSyncProgress.active, sessionIndexRepairActive, sessionIndexRepairReportError]);
+
+  return <details
+    className="session-maintenance"
+    open={maintenanceExpanded}
+    onToggle={(event) => setMaintenanceExpanded(event.currentTarget.open)}
+  >
+    <summary className="session-maintenance-summary">
+      <Wrench aria-hidden="true" className="h-4 w-4" />
+      <strong>{t("修复与维护")}</strong>
+      <span className="session-maintenance-auto-state" data-enabled={form.providerSyncEnabled}>
+        {form.providerSyncEnabled ? t("自动修复已开启") : t("自动修复已关闭")}
+      </span>
+      <span className="session-maintenance-status" data-error={maintenanceHasError} role="status" aria-live="polite">
+        {providerSyncProgress.active
+          ? <>{t("正在修复历史会话")} {formatProgressPercent(providerSyncProgress.percent)}%</>
+          : sessionIndexRepairActive
+            ? t("正在检查索引…")
+            : maintenanceHasError ? t("需要处理") : null}
+      </span>
+      <ChevronDown aria-hidden="true" className="session-maintenance-chevron h-4 w-4" />
+    </summary>
+    <div className="session-maintenance-content">
           <div className="session-repair-tools">
             <Field className="session-sync-target" label={t("同步目标")}>
               <AppSelect
@@ -7488,11 +9136,20 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
               <ToggleVisual />
             </label>
 
+            <label className="switch-row compact session-auto-repair">
+              <input
+                checked={Boolean(form.threadModelFollowSwitchEnabled)}
+                onChange={(event) => onFormChange({ ...form, threadModelFollowSwitchEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("切换模型后旧会话跟随新默认")}</strong>
+                <small>{t("切换供应商或默认模型后，下次启动前把仍停在旧默认模型的会话改为新默认；手动选过模型的会话不变。保存设置后生效。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+
             <div className="session-repair-actions">
-              <Button onClick={() => void actions.refreshLocalSessions()} variant="outline">
-                <RefreshCw className="h-4 w-4" />
-                {t("刷新会话")}
-              </Button>
               <Button
                 disabled={providerSyncProgress.active || sessionIndexRepairActive || !canRepairProviderSessions}
                 onClick={() => void actions.syncProvidersNow()}
@@ -7588,10 +9245,6 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
             </div>
           ) : null}
 
-          <div className="hint-line session-delete-hint">
-            <Info className="h-4 w-4" />
-            <span>{t("删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。")}</span>
-          </div>
     {providerSyncProgress.result?.recoveryJournalPath ? <div>
       {!providerSyncProgress.active && providerSyncProgress.percent === 0 ? <p role="alert">{providerSyncProgress.message}</p> : null}
       <p role="alert" className="break-all">{t("恢复记录：")}{providerSyncProgress.result.recoveryJournalPath}</p>
@@ -7604,7 +9257,8 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
       {t("仍有改动：")}{providerSyncProgress.result.changedSessionFiles ?? 0} {t("个会话文件，")}
       {providerSyncProgress.result.sqliteRowsUpdated ?? 0} {t("行索引。请查看恢复记录处理剩余冲突。")}
     </p> : null}
-  </CardContent></Panel>;
+    </div>
+  </details>;
 }
 
 function SessionsScreen({
@@ -7836,7 +9490,7 @@ function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; action
           <div className="recommend-hero">
             <div>
               <strong>{ads ? tf("已加载 {0} 条推荐", [ordered.length]) : t("尚未加载推荐内容")}</strong>
-              <span>{t("内容来自 BigPizzaV3/Ad-List，含置顶推荐与普通推荐。")}</span>
+              <span>{t("内容来自 Codex++ 广告源，含置顶推荐与普通推荐。")}</span>
             </div>
             <Button onClick={() => void actions.refreshAds()}>
               <RefreshCw className="h-4 w-4" />
@@ -7905,7 +9559,7 @@ function MaintenanceScreen({
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，Codex 仍需点击启动")} />
+        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，可选择自动启动 Codex")} />
         <CardContent>
           <label className="switch-row">
             <input
@@ -7916,7 +9570,46 @@ function MaintenanceScreen({
             />
             <span>
               <strong>{t("登录时自动打开")}</strong>
-              <small>{t("开启后注册系统登录项，关闭时移除；Codex 仍需你手动点击启动。")}</small>
+              <small>{t("开启后注册系统登录项，关闭时移除；是否自动启动 Codex 由下面的独立开关决定。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_codex_on_open)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartCodexOnOpen(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("打开 Codex++ 时自动启动 Codex")}</strong>
+              <small>{t("仅手动打开 Codex++ 时生效；已有 Codex 会先恢复，不会重复启动。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_codex)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartCodex(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("登录时自动启动 Codex")}</strong>
+              <small>{t("仅登录启动 Codex++ 时自动启动 Codex；手动打开 Codex++ 仍不会自动启动。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_minimized)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartMinimized(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("启动时自动最小化")}</strong>
+              <small>{t("仅登录启动时隐藏到托盘；手动打开 Codex++ 仍显示主窗口。")}</small>
             </span>
             <ToggleVisual />
           </label>
@@ -8081,7 +9774,7 @@ function AboutScreen({
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
             <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
           </div>
-          <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
+          <ReleaseNotes markdown={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} onOpenUrl={(url) => void actions.openExternalUrl(url)} />
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
@@ -8097,110 +9790,85 @@ function AboutScreen({
   );
 }
 
-/// 设置页。
+/// Agent 专属设置页。
 ///
-/// 内容按归属分成两类：
-/// - **应用级**（界面主题、语言等）：跟具体工具无关，任何工具下都显示
-/// - **工具级**：图片覆盖层、供应商测试模型、额外启动参数，只在聚焦 Codex 时显示
+/// 入口在侧栏各 Agent 自己的菜单里，只放跟随该 Agent 的选项：
+/// - **Codex**：供应商测试模型、图片覆盖层、额外启动参数
+/// - **Grok / Claude**：供应商与模型在各自页面里管理，这里给出跳转
 ///
-/// 语音输入和 Stepwise 的完整配置在 Codex增强 页面管理。
-function SettingsScreen({
+/// 应用级选项（主题、配置备份、配置文件路径）在最左侧齿轮的「设置」里，
+/// 见 [GlobalSettingsScreen]。语音输入和 Stepwise 的完整配置在 Codex增强 页面管理。
+function AgentSettingsScreen({
   dirty,
-  settings,
-  theme,
   form,
-  activeTool,
-  toolEntries,
   onFormChange,
   actions,
 }: {
   dirty: boolean;
-  settings: SettingsResult | null;
-  theme: Theme;
   form: BackendSettings;
-  activeTool: ToolId;
-  toolEntries: ToolEntry[];
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
-  const tool = toolEntries.find((entry) => entry.id === activeTool);
-  const isCodex = activeTool === "codex";
   return (
     <div className="settings-page">
-      <Panel>
-        <CardHead title={t("基础设置")} detail={settings?.settings_path ?? ""} />
-        <CardContent className="settings-content">
-          <div className="theme-row">
-            <div>
-              <strong>{t("界面主题")}</strong>
-              <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
-            </div>
-            <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
-          </div>
-        </CardContent>
-      </Panel>
+      <>
+        <Panel>
+          <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              title={t("供应商测试模型")}
+              description={t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
+            >
+              <Input
+                value={form.relayTestModel}
+                onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
+                placeholder={t("例如 gpt-5.4-mini")}
+              />
+            </SettingRow>
+          </CardContent>
+        </Panel>
 
-      {isCodex ? (
-        <>
-          <Panel>
-            <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-            <CardContent className="settings-content">
-              <Field className="settings-test-model-field" label={t("供应商测试模型")}>
-                <Input
-                  value={form.relayTestModel}
-                  onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
-                  placeholder={t("例如 gpt-5.4-mini")}
-                />
-              </Field>
-              <p className="field-hint">
-                {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-              </p>
-            </CardContent>
-          </Panel>
-
-          <Panel>
-            <CardHead title={t("Codex 图片覆盖层")} detail={t("在当前 Codex 会话上叠加一张背景图")} />
-            <CardContent className="settings-content">
-              <div className="settings-block">
-                <label className="check-row">
-                  <input
-                    checked={form.codexAppImageOverlayEnabled}
-                    onChange={(event) =>
-                      onFormChange({ ...form, codexAppImageOverlayEnabled: event.currentTarget.checked })
-                    }
-                    type="checkbox"
-                  />
-                  <span>{t("启用 Codex 图片覆盖层")}</span>
-                </label>
-                <div className="form-row">
-                  <Field label={t("覆盖图片")}>
+        <Panel>
+          <SwitchPanelHead
+            checked={form.codexAppImageOverlayEnabled}
+            detail={t("在当前 Codex 会话上叠加一张背景图")}
+            label={t("启用 Codex 图片覆盖层")}
+            onChange={(checked) => onFormChange({ ...form, codexAppImageOverlayEnabled: checked })}
+            title={t("Codex 图片覆盖层")}
+          />
+          <CardContent className="settings-content setting-rows">
+            {form.codexAppImageOverlayEnabled ? (
+              <>
+                <SettingRow title={t("覆盖图片")} description={t("支持 png / jpg / webp / gif / bmp。")}>
+                  <div className="setting-inline">
                     <Input
                       value={form.codexAppImageOverlayPath}
                       onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
                       placeholder={t("选择 png / jpg / webp / gif / bmp")}
                     />
-                  </Field>
-                  <Toolbar>
                     <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
                       {t("选择图片")}
                     </Button>
-                  </Toolbar>
-                </div>
-                <Field label={tf("透明度 {0}%", [form.codexAppImageOverlayOpacity])}>
-                  <Input
-                    min={1}
-                    max={100}
-                    type="range"
-                    value={form.codexAppImageOverlayOpacity}
-                    onChange={(event) =>
-                      onFormChange({
-                        ...form,
-                        codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
-                      })
-                    }
-                  />
-                </Field>
-                <Field label={t("背景适配方式")}>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("透明度")} description={t("数值越大，背景图越明显。")}>
+                  <div className="setting-inline setting-range">
+                    <Input
+                      min={1}
+                      max={100}
+                      type="range"
+                      value={form.codexAppImageOverlayOpacity}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
+                        })
+                      }
+                    />
+                    <span className="setting-range-value">{form.codexAppImageOverlayOpacity}%</span>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("背景适配方式")} description={t("图片和窗口比例不一致时如何铺放。")}>
                   <AppSelect
                     value={form.codexAppImageOverlayFitMode}
                     onChange={(value) =>
@@ -8217,57 +9885,129 @@ function SettingsScreen({
                       { value: "center", label: t("居中") },
                     ]}
                   />
-                </Field>
-              </div>
-              <Toolbar>
-                <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
-                  {t("重置背景")}
-                </Button>
-              </Toolbar>
-            </CardContent>
-          </Panel>
-
-          <Panel>
-            <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
-            <CardContent className="settings-content">
-              <Field label={t("额外参数")}>
-                <Textarea
-                  className="launch-args-input"
-                  placeholder="--force_high_performance_gpu"
-                  spellCheck={false}
-                  value={codexExtraArgsToInput(form.codexExtraArgs)}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      codexExtraArgs: inputToCodexExtraArgs(event.currentTarget.value),
-                    })
-                  }
-                />
-              </Field>
-              <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
-            </CardContent>
-          </Panel>
-        </>
-      ) : (
-        <Panel>
-          <CardHead title={tf("{0} 设置", [tool?.name ?? t("工具")])} detail={t("这个工具目前没有独立设置项")} />
-          <CardContent className="settings-content">
-            <p className="field-hint">
-              {t("该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。")}
-            </p>
+                </SettingRow>
+                <SettingRow title={t("恢复默认")} description={t("清除图片，并把透明度、适配方式恢复为默认值。")}>
+                  <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
+                    {t("重置背景")}
+                  </Button>
+                </SettingRow>
+              </>
+            ) : (
+              <p className="setting-footnote">{t("已关闭：Codex 会话不叠加背景图。")}</p>
+            )}
           </CardContent>
         </Panel>
-      )}
 
-      {dirty ? (
-        <div className="settings-save-bar">
-          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-          <Button onClick={() => void actions.saveSettings()}>
-            <Save className="h-4 w-4" />
-            {t("保存设置")}
-          </Button>
-        </div>
-      ) : null}
+        <Panel>
+          <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              stacked
+              title={t("额外参数")}
+              description={t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}
+            >
+              <Textarea
+                className="launch-args-input"
+                placeholder="--force_high_performance_gpu"
+                spellCheck={false}
+                value={codexExtraArgsToInput(form.codexExtraArgs)}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    codexExtraArgs: inputToCodexExtraArgs(event.currentTarget.value),
+                  })
+                }
+              />
+            </SettingRow>
+          </CardContent>
+        </Panel>
+      </>
+
+      <SettingsSaveBar dirty={dirty} actions={actions} />
+    </div>
+  );
+}
+
+/// 整体设置页（最左侧齿轮）。
+///
+/// 只放与当前 Agent 无关的应用级选项，内容不随 Agent 切换而变。
+/// Agent 专属选项放在各 Agent 菜单的「设置」里，见 [AgentSettingsScreen]。
+function GlobalSettingsScreen({
+  dirty,
+  settings,
+  theme,
+  actions,
+  onOpenAgentSettings,
+}: {
+  dirty: boolean;
+  settings: SettingsResult | null;
+  theme: Theme;
+  actions: Actions;
+  onOpenAgentSettings: () => void;
+}) {
+  const settingsPath = settings?.settings_path ?? "";
+  // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
+  return (
+    <div className="settings-page global-settings-page">
+      <Panel>
+        <CardHead title={t("基础设置")} detail="" />
+        <CardContent className="global-settings-list">
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("界面主题")}</strong>
+              <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("配置备份与迁移")}</strong>
+              <span>{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
+              <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("配置文件路径")}</strong>
+              <code className="global-setting-path" title={settingsPath}>{settingsPath || "—"}</code>
+              <span>{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
+              <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("Codex 专属设置")}</strong>
+              <span>{t("供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
+            </div>
+          </div>
+        </CardContent>
+      </Panel>
+      <SettingsSaveBar dirty={dirty} actions={actions} />
+    </div>
+  );
+}
+
+/// 设置页底部的保存条：整体设置与 Agent 设置共用。
+function SettingsSaveBar({ dirty, actions }: { dirty: boolean; actions: Actions }) {
+  if (!dirty) return null;
+  return (
+    <div className="settings-save-bar">
+      <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
+      <Button onClick={() => void actions.saveSettings()}>
+        <Save className="h-4 w-4" />
+        {t("保存设置")}
+      </Button>
     </div>
   );
 }
@@ -8433,8 +10173,22 @@ function SortableRelayProfileCard({
         {providerInitial(profile.name)}
       </span>
       <span className="relay-summary">
-        <strong>{profile.name || t("未命名供应商")}</strong>
-        <small>{relayProfileModeLabel(profile)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
+        {/* 参照 CC Switch：接入方式、非 Responses 协议做成名字旁的标签，第二行只放地址。 */}
+        <strong>
+          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+          <span className="relay-tag" data-tone={relayProfileTagTone(profile)}>{relayProfileModeLabel(profile)}</span>
+          {!isAggregateRelayProfile(profile) && profile.protocol !== "responses" ? (
+            <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(profile.protocol)}</span>
+          ) : null}
+          {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+        </strong>
+        <small>
+          {profile.relayMode === "official"
+            ? profile.officialMixApiKey
+              ? profile.baseUrl || t("未填写 URL")
+              : t("使用 Codex 当前登录的 ChatGPT 账号")
+            : relayProfileConfigBrief(profile)}
+        </small>
       </span>
       <span className="relay-card-actions">
         <Button
@@ -8536,6 +10290,14 @@ function SortableRelayProfileCard({
   );
 }
 
+/// 清单时间是 ISO 字符串（UTC），按本地时区显示成「2026-10-17 17:46」；解析失败原样返回。
+function formatMarketUpdatedAt(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function MarketScriptCard({
   script,
   actions,
@@ -8549,7 +10311,11 @@ function MarketScriptCard({
   /// 前端不重算，直接取自 user_scripts 清单；为空表示未安装或不可删除。
   installedKey?: string;
 }) {
-  const status = script.updateAvailable ? t("可更新") : script.installed ? tf("已安装 {0}", [script.installedVersion]) : t("未安装");
+  // 「未安装」是默认状态：满屏同一个徽标只是噪音，只给已安装 / 可更新打标。
+  const status = script.updateAvailable ? t("可更新") : script.installed ? tf("已安装 {0}", [script.installedVersion]) : null;
+  // 标签最多露 3 个，其余收成「+N」，否则卡片被撑成高低不齐的两三行。
+  const visibleTags = script.tags.slice(0, 3);
+  const hiddenTags = script.tags.slice(3);
   const isGitHubHomepage = script.homepage ? isGitHubRepositoryHomepage(script.homepage) : false;
   const githubSupportLabel = isGitHubHomepage ? tf("在 GitHub 上支持作者：{0}", [script.name]) : undefined;
   return (
@@ -8557,17 +10323,20 @@ function MarketScriptCard({
       <div className="script-market-title">
         <div>
           <strong>{script.name}</strong>
-          <span>{script.author || t("未知作者")}</span>
+          <span>{script.author || t("未知作者")} · v{script.version}</span>
         </div>
-        <UiBadge variant={script.updateAvailable ? "default" : script.installed ? "secondary" : "outline"}>{status}</UiBadge>
+        {status ? <UiBadge className="script-market-status" variant={script.updateAvailable ? "default" : "secondary"}>{status}</UiBadge> : null}
       </div>
       <p className="script-market-description">{script.description || t("暂无描述。")}</p>
-      <div className="script-market-tags">
-        <span className="script-market-tag">v{script.version}</span>
-        {script.tags.map((tag) => (
+      {/* 没有标签就不渲染空容器：空容器会让被拉伸的卡片在描述下露出半行（见 .script-market-card 样式注释）。 */}
+      {script.tags.length ? <div className="script-market-tags">
+        {visibleTags.map((tag) => (
           <span className="script-market-tag" key={tag}>{tag}</span>
         ))}
-      </div>
+        {hiddenTags.length ? (
+          <span className="script-market-tag script-market-tag-more" title={hiddenTags.join("、")}>+{hiddenTags.length}</span>
+        ) : null}
+      </div> : null}
       <div className="script-market-actions">
         <Button onClick={() => void actions.installMarketScript(script.id)} size="sm">
           <Download className="h-4 w-4" />
@@ -8627,6 +10396,7 @@ function RelayProfileDetail({
   onSaved?: () => void;
   actions: Actions;
 }) {
+  const detailBodyRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState<RelayProfile>(profile);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact),
@@ -8853,7 +10623,17 @@ function RelayProfileDetail({
           </Button>
         </div>
       </div>
-      <div className="relay-detail-body">
+      {!aggregateModeRequired && !isAggregateRelayProfile(draft) ? (
+        // 编辑页很长：标题栏下给一排分区跳转，点哪个就展开该分区并滚过去。
+        <nav className="relay-section-nav" aria-label={t("跳转到分区")}>
+          {relaySectionLinks().map((link) => (
+            <button key={link.id} onClick={() => jumpToRelaySection(detailBodyRef.current, link.id)} type="button">
+              {link.label}
+            </button>
+          ))}
+        </nav>
+      ) : null}
+      <div className="relay-detail-body" ref={detailBodyRef}>
         {aggregateModeRequired ? (
           <AggregateModeChooser onSelect={selectAggregateMode} />
         ) : (
@@ -8945,6 +10725,28 @@ function SortableModelWindowEntry({ id, children }: SortableModelWindowEntryProp
   );
 }
 
+/// 编辑页分区导航的条目。id 与 RelayFold 的 sectionId 一致；`basic` 是不可折叠的基础设置。
+function relaySectionLinks() {
+  return [
+    { id: "basic", label: t("基础") },
+    { id: "models", label: t("模型") },
+    { id: "requests", label: t("请求") },
+    { id: "advanced", label: t("更多选项") },
+    { id: "config-preview", label: t("配置预览") },
+  ];
+}
+
+/// 跳到编辑页某个分区：折叠着就先展开（会触发 RelayFold 记住展开状态），再滚到分区顶部。
+function jumpToRelaySection(root: HTMLElement | null, id: string) {
+  if (!root) return;
+  const target = id === "basic"
+    ? root.querySelector<HTMLElement>(".relay-basic-section")
+    : root.querySelector<HTMLElement>(`details[data-section="${id}"]`);
+  if (!target) return;
+  if (target instanceof HTMLDetailsElement && !target.open) target.open = true;
+  requestAnimationFrame(() => target.scrollIntoView({ behavior: "smooth", block: "start" }));
+}
+
 function RelayFold({ title, children, className = "", bodyClassName = "", issue, sectionId, defaultOpen = false }: {
   title: string;
   children: ReactNode;
@@ -8972,7 +10774,7 @@ function RelayFold({ title, children, className = "", bodyClassName = "", issue,
     previousIssue.current = issue;
   }, [issue]);
   return (
-    <details className={`relay-fold ${className}`.trim()} open={open} onToggle={(event) => {
+    <details className={`relay-fold ${className}`.trim()} data-section={sectionId} open={open} onToggle={(event) => {
       const next = event.currentTarget.open;
       if (next === open) return;
       setOpen(next);
@@ -9016,7 +10818,86 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [vlmTestOpen, setVlmTestOpen] = useState(false);
+  const [relayProxyUrl, setRelayProxyUrl] = useState("");
+  const [relayProxyBusy, setRelayProxyBusy] = useState(false);
+  const relayProxyProfileRef = useRef(profile);
+  relayProxyProfileRef.current = profile;
+  const relayProxyRevisionRef = useRef(0);
+  const [stabilizePromptPrefix, setStabilizePromptPrefix] = useState(false);
+  // 「高级兼容选项」分组：null = 用户没手动开合过，按是否有开启项决定。
+  const [compatOpen, setCompatOpen] = useState<boolean | null>(null);
+  const compatEnabledCount = [
+    profile.standardOpenaiProtocol,
+    stabilizePromptPrefix,
+    profile.webSearchHistoryCompat,
+    profile.trustUpstreamCatalogLite === true,
+    profile.strictResponsesReasoning === true,
+  ].filter(Boolean).length;
+  const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
+  useEffect(() => {
+    let cancelled = false;
+    const revision = ++relayProxyRevisionRef.current;
+    setRelayProxyUrl("");
+    setIndependentProxyConfigured(profile.id, false);
+    void invoke<{ status: string; proxyUrl?: string; configured?: boolean }>("load_relay_proxy", { profileId: profile.id })
+      .then((result) => {
+        if (!cancelled && revision === relayProxyRevisionRef.current && result.status === "ok") {
+          setIndependentProxyConfigured(profile.id, result.configured ?? Boolean(result.proxyUrl?.trim()));
+          setRelayProxyUrl(result.proxyUrl || "");
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [profile.id]);
+  useEffect(() => {
+    let cancelled = false;
+    setStabilizePromptPrefix(false);
+    void invoke<{ stabilizePromptPrefix?: boolean }>("load_relay_feature", { profileId: profile.id })
+      .then((result) => { if (!cancelled) setStabilizePromptPrefix(result.stabilizePromptPrefix === true); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [profile.id]);
+  const saveRelayProxy = async () => {
+    const profileId = profile.id;
+    ++relayProxyRevisionRef.current;
+    setRelayProxyBusy(true);
+    try {
+      const result = await invoke<{ status: string; message: string; configured?: boolean }>("set_relay_proxy", {
+        profileId,
+        proxyUrl: relayProxyUrl,
+      });
+      if (result.status === "ok") {
+        setIndependentProxyConfigured(profileId, result.configured ?? Boolean(relayProxyUrl.trim()));
+        const current = relayProxyProfileRef.current;
+        if (current.id === profileId) {
+          // 保存响应返回时从最新草稿重算，保留期间编辑的其它字段。
+          onProfileChange(applyRelayProfilePatchToFiles(current, { baseUrl: current.baseUrl }, { allowGenerateFiles: isNew }));
+        }
+      }
+      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
+    } finally {
+      setRelayProxyBusy(false);
+    }
+  };
+  const saveStabilizePromptPrefix = async (enabled: boolean) => {
+    setStabilizePromptPrefix(enabled);
+    setStabilizePromptPrefixBusy(true);
+    try {
+      const result = await invoke<{ status: string; message: string }>("set_relay_feature", {
+        profileId: profile.id,
+        stabilizePromptPrefix: enabled,
+      });
+      await actions.showMessage(t("前缀稳定层"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      setStabilizePromptPrefix(!enabled);
+      await actions.showMessage(t("前缀稳定层"), String(error), "failed");
+    } finally {
+      setStabilizePromptPrefixBusy(false);
+    }
+  };
   const [activeImportDraft, setActiveImportDraft] = useState<ActiveImportDraft | null>(null);
   const [metadataImportError, setMetadataImportError] = useState("");
   const [builtinMatch, setBuiltinMatch] = useState<BuiltinModelMetadataMatch | null>(null);
@@ -9185,6 +11066,10 @@ function RelayProfileEditor({
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
     );
+  };
+  // 表头「全部设为」：十几行模型的压缩比例 / 图片处理通常一样，不必逐行改。
+  const updateAllModelWindowRows = (patch: Partial<ModelWindowRow>) => {
+    setModelWindowRows(modelWindowRows.map((row) => ({ ...row, ...patch })));
   };
   // 内置命中 → 回填空窗口/压缩列的统一入口：上游获取、手动提交行名、打开导入
   // 面板都走这一条规则，不再只有「重新匹配」才回填（裁决见 builtinRowBackfillValue）。
@@ -9646,6 +11531,11 @@ function RelayProfileEditor({
                                 key.id === entry.id ? { ...key, apiKey: event.currentTarget.value } : key))}
                               placeholder={t("输入供应商的 API Key")}
                             />
+                            {apiKeyPreview(entry.apiKey) ? (
+                              <span className="relay-api-key-preview" title={t("Key 首尾预览")}>
+                                {apiKeyPreview(entry.apiKey)}
+                              </span>
+                            ) : null}
                             <Button
                               aria-label={t("删除 Key")}
                               disabled={normalizedApiKeys.apiKeys.length === 1}
@@ -9832,8 +11722,39 @@ function RelayProfileEditor({
                     <span aria-hidden="true" />
                     <span>{t("模型名称")}</span>
                     <span>{t("上下文窗口")}</span>
-                    <span>{t("自动压缩")}</span>
-                    <span>{t("图片处理方式")}</span>
+                    <span className="relay-model-head-bulk">
+                      {t("自动压缩")}
+                      <select
+                        aria-label={t("全部模型的自动压缩")}
+                        onChange={(event) => {
+                          if (event.currentTarget.value) updateAllModelWindowRows({ autoCompact: event.currentTarget.value });
+                          event.currentTarget.value = "";
+                        }}
+                        title={t("把所有模型设为同一个自动压缩比例")}
+                        value=""
+                      >
+                        <option value="">{t("全部设为…")}</option>
+                        {autoCompactOptions("").map((value) => <option key={value} value={value}>{value}</option>)}
+                      </select>
+                    </span>
+                    <span className="relay-model-head-bulk">
+                      {t("图片处理方式")}
+                      <select
+                        aria-label={t("全部模型的图片处理方式")}
+                        disabled={vlmUnsupportedProtocol}
+                        onChange={(event) => {
+                          if (event.currentTarget.value) updateAllModelWindowRows({ imageHandling: event.currentTarget.value as ModelWindowRow["imageHandling"] });
+                          event.currentTarget.value = "";
+                        }}
+                        title={t("把所有模型设为同一种图片处理方式")}
+                        value=""
+                      >
+                        <option value="">{t("全部设为…")}</option>
+                        <option value="send-as-is">{t("原样发送图片")}</option>
+                        <option value="strip">{t("移除图片")}</option>
+                        <option value="vlm">{t("视觉辅助分析")}</option>
+                      </select>
+                    </span>
                     <span>{t("思考等级")}</span>
                     <span>{t("模型配置")}</span>
                     <span aria-hidden="true" />
@@ -9934,7 +11855,7 @@ function RelayProfileEditor({
                                 setMetadataImportPreview(synchronized.preview);
                                 setMetadataImportError("");
                               }}
-                              placeholder="1M"
+                              placeholder={t("留空使用默认值")}
                             />
                           </div>
                           <div className="relay-model-cell relay-model-cell-compact">
@@ -9987,6 +11908,8 @@ function RelayProfileEditor({
                             <span className="relay-model-cell-label">{t("思考等级")}</span>
                             <ModelReasoningLevelsCell
                               levels={reasoning.levels}
+                              parameterMode={reasoningParameterMode(rowMetadataKey ? importedModelMetadata[rowMetadataKey] : undefined)}
+                              onParameterModeChange={(mode) => commitModelMetadata(setModelReasoningParameterMode(profile.modelMetadata, rowMetadataKey ?? slug, mode))}
                               inherited={!reasoning.overridden}
                               defaultLevel={reasoning.defaultLevel}
                               onChange={(levels, defaultLevel) => commitModelMetadata(
@@ -10047,6 +11970,16 @@ function RelayProfileEditor({
                                 ]}
                               />
                               <p className="field-hint">{t("按当前供应商逐模型声明。仅在上游支持 service_tier=priority 时选择支持；继承会清除自定义声明，取消不会保存修改。")}</p>
+                            </Field>
+                            <Field label={t("Responses Lite 支持")}>
+                              <AppSelect value={metadataImportPreview?.metadata.use_responses_lite === true ? "supported" : metadataImportPreview?.metadata.use_responses_lite === false ? "unsupported" : "inherit"}
+                                options={[{ value: "inherit", label: t("继承模型默认能力") }, { value: "supported", label: t("明确支持 Lite") }, { value: "unsupported", label: t("标准 Responses") }]}
+                                onChange={(value) => {
+                                  const changed = synchronizeModelMetadataLiteSupport(metadataImportDocument, slug, value as "inherit" | "supported" | "unsupported");
+                                  if (!changed) { setMetadataImportError(t("请先修正当前模型的 JSON 配置。")); return; }
+                                  setMetadataImportDocument(changed.document); setMetadataImportPreview(changed.preview); setImportPrefillSource("existing"); setMetadataImportError("");
+                                }} />
+                              <p className="field-hint">{t("保存此模型后还需保存并使用供应商；只为已核实支持 Lite 的上游选择支持。")}</p>
                             </Field>
                             <Textarea
                               autoFocus
@@ -10318,30 +12251,6 @@ function RelayProfileEditor({
               </Field>
             ) : null}
             {showApiFields ? (
-              <label
-                className={`switch-row compact relay-switch-row relay-field-standard${profile.protocol === "chatCompletions" ? "" : " is-disabled"}`}
-                title={profile.protocol === "chatCompletions" ? undefined : t("仅在上游协议为 Chat Completions 时可用。Responses API 会原样转发。")}
-              >
-                <input
-                  checked={profile.standardOpenaiProtocol}
-                  disabled={profile.protocol !== "chatCompletions"}
-                  onChange={(event) =>
-                    updateDraft({ standardOpenaiProtocol: event.currentTarget.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>
-                  <strong>{t("纯标准协议")}</strong>
-                  <small>
-                    {t("强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。")}
-                    {" "}
-                    {t("若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。")}
-                  </small>
-                </span>
-                <ToggleVisual />
-              </label>
-            ) : null}
-            {showApiFields ? (
               <Field className="relay-field-user-agent" label="User-Agent">
                 <Input
                   value={profile.userAgent}
@@ -10351,24 +12260,110 @@ function RelayProfileEditor({
               </Field>
             ) : null}
             {showApiFields ? (
-              <label
-                className={`switch-row compact relay-switch-row relay-field-search-history${profile.protocol === "responses" ? "" : " is-disabled"}`}
-                title={profile.protocol === "responses" ? undefined : t("仅限 Responses API。")}
-              >
-                <input
-                  checked={profile.webSearchHistoryCompat}
-                  disabled={profile.protocol !== "responses"}
-                  onChange={(event) =>
-                    updateDraft({ webSearchHistoryCompat: event.currentTarget.checked })
-                  }
-                  type="checkbox"
+              <Field className="relay-field-auto-review-model" label={t("自动审批模型")}>
+                <Input
+                  value={profile.autoReviewModel ?? ""}
+                  onChange={(event) => updateDraft({ autoReviewModel: event.currentTarget.value })}
+                  placeholder={t("留空则原样转发 codex-auto-review")}
                 />
-                <span>
-                  <strong>{t("搜索历史压缩兼容（实验）")}</strong>
-                  <small>response protection is unavailable</small>
-                </span>
-                <ToggleVisual />
-              </label>
+              </Field>
+            ) : null}
+            {showApiFields ? (
+              <Field className="relay-field-proxy" label={t("供应商独立代理")}>
+                <div className="relay-inline-field">
+                  <Input
+                    value={relayProxyUrl}
+                    onChange={(event) => setRelayProxyUrl(event.currentTarget.value)}
+                    placeholder="http://127.0.0.1:7890"
+                  />
+                  <Button disabled={relayProxyBusy} onClick={() => void saveRelayProxy()} size="sm" type="button" variant="secondary">
+                    {t("保存")}
+                  </Button>
+                </div>
+                <span className="hint-line">{t("留空表示使用系统代理；仅影响当前供应商的模型拉取、测试和请求。")}</span>
+              </Field>
+            ) : null}
+            {showApiFields ? (
+              // 五个兼容性开关默认都关，且只在上游明确需要时才开：收成一组，摘要上写开了几项。
+              <details
+                className="relay-compat-group"
+                open={compatOpen ?? compatEnabledCount > 0}
+                onToggle={(event) => setCompatOpen(event.currentTarget.open)}
+              >
+                <summary>
+                  <ChevronDown aria-hidden="true" className="relay-fold-chevron h-4 w-4" />
+                  <strong>{t("高级兼容选项")}</strong>
+                  <small>{compatEnabledCount ? tf("已开启 {0} 项", [compatEnabledCount]) : t("全部关闭；只在上游明确需要时开启")}</small>
+                </summary>
+                <div className="relay-compat-body">
+                {showApiFields ? (
+                  <label
+                    className={`switch-row compact relay-switch-row relay-field-standard${profile.protocol === "chatCompletions" ? "" : " is-disabled"}`}
+                    title={profile.protocol === "chatCompletions" ? undefined : t("仅在上游协议为 Chat Completions 时可用。Responses API 会原样转发。")}
+                  >
+                    <input
+                      checked={profile.standardOpenaiProtocol}
+                      disabled={profile.protocol !== "chatCompletions"}
+                      onChange={(event) =>
+                        updateDraft({ standardOpenaiProtocol: event.currentTarget.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>{t("纯标准协议")}</strong>
+                      <small>
+                        {t("强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。")}
+                        {" "}
+                        {t("若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。")}
+                      </small>
+                    </span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields ? (
+                  <label className="switch-row compact relay-switch-row">
+                    <input
+                      checked={stabilizePromptPrefix}
+                      disabled={stabilizePromptPrefixBusy}
+                      onChange={(event) => void saveStabilizePromptPrefix(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span><strong>{t("前缀稳定层")}</strong><small>{t("按供应商稳定可选历史块的顺序并移除成对 image_resize_notice；默认关闭，适合已确认上游支持的缓存场景。")}</small></span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields ? (
+                  <label
+                    className={`switch-row compact relay-switch-row relay-field-search-history${profile.protocol === "responses" ? "" : " is-disabled"}`}
+                    title={profile.protocol === "responses" ? undefined : t("仅限 Responses API。")}
+                  >
+                    <input
+                      checked={profile.webSearchHistoryCompat}
+                      disabled={profile.protocol !== "responses"}
+                      onChange={(event) =>
+                        updateDraft({ webSearchHistoryCompat: event.currentTarget.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>{t("搜索历史压缩兼容（实验）")}</strong>
+                      <small>response protection is unavailable</small>
+                    </span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields && profile.protocol === "responses" ? <>
+                  <label className="switch-row compact relay-switch-row">
+                    <input type="checkbox" checked={profile.trustUpstreamCatalogLite === true} onChange={(event) => updateDraft({ trustUpstreamCatalogLite: event.currentTarget.checked })} />
+                    <span><strong>{t("保留外部目录的 Lite 声明")}</strong><small>{t("仅在已确认上游支持时启用；保留每个模型的显式声明，不会为全部模型开启 Lite。")}</small></span><ToggleVisual />
+                  </label>
+                  <label className="switch-row compact relay-switch-row">
+                    <input type="checkbox" checked={profile.strictResponsesReasoning === true} onChange={(event) => updateDraft({ strictResponsesReasoning: event.currentTarget.checked })} />
+                    <span><strong>{t("严格 Responses 推理历史兼容")}</strong><small>{t("仅当目标上游接受当前账号的加密历史时启用。混合推理只发送可识别的加密信封；占位或无效密文会明确报错。本地记录不变。")}</small></span><ToggleVisual />
+                  </label>
+                </> : null}
+                </div>
+              </details>
             ) : null}
             {showApiFields ? (
               <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
@@ -10772,6 +12767,17 @@ function AggregateRelayProfileEditor({
       routes: [...routes, { pattern: "", profileId: aggregate.members[0]?.profileId ?? "", priority: 0 }],
     });
   };
+  // 模型聚合的最终效果：默认成员的模型以裸名发布，其余成员带 cpx- 前缀。勾选时就告诉用户 Codex 会看到什么。
+  const memberModelCount = (candidate: RelayProfile) => new Set([
+    ...candidate.modelList.split(/[\r\n,]+/).map((line) => line.trim()).filter(Boolean),
+    ...(candidate.model.trim() ? [candidate.model.trim()] : []),
+  ]).size;
+  const selectedCandidates = candidates.filter((candidate) => memberIds.has(candidate.id));
+  const defaultCandidate = selectedCandidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
+  const bareModelCount = defaultCandidate ? memberModelCount(defaultCandidate) : 0;
+  const prefixedModelCount = selectedCandidates
+    .filter((candidate) => candidate.id !== defaultCandidate?.id)
+    .reduce((sum, candidate) => sum + memberModelCount(candidate), 0);
 
   return (
     <div className="relay-profile-editor aggregate-editor" data-aggregate-mode={modelMode ? "model" : "provider"}>
@@ -10830,16 +12836,24 @@ function AggregateRelayProfileEditor({
           ))}
         </div>
       ) : (
-        <div className="aggregate-model-mode-hint">
-          <strong>{t("模型聚合已启用")}</strong>
-          <span>{t("默认成员的模型以裸名发布、其他成员带 cpx- 前缀；勾选成员后点行尾「设为默认」指定默认供应商。本模式不使用轮转策略或通配符路由。")}</span>
-        </div>
+        null
       )}
       <div className="aggregate-members">
         <div className="aggregate-members-head">
           <div>
             <strong>{t("成员供应商")}</strong>
-            <span>{t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}</span>
+            <span>
+              {modelMode
+                ? t("默认成员的模型以裸名发布，其他成员带 cpx- 前缀；悬停已勾选的成员可「设为默认」。本模式不使用轮转策略或通配符路由。")
+                : t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}
+            </span>
+            {modelMode && selectedCandidates.length ? (
+              <span className="aggregate-model-summary">
+                {defaultCandidate
+                  ? tf("Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型", [bareModelCount, defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
+                  : tf("Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错", [prefixedModelCount])}
+              </span>
+            ) : null}
           </div>
           <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
         </div>
@@ -10863,11 +12877,15 @@ function AggregateRelayProfileEditor({
                     type="checkbox"
                   />
                   <span className="aggregate-member-summary">
+                    {/* 与供应商列表一致：接入方式做成标签，第二行只放地址。 */}
                     <span className="aggregate-member-title">
                       <strong>{candidate.name || t("未命名供应商")}</strong>
+                      <span className="relay-tag" data-tone={relayProfileTagTone(candidate)}>{relayProfileModeLabel(candidate)}</span>
+                      {candidate.protocol !== "responses" ? (
+                        <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(candidate.protocol)}</span>
+                      ) : null}
                     </span>
                     <small>
-                      {relayProfileModeLabel(candidate)} · {relayProtocolLabel(candidate.protocol)} ·{" "}
                       {isOfficialLoginMemberProfile(candidate)
                         ? t("使用已登录的 ChatGPT 账号凭据")
                         : relayProfileConfigBrief(candidate)}
@@ -11708,6 +13726,48 @@ function DreamSkinUnsavedDialog({
   );
 }
 
+function UpdateDialog({ update, progress, onClose, onMuteToday, onUpdate, onOpenUrl }: {
+  update: UpdateResult;
+  progress: TaskProgress;
+  onClose: () => void;
+  onMuteToday: () => void;
+  onUpdate: () => void;
+  onOpenUrl: (url: string) => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    return () => { if (dialog?.open) dialog.close(); };
+  }, []);
+
+  return (
+    <dialog className="modal-card update-dialog" ref={dialogRef} aria-labelledby="update-dialog-title" aria-describedby="update-dialog-description" onCancel={(event) => { event.preventDefault(); onClose(); }}>
+      <div className="modal-head">
+        <div>
+          <h2 id="update-dialog-title">{tf("发现新版本 {0}", [update.latestVersion ?? ""])}</h2>
+          <p id="update-dialog-description">{tf("当前版本 {0}", [update.currentVersion])}</p>
+        </div>
+        <button className="toast-close" onClick={onClose} type="button" aria-label={t("关闭更新提示")}>×</button>
+      </div>
+      <div className="update-dialog-body">
+        <ReleaseNotes markdown={update.releaseSummary || t("发现可用更新。")} onOpenUrl={onOpenUrl} />
+      </div>
+      <TaskProgressBox completedTitle={t("上次更新结果")} progress={progress} title={t("安装包更新进度")} />
+      <p className="update-dialog-hint">{t("也可随时在“关于”页面检查和安装更新。")}</p>
+      {!update.assetName || !update.assetUrl ? <p className="update-dialog-hint">{t("此版本暂未提供适用于当前系统的安装包。")}</p> : null}
+      <Toolbar className="update-dialog-actions">
+        <Button autoFocus disabled={progress.active || !update.assetName || !update.assetUrl} onClick={onUpdate}>
+          <Download className="h-4 w-4" />
+          {progress.active ? t("正在下载安装包…") : t("立即更新")}
+        </Button>
+        <Button variant="secondary" onClick={onClose}>{t("关闭提示")}</Button>
+        <Button variant="ghost" onClick={onMuteToday}>{t("今日不再提示")}</Button>
+      </Toolbar>
+    </dialog>
+  );
+}
+
 function NoticeDialog({
   notice,
   onClose,
@@ -11764,6 +13824,45 @@ function ConfirmDialog({
             {confirm.confirmText}
           </Button>
           <Button onClick={onCancel} variant="secondary">{confirm.cancelText}</Button>
+        </Toolbar>
+      </div>
+    </div>
+  );
+}
+
+/** 切换时实时配置 endpoint 被外部改过（#2666）：让用户选导入还是放弃，不再只给报错。 */
+function LiveConflictDialog({
+  profileName,
+  onChoose,
+}: {
+  profileName: string;
+  onChoose: (choice: LiveConflictResolution | null) => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal-card confirm-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{t("实时配置已被修改")}</h2>
+          </div>
+          <button className="toast-close" onClick={() => onChoose(null)} type="button">×</button>
+        </div>
+        <div className="confirm-modal-body">
+          <p className="modal-message">
+            {tf("当前生效的 config.toml / auth.json 里的供应商地址，和「{0}」保存的不一样。可能是其它工具改过，也可能是你手动改的，Codex++ 无法自动判断该保留哪一份。", [profileName])}
+          </p>
+          <p className="modal-message">{tf("导入为新供应商：把当前生效的地址和 Key 保存成一个新供应商，「{0}」保持原样，然后继续切换。", [profileName])}</p>
+          <p className="modal-message">{tf("放弃实时改动：先把当前生效的文件备份一份，「{0}」保持原样，然后继续切换。", [profileName])}</p>
+        </div>
+        <Toolbar className="confirm-modal-actions">
+          <Button onClick={() => onChoose("importAsNewProfile")}>
+            <Download className="h-4 w-4" />
+            {t("导入为新供应商")}
+          </Button>
+          <Button onClick={() => onChoose("discardLiveChanges")} variant="secondary">
+            {t("放弃实时改动、继续切换")}
+          </Button>
+          <Button onClick={() => onChoose(null)} variant="ghost">{t("取消")}</Button>
         </Toolbar>
       </div>
     </div>
@@ -11883,10 +13982,14 @@ function PendingProviderImportDialog({
 
 function DreamSkinCommunityLinkDialog({
   versionId,
+  installBlocked,
+  installPending,
   onConfirm,
   onDismiss,
 }: {
   versionId: string;
+  installBlocked: boolean;
+  installPending: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
 }) {
@@ -11898,7 +14001,7 @@ function DreamSkinCommunityLinkDialog({
             <h2>{t("从 DreamSkin.cc 安装主题")}</h2>
             <p>{t("检测到网页一键换肤请求。确认后会从固定社区 API 下载，并在本机重新校验大小、SHA-256、ZIP 清单与 Safe CSS。")}</p>
           </div>
-          <button className="toast-close" onClick={onDismiss} type="button">×</button>
+          <button aria-label={t("关闭")} className="toast-close" disabled={installPending} onClick={onDismiss} type="button">×</button>
         </div>
         <div className="metric-list">
           <Metric label={t("主题版本 ID")} value={versionId} />
@@ -11908,26 +14011,32 @@ function DreamSkinCommunityLinkDialog({
           {t("链接不能携带任意下载地址、文件路径或命令；安装后主题会进入“我的主题”，不会自动重启 Codex。")}
         </div>
         <Toolbar>
-          <Button onClick={onConfirm}>
-            <Download className="h-4 w-4" />
-            {t("下载并安装")}
+          <Button aria-busy={installPending} disabled={installBlocked} onClick={onConfirm}>
+            {installPending
+              ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+              : <Download className="h-4 w-4" />}
+            {installPending ? t("安装中…") : t("下载并安装")}
           </Button>
-          <Button onClick={onDismiss} variant="secondary">{t("取消")}</Button>
+          <Button disabled={installPending} onClick={onDismiss} variant="secondary">{t("取消")}</Button>
         </Toolbar>
+        {installPending ? <DreamSkinInstallProgress /> : null}
+        {installBlocked && !installPending ? (
+          <div className="hint-line" role="status">{t("其他主题正在安装，请等待完成后再安装此主题。")}</div>
+        ) : null}
       </div>
     </div>
   );
 }
 
 function TaskProgressBox({ progress, title, completedTitle = t("上次修复结果") }: { progress: TaskProgress; title: string; completedTitle?: string }) {
-  if (!progress.active && progress.percent <= 0) return null;
+  if (!progress.active && progress.percent <= 0 && !progress.failed) return null;
   return (
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
         <strong>{progress.active ? title : completedTitle}</strong>
-        <span>{progress.indeterminate ? null : `${formatProgressPercent(progress.percent)}%`}</span>
+        <span>{progress.indeterminate || progress.failed ? null : `${formatProgressPercent(progress.percent)}%`}</span>
       </div>
-      <div
+      {!progress.failed ? <div
         aria-valuemax={100}
         aria-valuemin={0}
         aria-valuenow={progress.indeterminate ? undefined : progress.percent}
@@ -11939,7 +14048,7 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
           className="provider-sync-progress-fill"
           style={progress.indeterminate ? undefined : { width: `${progress.percent}%` }}
         />
-      </div>
+      </div> : null}
       <small>{progress.message}</small>
     </div>
   );
@@ -11968,19 +14077,54 @@ type ClaudeLocalizationStatus = {
   catalogEntries: number;
   voiceInput: boolean;
   localization: boolean;
+  computerUse: boolean;
+  /** 当前平台能否真正应用 Computer Use；Windows 为 false（#2673）。 */
+  computerUseSupported: boolean;
 };
 
+/**
+ * Claude 增强页跨挂载的记忆：Codex++ 运行期间只在第一次进入时自动检测一次，
+ * 之后再进来直接显示上次结果，需要时手动点「检测 Claude」刷新。
+ *
+ * 检测已在后台线程跑、带 15 秒超时，未安装 Claude 时直接早退（#2539 的死机不会再现），
+ * 所以首次进入自动检测是安全的；但每次切回来都重新探测进程和运行时没有必要。
+ */
+const claudeLocalizationMemo: {
+  status: CommandResult<ClaudeLocalizationStatus> | null;
+  autoDetected: boolean;
+} = { status: null, autoDetected: false };
+
 function ClaudeLocalizationScreen() {
-  const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(claudeLocalizationMemo.status);
+  // 首次进入会自动检测：初值就标成检测中，免得第一帧先闪出「点击重试」。
+  const [busy, setBusy] = useState<string | null>(claudeLocalizationMemo.autoDetected ? null : "detect");
   const [error, setError] = useState<string | null>(null);
+  /** 制作增强版时宿主推送的阶段进度（0-100）。 */
+  const [progress, setProgress] = useState<{ percent: number; message: string } | null>(null);
   const mounted = useRef(true);
   const pending = useRef(false);
+  /**
+   * 页头右上角的操作槽：「启动增强版」放在和 Codex 页「启动 Codex」相同的位置。
+   * 页头与本页都按路由重建、同一次提交挂载，所以在 layout effect 里取，首帧绘制前就到位。
+   */
+  const [topbarSlot, setTopbarSlot] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    setTopbarSlot(document.querySelector<HTMLElement>("[data-topbar-actions]"));
+  }, []);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ percent: number; message: string }>("claude-localization-progress", (event) => {
+      if (mounted.current) setProgress(event.payload);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
   const accept = (result: CommandResult<ClaudeLocalizationStatus>) => {
+    // 先记下有效结果再判断挂载：检测中切走页面，回来时仍能看到这次的结果。
+    if (result.status === "ok") claudeLocalizationMemo.status = result;
     if (!mounted.current) return;
     if (result.status === "ok") setStatus(result);
     else setError(result.message);
@@ -11996,10 +14140,16 @@ function ClaudeLocalizationScreen() {
       if (mounted.current) setBusy(null);
     }
   };
+  useEffect(() => {
+    if (claudeLocalizationMemo.autoDetected) return;
+    claudeLocalizationMemo.autoDetected = true;
+    void refresh();
+  }, []);
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
     if (pending.current) return;
     pending.current = true;
     setBusy(action); setError(null);
+    if (action === "prepare") setProgress({ percent: 0, message: t("准备开始…") });
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_action", { action });
       // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
@@ -12009,6 +14159,7 @@ function ClaudeLocalizationScreen() {
     finally {
       pending.current = false;
       if (mounted.current) setBusy(null);
+      if (action === "prepare") setTimeout(() => { if (mounted.current) setProgress(null); }, 1500);
     }
   };
   const toggleVoiceInput = async (enabled: boolean) => {
@@ -12022,6 +14173,22 @@ function ClaudeLocalizationScreen() {
       );
       // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
       // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      accept(result);
+    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
+  const toggleComputerUse = async (enabled: boolean) => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy("computerUse"); setError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
+        "claude_localization_set_computer_use",
+        { enabled },
+      );
       accept(result);
     } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
     finally {
@@ -12053,14 +14220,123 @@ function ClaudeLocalizationScreen() {
   const statusText = busy === "detect" ? t("检测中…") : !s ? t("未检测") : !s.supported ? t("未检测到 Claude") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备");
   return (
     <div className="claude-localization-page">
-      {/* 左栏：增强项。每一项都跑在右边的受管副本上，汉化只是其中之一。 */}
-      <div className="claude-l10n-column">
+      {topbarSlot
+        ? createPortal(
+            <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")} title={t("启动增强版")}>
+              <Rocket className="h-4 w-4" />
+              {busy === "launch" ? t("启动中…") : t("启动增强版")}
+            </Button>,
+            topbarSlot,
+          )
+        : null}
+      {/* 顶部通栏：所有增强共同的前置条件。状态和操作放在第一屏，不用滚动就能点到。 */}
+      <Panel className="claude-l10n-hero">
+        <CardContent className="claude-l10n-hero-body">
+          <div className="claude-l10n-hero-head">
+            <div className="claude-l10n-hero-title">
+              <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
+              <div>
+                <strong>{t("受管增强版")}</strong>
+                <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
+              </div>
+            </div>
+            <span className={`claude-l10n-status claude-l10n-status-${statusTone}`}>
+              <i aria-hidden="true" />
+              {statusText}
+            </span>
+          </div>
+          {/* 三步进度：原来右栏的「上手步骤」收成一排，完成的步骤打勾。 */}
+          <ol className="claude-l10n-progress-steps">
+            <li data-done={s?.prepared ? "true" : "false"}>
+              <span aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
+              <div><strong>{t("制作增强版")}</strong><small>{t("官方 Claude.app 与 app.asar 保持原样")}</small></div>
+            </li>
+            <li data-done={s?.running ? "true" : "false"}>
+              <span aria-hidden="true">{s?.running ? "✓" : "2"}</span>
+              <div><strong>{t("启动增强版")}</strong><small>{t("右上角启动，增强在启动时注入")}</small></div>
+            </li>
+            <li data-done="false">
+              <span aria-hidden="true">3</span>
+              <div><strong>{t("开启需要的增强")}</strong><small>{t("下方各项独立开关，重启副本后应用")}</small></div>
+            </li>
+          </ol>
+          {/* 版本与词表信息只作参考，收成一行小字。 */}
+          <dl className="claude-l10n-meta">
+            <div><dt>{t("官方版本")}</dt><dd title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</dd></div>
+            <div><dt>{t("副本版本")}</dt><dd title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</dd></div>
+            <div><dt>{t("外壳语言")}</dt><dd>{s?.shellLocale || t("未设置")}</dd></div>
+            <div><dt>{t("官方词条")}</dt><dd>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</dd></div>
+          </dl>
+          {s?.supported && !s.prepared ? (
+            <p className="claude-l10n-hint">
+              <Info className="h-4 w-4" />
+              {t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}
+            </p>
+          ) : null}
+          {!s ? (
+            <p className="claude-l10n-hint">
+              {busy === "detect"
+                ? t("正在读取 Claude 安装状态，只读检测，不会修改应用。")
+                : t("没有读到安装状态，点击“检测 Claude”重试；检测不会修改应用。")}
+            </p>
+          ) : !s.supported ? (
+            <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
+          ) : null}
+          {error ? <div className="claude-l10n-error" role="alert">{error}</div> : null}
+          {progress ? (
+            <div
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={progress.percent}
+              className="claude-l10n-progress"
+              role="progressbar"
+            >
+              <div className="claude-l10n-progress-head">
+                <span>{progress.message || t("处理中…")}</span>
+                <span className="claude-l10n-progress-pct">{progress.percent}%</span>
+              </div>
+              <div className="claude-l10n-progress-track">
+                <div
+                  className="claude-l10n-progress-fill"
+                  style={{ width: `${Math.min(100, Math.max(2, progress.percent))}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
+          {/* 制作在左，检测类的次要操作收在右边，窄时整组换行而不是剩一个按钮掉下去。启动在页头右上角。 */}
+          <div className="claude-l10n-actions">
+            <div className="claude-l10n-actions-primary">
+            <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
+              <PackageOpen className="h-4 w-4" />
+              {busy === "prepare"
+                ? t("制作中…")
+                : s?.needsRebuild
+                  ? t("更新副本")
+                  : s?.prepared
+                    ? t("重新制作增强版")
+                    : t("制作增强版")}
+            </Button>
+            </div>
+            <div className="claude-l10n-actions-secondary">
+              <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
+                <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
+                {busy === "detect" ? t("检测中…") : t("检测 Claude")}
+              </Button>
+              <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
+                <ShieldCheck className="h-4 w-4" />{t("检查增强版")}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Panel>
+      {/* 增强项铺满整行、三列并排：每一项都跑在上方的受管副本上，汉化只是其中之一。 */}
+      <div className="claude-l10n-column claude-l10n-features">
         <Panel>
           <CardHead
             title={t("增强功能")}
             detail={t("各自独立开关，互不影响；副本只是它们共同的前置条件，改动在重启副本后应用。")}
           />
-          <CardContent>
+          <CardContent className="claude-l10n-feature-grid">
             <label className="switch-row compact">
               <input
                 checked={Boolean(s?.localization)}
@@ -12087,109 +14363,86 @@ function ClaudeLocalizationScreen() {
               </span>
               <ToggleVisual />
             </label>
+            <label className="switch-row compact">
+              <input
+                checked={Boolean(s?.computerUse)}
+                disabled={busy !== null || !s?.supported || s?.computerUseSupported === false}
+                onChange={(event) => void toggleComputerUse(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("Computer Use")}</strong>
+                <small>{s?.computerUseSupported === false
+                  ? t("暂仅支持 macOS：Windows 的副本构建流程不会改写 app.asar，打开这个开关不会有任何效果。")
+                  : t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次启动增强版会提示授权辅助功能与屏幕录制。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
-                {t("副本还没准备：开关会先存下来，等你在右边准备好副本并启动后生效。")}
+                {t("增强版还没制作：开关会先存下来，等你在上方制作好增强版并启动后生效。")}
               </p>
             ) : null}
           </CardContent>
         </Panel>
       </div>
-      {/* 右栏：所有增强共同的前置条件。 */}
-      <div className="claude-l10n-column">
-      <Panel className="claude-l10n-hero">
-        <CardContent>
-          <div className="claude-l10n-hero-head">
-            <div className="claude-l10n-hero-title">
-              <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
-              <div>
-                <strong>{t("受管副本")}</strong>
-                <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
-              </div>
-            </div>
-            <span className={`claude-l10n-status claude-l10n-status-${statusTone}`}>
-              <i aria-hidden="true" />
-              {statusText}
-            </span>
-          </div>
-          <div className="claude-l10n-steps" role="list">
-            <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("准备副本")}</strong>
-                <small>{t("用下面的按钮创建受管副本；官方 Claude.app 与 app.asar 保持原样。")}</small>
-              </div>
-            </div>
-            <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("启动 Claude 副本")}</strong>
-                <small>{t("增强只在副本里生效，官方版和登录态不受影响。")}</small>
-              </div>
-            </div>
-            <div className="claude-l10n-step" role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">3</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("在左边开启需要的增强")}</strong>
-                <small>{t("界面汉化与语音输入各自独立，改动在重启副本后应用。")}</small>
-              </div>
-            </div>
-          </div>
-          <div className="claude-l10n-stats">
-            <div className="claude-l10n-stat">
-              <span>{t("官方版本")}</span>
-              <strong title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("副本版本")}</span>
-              <strong title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("外壳语言")}</span>
-              <strong>{s?.shellLocale || t("未设置")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("官方词条")}</span>
-              <strong>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</strong>
-            </div>
-          </div>
-          <div className="claude-l10n-note" role="note">
-            <Info className="h-4 w-4" />
-            <span>{t("首次准备会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
-          </div>
-          {!s ? (
-            <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
-          ) : !s.supported ? (
-            <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
-          ) : null}
-          {error ? <div className="inline-error">{error}</div> : null}
-          <div className="claude-l10n-actions">
-            <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
-              <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
-              {busy === "detect" ? t("检测中…") : t("检测 Claude")}
-            </Button>
-            <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
-              <PackageOpen className="h-4 w-4" />
-              {busy === "prepare"
-                ? t("准备中…")
-                : s?.needsRebuild
-                  ? t("更新副本")
-                  : s?.prepared
-                    ? t("重新准备副本")
-                    : t("准备副本")}
-            </Button>
-            <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
-              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动 Claude 副本")}
-            </Button>
-            <div className="claude-l10n-actions-secondary">
-              <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
-                <RefreshCw className="h-4 w-4" />{t("检查副本")}
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Panel>
+    </div>
+  );
+}
+
+/// 设置行：左边标题 + 一句短说明，右边控件；长说明放进悬停提示（`detail`）。
+/// `stacked` 时控件放到说明下方，给状态码编辑、多行输入这类宽控件用。
+function SettingRow({ title, description, detail, stacked = false, children }: {
+  title: ReactNode;
+  description?: ReactNode;
+  detail?: string;
+  stacked?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className={`setting-row${stacked ? " setting-row-stacked" : ""}`} title={detail}>
+      <div className="setting-row-copy">
+        <strong>{title}</strong>
+        {description ? <span>{description}</span> : null}
       </div>
+      {children ? <div className="setting-row-control">{children}</div> : null}
+    </div>
+  );
+}
+
+/// 标题栏右侧带开关的卡片头：开关关闭时，卡片里的设置整块收起，只留一行提示。
+function SwitchPanelHead({ title, detail, checked, onChange, label }: {
+  title: string;
+  detail: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <CardHeader className="panel-head switch-panel-head">
+      <div className="switch-panel-head-copy">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{detail}</CardDescription>
+      </div>
+      <label className="switch-row compact relay-master-switch-compact">
+        <input aria-label={label} checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} type="checkbox" />
+        <span>{checked ? t("已开启") : t("已关闭")}</span>
+        <ToggleVisual />
+      </label>
+    </CardHeader>
+  );
+}
+
+/// 带状态图标的小卡片，与概览页健康检查同一套样式。
+function HealthTile({ item }: { item: ReturnType<typeof healthItems>[number] }) {
+  return (
+    <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`}>
+      <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
+      <div>
+        <strong>{item.title}</strong>
+        <span title={item.detail}>{item.detail}</span>
+      </div>
+      <Badge status={item.status} />
     </div>
   );
 }
@@ -12400,139 +14653,19 @@ function GrokScreen({
   const live = result?.live;
 
   return (
-    <>
-      <Panel className="grok-panel">
-        <CardHead
-          title={t("Grok 供应商")}
-          detail={t("每个供应商对应一套 Base URL + API Key + 模型列表。")}
-        />
-        <CardContent>
-          <div className="toolbar">
-            <Button disabled={loading} onClick={() => void refresh()} variant="outline">
-              <RefreshCw className="h-4 w-4" />
-              {loading ? t("刷新中") : t("刷新")}
-            </Button>
-            <Button onClick={() => void addProfile()} variant="outline">
-              <Plus className="h-4 w-4" />
-              {t("新增供应商")}
-            </Button>
-            <Button
-              disabled={saving || !draftDirty}
-              onClick={() => void saveDraft()}
-              title={draftDirty ? undefined : t("没有需要保存的修改")}
-              variant="outline"
-            >
-              <Save className="h-4 w-4" />
-              {saving ? t("保存中") : t("保存此供应商")}
-            </Button>
-            <Button
-              disabled={!activeProfile || applying || draftDirty}
-              onClick={() => setConfirming(true)}
-              title={
-                !activeProfile
-                  ? t("请先选择一个供应商")
-                  : draftDirty
-                    ? t("请先保存当前修改")
-                    : undefined
-              }
-            >
-              <Play className="h-4 w-4" />
-              {applying ? t("应用中") : t("应用到 Grok")}
-            </Button>
+    <div className="grok-page-layout">
+      {/* 最重要的是 Grok 实际生效的配置：放最上面，刷新跟它放在一起。 */}
+      <Panel className="grok-panel grok-live-panel">
+        <CardHeader className="panel-head grok-head">
+          <div>
+            <CardTitle>{t("Grok 当前配置")}</CardTitle>
+            <CardDescription>{live?.configPath || t("读取 ~/.grok/config.toml")}</CardDescription>
           </div>
-
-          {profiles.length === 0 ? (
-            <div className="grok-empty">
-              <Blocks className="h-5 w-5" aria-hidden="true" />
-              <div>
-                <strong>{t("还没有 Grok 供应商")}</strong>
-                <span>{t("点「新增供应商」，填好 Base URL、API Key 和模型列表，再点「应用到 Grok」。")}</span>
-              </div>
-            </div>
-          ) : (
-            <div className="grok-provider-list">
-              {profiles.map((profile) => {
-                const selected = profile.id === activeId;
-                const modelCount = profile.modelList.split(/[\r\n,]+/).filter((line) => line.trim()).length;
-                const endpoint = profile.upstreamBaseUrl || profile.baseUrl;
-                return (
-                  <div className={`grok-provider-row ${selected ? "active" : ""}`} key={profile.id}>
-                    <button
-                      className="grok-provider-pick"
-                      onClick={() => void selectProfile(profile.id)}
-                      type="button"
-                    >
-                      <span className="grok-provider-name">
-                        {profile.name}
-                        {selected ? <span className="grok-provider-badge">{t("使用中")}</span> : null}
-                      </span>
-                      <span className="grok-provider-url">
-                        {endpoint || t("未填写 Base URL")}
-                      </span>
-                    </button>
-                    <span className="grok-provider-models">{tf("{0} 个模型", [String(modelCount)])}</span>
-                    <Button
-                      onClick={() => void removeProfile(profile.id)}
-                      size="icon"
-                      title={t("删除供应商")}
-                      variant="outline"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </CardContent>
-      </Panel>
-
-      {draft ? (
-        <Panel className="grok-panel">
-          <CardHead title={t("编辑供应商")} detail={draft.name} />
-          <CardContent>
-            <div className="grok-provider-editor">
-              <Field label={t("名称")}>
-                <Input
-                  onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })}
-                  value={draft.name}
-                />
-              </Field>
-              <Field label="Base URL">
-                <Input
-                  onChange={(event) => setDraft({ ...draft, upstreamBaseUrl: event.currentTarget.value })}
-                  placeholder="https://your-endpoint.example/v1"
-                  value={draft.upstreamBaseUrl}
-                />
-              </Field>
-              <Field label="API Key">
-                <Input
-                  onChange={(event) => setDraft({ ...draft, apiKey: event.currentTarget.value })}
-                  placeholder={t("留空则不改动 Grok 里已有的 Key")}
-                  type="password"
-                  value={draft.apiKey}
-                />
-              </Field>
-              <Field label={t("模型列表")}>
-                <Textarea
-                  onChange={(event) => setDraft({ ...draft, modelList: event.currentTarget.value })}
-                  placeholder={"grok-4.5[1M]\ngrok-4.1-fast"}
-                  rows={4}
-                  value={draft.modelList}
-                />
-              </Field>
-            </div>
-            <p className="muted-line">
-              {t("每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。")}
-              {" "}
-              {t("改完点「保存此供应商」，再点「应用到 Grok」生效。")}
-            </p>
-          </CardContent>
-        </Panel>
-      ) : null}
-
-      <Panel className="grok-panel">
-        <CardHead title={t("Grok 当前配置")} detail={live?.configPath || t("读取 ~/.grok/config.toml")} />
+          <Button disabled={loading} onClick={() => void refresh()} size="sm" variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            {loading ? t("刷新中") : t("刷新")}
+          </Button>
+        </CardHeader>
         <CardContent>
           {live ? (
             <div className="grok-live-grid">
@@ -12561,6 +14694,152 @@ function GrokScreen({
         </CardContent>
       </Panel>
 
+      {/* 左边选供应商，右边编辑；按钮各归各：新增在列表头，保存与应用在编辑区头。 */}
+      <div className="grok-workspace">
+        <Panel className="grok-panel grok-list-panel">
+          <CardHeader className="panel-head grok-head">
+            <div>
+              <CardTitle>{t("Grok 供应商")}</CardTitle>
+              <CardDescription>{t("每个供应商对应一套 Base URL + API Key + 模型列表。")}</CardDescription>
+            </div>
+            <Button onClick={() => void addProfile()} size="sm" variant="outline">
+              <Plus className="h-4 w-4" />
+              {t("新增")}
+            </Button>
+          </CardHeader>
+          <CardContent>
+          {profiles.length === 0 ? (
+            <div className="grok-empty">
+              <Blocks className="h-5 w-5" aria-hidden="true" />
+              <div>
+                <strong>{t("还没有 Grok 供应商")}</strong>
+                <span>{t("点「新增供应商」，填好 Base URL、API Key 和模型列表，再点「应用到 Grok」。")}</span>
+              </div>
+            </div>
+          ) : (
+            <div className="grok-provider-list">
+              {profiles.map((profile) => {
+                const selected = profile.id === activeId;
+                const modelCount = profile.modelList.split(/[\r\n,]+/).filter((line) => line.trim()).length;
+                const endpoint = profile.upstreamBaseUrl || profile.baseUrl;
+                return (
+                  <div className={`grok-provider-row ${selected ? "active" : ""}`} key={profile.id}>
+                    {/* 与 Codex 供应商列表同一套：两字头像 + 名称 / 地址，删除悬停才出现。 */}
+                    <button
+                      className="grok-provider-pick"
+                      onClick={() => void selectProfile(profile.id)}
+                      type="button"
+                    >
+                      <span className="relay-index" aria-hidden="true">{providerInitial(profile.name)}</span>
+                      <span className="grok-provider-text">
+                        <span className="grok-provider-name">
+                          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+                          {selected ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+                        </span>
+                        {/* 左列较窄：模型数放进第二行，给名称留出空间。 */}
+                        <span className="grok-provider-url">
+                          {endpoint || t("未填写 Base URL")} · {tf("{0} 个模型", [String(modelCount)])}
+                        </span>
+                      </span>
+                    </button>
+                    <Button
+                      className="grok-provider-delete"
+                      onClick={() => void removeProfile(profile.id)}
+                      size="icon"
+                      title={t("删除供应商")}
+                      variant="ghost"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          </CardContent>
+        </Panel>
+
+        <Panel className="grok-panel grok-editor-panel">
+          <CardHeader className="panel-head grok-head">
+            <div>
+              <CardTitle>{draft ? draft.name || t("未命名供应商") : t("编辑供应商")}</CardTitle>
+              <CardDescription>
+                {!draft ? t("在左边选一个供应商") : draftDirty ? t("有未保存修改") : t("改完先保存，再应用到 Grok 生效")}
+              </CardDescription>
+            </div>
+            <div className="grok-editor-actions">
+              <Button
+                disabled={saving || !draftDirty}
+                onClick={() => void saveDraft()}
+                size="sm"
+                title={draftDirty ? undefined : t("没有需要保存的修改")}
+                variant="outline"
+              >
+                <Save className="h-4 w-4" />
+                {saving ? t("保存中") : t("保存")}
+              </Button>
+              <Button
+                disabled={!activeProfile || applying || draftDirty}
+                onClick={() => setConfirming(true)}
+                size="sm"
+                title={
+                  !activeProfile
+                    ? t("请先选择一个供应商")
+                    : draftDirty
+                      ? t("请先保存当前修改")
+                      : undefined
+                }
+              >
+                <Play className="h-4 w-4" />
+                {applying ? t("应用中") : t("应用到 Grok")}
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {draft ? (
+              <>
+                <div className="grok-provider-editor">
+              <Field label={t("名称")}>
+                <Input
+                  onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })}
+                  value={draft.name}
+                />
+              </Field>
+                  <div className="grok-editor-pair">
+              <Field label="Base URL">
+                <Input
+                  onChange={(event) => setDraft({ ...draft, upstreamBaseUrl: event.currentTarget.value })}
+                  placeholder="https://your-endpoint.example/v1"
+                  value={draft.upstreamBaseUrl}
+                />
+              </Field>
+              <Field label="API Key">
+                <Input
+                  onChange={(event) => setDraft({ ...draft, apiKey: event.currentTarget.value })}
+                  placeholder={t("留空则不改动 Grok 里已有的 Key")}
+                  type="password"
+                  value={draft.apiKey}
+                />
+              </Field>
+                  </div>
+              <Field label={t("模型列表")}>
+                <Textarea
+                  onChange={(event) => setDraft({ ...draft, modelList: event.currentTarget.value })}
+                  placeholder={"grok-4.5[1M]\ngrok-4.1-fast"}
+                  rows={4}
+                  value={draft.modelList}
+                />
+              </Field>
+                </div>
+                <p className="muted-line">{t("每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。")}</p>
+              </>
+            ) : (
+              <p className="muted-line">{t("还没有选中的供应商。")}</p>
+            )}
+          </CardContent>
+        </Panel>
+      </div>
+
       {confirming ? (
         <ConfirmDialog
           confirm={{            title: t("应用到 Grok？"),
@@ -12575,7 +14854,7 @@ function GrokScreen({
           onConfirm={() => void applyToGrok()}
         />
       ) : null}
-    </>
+    </div>
   );
 }
 
@@ -12589,6 +14868,8 @@ function ApplicationRail({
   onSelect,
   onNavigate,
   onToggleTheme,
+  pendingUpdateVersion,
+  onOpenUpdate,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
@@ -12598,39 +14879,69 @@ function ApplicationRail({
   onSelect: (toolId: ToolId) => void;
   onNavigate: (route: Route) => void;
   onToggleTheme: () => void;
+  /** 后台检查到的新版本号；没有新版本时为 null。 */
+  pendingUpdateVersion: string | null;
+  onOpenUpdate: () => void;
 }) {
   const languageLabel = getLanguage() === "en" ? t("切换到中文") : t("切换到英文");
   const themeLabel = theme === "dark" ? t("切换到浅色") : t("切换到深色");
+  const renderNavItem = (routeId: Route) => {
+    const item = routes.find((candidate) => candidate.id === routeId);
+    if (!item) return null;
+    const Icon = item.icon;
+    const selected = route === item.id;
+    return (
+      <button
+        aria-current={selected ? "page" : undefined}
+        aria-label={item.label}
+        className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
+        key={item.id}
+        onClick={() => onNavigate(item.id)}
+        title={item.label}
+        type="button"
+      >
+        <Icon aria-hidden="true" className="rail-nav-icon" />
+      </button>
+    );
+  };
   return (
     <aside className="app-rail">
+      {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。
+          有新版本时右上角挂一个更新角标（独立按钮，不能嵌在 logo 按钮里），点角标弹出更新框。 */}
+      <div className="rail-brand-wrap">
+        <button
+          aria-label={t("Codex++ 概览")}
+          className="rail-brand"
+          onClick={() => onNavigate("overview")}
+          title="Codex++"
+          type="button"
+        >
+          <img alt="" draggable={false} src={APP_LOGO_URL} />
+        </button>
+        {pendingUpdateVersion ? (
+          <button
+            aria-label={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            className="rail-update-badge"
+            onClick={onOpenUpdate}
+            title={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            type="button"
+          >
+            <ArrowUp aria-hidden="true" strokeWidth={3} />
+          </button>
+        ) : null}
+      </div>
       <ToolSwitcher
         tools={tools}
         activeTool={activeTool}
         codexAppRunning={codexAppRunning}
         showSelection={!globalNavigationRoutes.includes(route)}
         onSelect={onSelect}
-      />
+      >
+        {railAgentGroupRoutes.map(renderNavItem)}
+      </ToolSwitcher>
       <div className="rail-bottom">
         <nav className="rail-navigation" aria-label={t("系统")}>
-          {globalNavigationRoutes.map((routeId) => {
-            const item = routes.find((candidate) => candidate.id === routeId);
-            if (!item) return null;
-            const Icon = item.icon;
-            const selected = route === item.id;
-            return (
-              <button
-                aria-current={selected ? "page" : undefined}
-                aria-label={item.label}
-                className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
-                key={item.id}
-                onClick={() => onNavigate(item.id)}
-                title={item.label}
-                type="button"
-              >
-                <Icon aria-hidden="true" className="rail-nav-icon" />
-              </button>
-            );
-          })}
+          {globalNavigationRoutes.filter((routeId) => !railAgentGroupRoutes.includes(routeId)).map(renderNavItem)}
         </nav>
         <div className="rail-preferences">
           <button
@@ -12669,12 +14980,15 @@ function ToolSwitcher({
   codexAppRunning,
   showSelection = true,
   onSelect,
+  children,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
   codexAppRunning: boolean;
   showSelection?: boolean;
   onSelect: (toolId: ToolId) => void;
+  /** 排在 Agent 图标之后的同组入口。 */
+  children?: ReactNode;
 }) {
   return (
     <nav className="tool-switcher" aria-label={t("工具切换")}>
@@ -12705,10 +15019,10 @@ function ToolSwitcher({
             ) : (
               <Blocks aria-hidden="true" className="tool-chip-icon" />
             )}
-            {running ? <span aria-hidden="true" className="tool-chip-running-dot" /> : null}
           </button>
         );
       })}
+      {children}
     </nav>
   );
 }
@@ -12927,8 +15241,10 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
-    claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
-    relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
+    claudeRelay: t("管理 Claude Code 的 API 供应商，切换时写入 ~/.claude/settings.json"),
+    claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
+    relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
+    requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP 服务器与插件"),
     skills: t("从 GitHub 仓库安装 Skill 到 Codex"),
@@ -12940,9 +15256,11 @@ function routeSubtitle(route: Route) {
     recommendations: t("普通推荐内容"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
     agentCollaboration: t("连接 Codex、DeepSeek Harness 与 Claude Code，派发任务并查看结果。"),
+    computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
-    settings: t("主题和启动参数"),
+    settings: t("主题、配置备份与配置文件路径，不随 Agent 变化"),
+    agentSettings: t("当前 Agent 的专属设置"),
   };
   return subtitles[route];
 }
@@ -12950,7 +15268,7 @@ function routeSubtitle(route: Route) {
 const contextKindOptions: Array<{ kind: ContextKind; label: string; tableName: string }> = [
   { kind: "mcp", label: "MCP", tableName: "mcp_servers" },
   { kind: "skill", label: "Skills", tableName: "skills" },
-  { kind: "plugin", label: t("插件"), tableName: "plugins" },
+  { kind: "plugin", get label() { return t("插件"); }, tableName: "plugins" },
 ];
 
 function contextKindLabel(kind: ContextKind) {
@@ -13535,9 +15853,9 @@ function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, 
   return profile.id === form.activeRelayId ? t("当前正在使用") : t("编辑后保存列表，再切换模式时会使用新配置");
 }
 
+/// 供应商头像上的两个字，规则见 provider-name.ts 的 providerAvatarText。
 function providerInitial(name: string) {
-  const trimmed = (name || t("供应商")).trim();
-  return Array.from(trimmed)[0]?.toUpperCase() || t("供");
+  return providerAvatarText(name, t("供"));
 }
 
 function statusLabel(status: string) {
@@ -13557,6 +15875,8 @@ function statusLabel(status: string) {
     not_implemented: t("未实现"),
     disabled: t("已禁用"),
     stopped: t("未运行"),
+    waiting: t("等待启动"),
+    off: t("未启用"),
     connected: t("已连接"),
     disconnected: t("未连接"),
     unknown: t("未知"),
@@ -13566,6 +15886,7 @@ function statusLabel(status: string) {
 
 function statusClass(status: string) {
   if (["found", "installed", "ok", "running", "running_degraded", "connected"].includes(status)) return "good";
+  if (status === "waiting" || status === "off") return "idle";
   if (["failed", "missing"].includes(status)) return "bad";
   return "warn";
 }
@@ -13585,28 +15906,55 @@ function truncateSessionDeletePreview(value: string) {
   return normalized.length > 20 ? `${normalized.slice(0, 20)}...` : normalized;
 }
 
-function healthItems(overview: OverviewResult | null) {
+/// 概览健康检查的各项。每项带自己的图标；本地服务器与协议转换拆成两项：
+/// 协议转换跑在本地服务器里，但两者状态独立（服务器在跑、转换没开是常态）。
+function healthItems(overview: OverviewResult | null): Array<{ title: string; status: string; ok: boolean; detail: string; icon: LucideIcon }> {
   const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled;
-  const conversionDetail = typeof conversionEnabled === "boolean"
-    ? t(conversionEnabled ? "协议转换已启用" : "协议转换未启用")
-    : undefined;
-  const serviceItem = (title: string, state: RuntimeServiceState | undefined, extraDetail?: string) => ({
+  const serviceItem = (title: string, state: RuntimeServiceState | undefined, icon: LucideIcon) => ({
     title,
     status: state?.status ?? "not_checked",
     ok: ["running", "connected", "disabled"].includes(state?.status ?? ""),
-    detail: state ? [state.address, t(state.message), extraDetail].filter(Boolean).join(" · ") : t("等待状态检查"),
+    detail: state ? [state.address, t(state.message)].filter(Boolean).join(" · ") : t("等待状态检查"),
+    icon,
   });
+  // 协议转换没开不是问题：直连 Responses 的供应商本来就不需要，显示为中性的「未启用」。
+  const conversionHealth = {
+    title: t("协议转换"),
+    status: typeof conversionEnabled !== "boolean" ? "not_checked" : conversionEnabled ? "ok" : "off",
+    ok: typeof conversionEnabled === "boolean",
+    detail: typeof conversionEnabled !== "boolean"
+      ? t("等待状态检查")
+      : conversionEnabled
+        ? t("Chat Completions / Anthropic 请求经本地服务器转成 Responses")
+        : t("当前供应商直连 Responses，不需要转换"),
+    icon: ArrowRightLeft,
+  };
+  // 调试连接依赖 Codex 在运行：Codex 没启动时连不上是预期内的，显示为中性的「等待启动」而不是警告。
+  const debuggerState = overview?.runtime_health?.debugger;
+  const codexRunning = overview?.runtime_health?.codex_app?.status === "running";
+  const debuggerHealth = debuggerState && debuggerState.status !== "connected" && !codexRunning
+    ? {
+      title: t("调试连接状态"),
+      status: "waiting",
+      ok: true,
+      detail: [debuggerState.address, t("Codex 未运行，启动后自动连接")].filter(Boolean).join(" · "),
+      icon: Bug,
+    }
+    : serviceItem(t("调试连接状态"), debuggerState, Bug);
   return [
     {
       title: t("Codex 应用"),
       status: overview?.codex_app.status ?? "not_checked",
       ok: overview?.codex_app.status === "found",
       detail: overview?.codex_app.path || t("尚未检查 Codex 应用路径。"),
+      icon: AppWindow,
     },
-    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, conversionDetail),
-    serviceItem(t("调试连接状态"), overview?.runtime_health?.debugger),
+    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, Server),
+    conversionHealth,
+    debuggerHealth,
   ];
 }
+
 
 function normalizeTypingEffect(value: unknown): TypingEffect {
   return value === "rainbow" || value === "fireworks" || value === "stars" ? value : "off";
@@ -13682,6 +16030,20 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     webSearch: normalizeWebSearchSettings(settings.webSearch),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
+    protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
+    // 默认关闭（opt-in），只有显式开启才生效。
+    protocolProxyMapUnlistedModels: settings.protocolProxyMapUnlistedModels === true,
+    protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
+    protocolProxyAutoRetryMode:
+      settings.protocolProxyAutoRetryMode === "buffered"
+        ? "buffered"
+        : settings.protocolProxyAutoRetryMode === "streaming-legacy"
+          ? "streaming-legacy"
+          : "streaming",
+    protocolProxyAutoRetryCommitDelayMs: clampNumber(settings.protocolProxyAutoRetryCommitDelayMs ?? 1000, 0, 10000),
+    protocolProxyAutoRetryIntervalSeconds: clampNumber(settings.protocolProxyAutoRetryIntervalSeconds ?? 2, 0, 30),
+    protocolProxyAutoRetryStatusCodes: normalizeRetryStatusCodes(settings.protocolProxyAutoRetryStatusCodes),
+    helperMaxRequestBodyMib: clampNumber(settings.helperMaxRequestBodyMib ?? 128, 32, 512),
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
     codexAppDreamSkinPaused: settings.codexAppDreamSkinPaused === true,
@@ -13725,6 +16087,18 @@ function backendSettingsEqual(left: BackendSettings, right: BackendSettings): bo
   const { revision: _leftRevision, ...leftValues } = normalizeSettings(left);
   const { revision: _rightRevision, ...rightValues } = normalizeSettings(right);
   return JSON.stringify(leftValues) === JSON.stringify(rightValues);
+}
+
+/** 「填入常用」：限流与常见的服务端/网关瞬时错误。 */
+const COMMON_RETRY_STATUS_CODES = [429, 500, 502, 503, 504];
+
+/** 与 Rust `normalize_protocol_proxy_auto_retry_status_codes` 保持一致：400~599、去重升序、最多 20 个。 */
+function normalizeRetryStatusCodes(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  const codes = value
+    .map(Number)
+    .filter((status) => Number.isInteger(status) && status >= 400 && status <= 599);
+  return Array.from(new Set(codes)).sort((a, b) => a - b).slice(0, 20);
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -13823,11 +16197,14 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelMetadata: profile.modelMetadata || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
+    autoReviewModel: profile.autoReviewModel?.trim() || "",
     customHeaders: profile.customHeaders || [],
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
     webSearchHistoryCompat: profile.webSearchHistoryCompat === true,
+    trustUpstreamCatalogLite: profile.trustUpstreamCatalogLite === true,
+    strictResponsesReasoning: profile.strictResponsesReasoning === true,
     anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
     anthropicMaxTokens: normalizeAnthropicMaxTokens(profile.anthropicMaxTokens),
     anthropicPromptCache: profile.anthropicPromptCache !== false,
@@ -13897,10 +16274,35 @@ function normalizeAnthropicMaxTokens(value: number | undefined): number {
   return Math.min(200000, Math.round(value));
 }
 
+/// 列表标签用的短协议名：卡片空间小，「转 Responses」留在编辑页里说明。
+function relayProtocolShortLabel(protocol: RelayProtocol): string {
+  if (protocol === "chatCompletions") return "Chat Completions";
+  if (protocol === "anthropicMessages") return "Anthropic";
+  return "Responses";
+}
+
+/// 接入方式标签的配色分组。
+function relayProfileTagTone(profile: RelayProfile): string {
+  if (isAggregateRelayProfile(profile)) return "aggregate";
+  if (profile.relayMode === "official") return profile.officialMixApiKey ? "mixed" : "official";
+  return "api";
+}
+
 function relayProtocolLabel(protocol: RelayProtocol): string {
   if (protocol === "chatCompletions") return t("Chat Completions 转 Responses");
   if (protocol === "anthropicMessages") return t("Anthropic Messages 转 Responses");
   return "Responses API";
+}
+
+/// 网址只显示主机名；解析不了就原样返回。
+function urlHost(value: string | undefined): string {
+  const text = (value ?? "").trim();
+  if (!text) return "";
+  try {
+    return new URL(text).host;
+  } catch {
+    return text.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  }
 }
 
 function ccsProviderSummary(result: CcsProvidersResult | null): string {
@@ -14074,14 +16476,14 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "strictResponsesReasoning" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
     && profile.protocol === "responses"
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || searchHistoryCompat
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || requestCompatibilityEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -14232,12 +16634,12 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "strictResponsesReasoning" in patch || "modelMetadata" in patch) {
     const searchHistoryCompat = next.webSearchHistoryCompat === true
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || requestCompatibilityEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
@@ -14643,7 +17045,9 @@ function ensureCodexProviderDefaults(
 ): string {
   let next = contents;
   const section = codexProviderSectionName(provider);
-  next = setTomlSectionStringKey(next, section, "name", provider);
+  // 已有非空 name 必须原样保留：name 只是展示标签，用户可能改成 "My relay"，
+  // 无条件写回 provider id 会在改 Base URL 等字段时把自定义名覆盖掉（issue #2682）。
+  next = setTomlSectionStringKey(next, section, "name", resolveProviderName(contents, provider));
   next = setTomlSectionStringKey(next, section, "wire_api", "responses");
   return options.requiresOpenAiAuth === false ? next : setTomlSectionBoolKey(next, section, "requires_openai_auth", true);
 }
@@ -15079,23 +17483,23 @@ function relayProfileDeleteIssue(settings: BackendSettings, id: string): string 
 const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: string; description: string }> = [
   {
     value: "failover",
-    label: t("失败切换"),
-    description: t("按成员顺序请求，失败后切到下一个供应商。"),
+    get label() { return t("失败切换"); },
+    get description() { return t("按成员顺序请求，失败后切到下一个供应商。"); },
   },
   {
     value: "conversationRoundRobin",
-    label: t("按对话轮转"),
-    description: t("同一对话保持一个成员，不同对话依次分配。"),
+    get label() { return t("按对话轮转"); },
+    get description() { return t("同一对话保持一个成员，不同对话依次分配。"); },
   },
   {
     value: "requestRoundRobin",
-    label: t("按请求轮转"),
-    description: t("每次请求按成员顺序切换，适合均匀摊请求量。"),
+    get label() { return t("按请求轮转"); },
+    get description() { return t("每次请求按成员顺序切换，适合均匀摊请求量。"); },
   },
   {
     value: "weightedRoundRobin",
-    label: t("权重轮转"),
-    description: t("按成员权重分配请求，权重越高承担越多。"),
+    get label() { return t("权重轮转"); },
+    get description() { return t("按成员权重分配请求，权重越高承担越多。"); },
   },
 ];
 
@@ -15296,6 +17700,10 @@ function loadInitialTheme(): Theme {
 function loadInitialRoute(): Route {
   if (typeof window === "undefined") return "overview";
   const params = new URLSearchParams(window.location.search);
+  const previewRoute = params.get("previewRoute");
+  if (previewRoute && routes.some((item) => item.id === previewRoute)) {
+    return previewRoute as Route;
+  }
   if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
     return "about";
   }

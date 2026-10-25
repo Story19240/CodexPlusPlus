@@ -105,7 +105,9 @@ test("unified enhancements use the master switch and Chinese suggestion labels",
   assert.equal(attribute(petGroup, "detail"), 't("在 Codex 中查看用量，设置自己的角色和互动方式。")');
   const petLook = fieldControl(petGroup.parent, "form.codexAppPetRealMouseLook");
   assert.ok(descendants(enhance).some((node) => ts.isConditionalExpression(node)
-    && node.condition.getText(app) === "isWindowsPlatform" && descendants(node.whenTrue).includes(petLook)), "native pet mouse tracking must remain Windows-only");
+    && node.condition.getText(app) === "supportsPetRealMouseLook" && descendants(node.whenTrue).includes(petLook)), "native pet mouse tracking must be available on Windows and macOS");
+  assert.ok(!descendants(enhance).some((node) => ts.isConditionalExpression(node)
+    && node.condition.getText(app) === "isWindowsPlatform" && descendants(node.whenTrue).includes(petLook)), "native pet mouse tracking must not stay Windows-only");
   const whaleWidget = fieldControl(petGroup.parent, "form.codexAppWhaleWidgetEnabled");
   assert.ok(!descendants(enhance).some((node) => ts.isConditionalExpression(node)
     && node.condition.getText(app) === "isWindowsPlatform" && descendants(node.whenTrue).includes(whaleWidget)), "the Codex usage widget must be available on every platform");
@@ -129,13 +131,20 @@ test("complete voice and Stepwise panels share the enhancement form and save act
     assert.equal(attribute(panel, "form"), "form");
     assert.equal(attribute(panel, "onFormChange"), "onFormChange");
   }
+  // 三个标签共用同一份表单，由同一个自动保存覆盖（语音输入、下一步建议的改动也会自动保存）。
   const calls = descendants(enhance).filter(ts.isCallExpression);
-  assert.ok(calls.some((node) => node.expression.getText(app) === "actions.saveSettings"), "enhancements must retain their save action");
+  assert.ok(
+    calls.some((node) => node.expression.getText(app) === "useEnhanceAutoSave"
+      && node.arguments.map((arg) => arg.getText(app)).join(", ") === "dirty, form, actions.autoSaveSettings"),
+    "enhancements must save the shared form automatically",
+  );
 
-  const settings = component("SettingsScreen");
-  assert.ok(!elements(settings).some((element) => ["DictationSettingsPanel", "WebSearchSettingsPanel", "StepwiseSettingsPanel"].includes(element.tagName.getText(app))));
-  assert.ok(!descendants(settings).some((node) => ts.isPropertyAccessExpression(node)
-    && (/^form\.(?:dictation|webSearch)(?:\.|$)/.test(node.getText(app)) || /^form\.codexApp(?:Stepwise|AnswerOutline)/.test(node.getText(app)))));
+  for (const name of ["GlobalSettingsScreen", "AgentSettingsScreen"]) {
+    const settings = component(name);
+    assert.ok(!elements(settings).some((element) => ["DictationSettingsPanel", "WebSearchSettingsPanel", "StepwiseSettingsPanel"].includes(element.tagName.getText(app))));
+    assert.ok(!descendants(settings).some((node) => ts.isPropertyAccessExpression(node)
+      && (/^form\.(?:dictation|webSearch)(?:\.|$)/.test(node.getText(app)) || /^form\.codexApp(?:Stepwise|AnswerOutline)/.test(node.getText(app)))));
+  }
 });
 
 test("local speech download requires a configuration button click and mount only reads status", () => {
@@ -226,14 +235,22 @@ test("all enhancement panes stay mounted while tab selection only changes visibi
   assert.equal(attribute(screen, "onTabChange"), "setEnhancementTab");
 });
 
-test("enhancement saving is an explicit permanent top action", () => {
+test("enhancement settings save automatically and show a permanent status at the top", () => {
   const enhance = component("EnhanceScreen");
-  const saves = elements(enhance).filter((element) => attribute(element, "onClick")?.includes("actions.saveSettings("));
-  assert.equal(saves.length, 1);
-  assert.equal(attribute(saves[0], "disabled"), "!dirty");
-  assert.equal(isConditional(saves[0], enhance), false);
+  // 不再有手动保存按钮：改动由 useEnhanceAutoSave 防抖后自动保存。
+  assert.equal(elements(enhance).filter((element) => attribute(element, "onClick")?.includes("actions.saveSettings(")).length, 0);
+  const status = elements(enhance).filter((element) => element.tagName.getText(app) === "AutoSaveStatus");
+  assert.equal(status.length, 1);
+  assert.equal(attribute(status[0], "state"), "autoSave");
+  assert.equal(isConditional(status[0], enhance), false);
   const firstPane = elements(enhance).find((element) => attribute(element, "role") === "tabpanel");
-  assert.ok(firstPane && saves[0].pos < firstPane.pos);
+  assert.ok(firstPane && status[0].pos < firstPane.pos);
+
+  // 校验不过时不保存也不弹窗，交给页面显示；保存期间的改动保留草稿并同步版本号。
+  const autoSave = appSource.slice(appSource.indexOf("const autoSaveSettings = async"), appSource.indexOf("const beginWeixinQrLogin"));
+  assert.match(autoSave, /if \(issue\) return \{ status: "invalid", message: issue \};/);
+  assert.doesNotMatch(autoSave, /showNotice\(/);
+  assert.match(autoSave, /backendSettingsEqual\(current, snapshot\) \? saved : \{ \.\.\.current, revision: saved\.revision \}/);
 });
 
 test("standalone quota unlock lives in its own group inside the general tab and stays editable when enhancements are off", () => {
