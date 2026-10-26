@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::computer_use::{RuntimeLocation, locate_runtime};
 use crate::computer_use_approval::{ApprovalMode, ApprovalStore, Outcome, subject_of};
+use crate::computer_use_js::{ChildFrame, ClientFrame, JsBridge};
 
 /// 审批转给客户端后等多久。超过就回 `cancel`，不让会话永久挂住。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -54,6 +55,43 @@ enum Event {
     ChildOversized(Oversized),
     ClientClosed,
     ChildClosed,
+    /// Claude Code 的 Stop 钩子：一个回合结束了（只在 JS 档使用）。
+    TurnEnd,
+}
+
+/// 给客户端的操作方式，见 `settings.computer_use_mode`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuMode {
+    /// 原生 CU 的 10 个离散工具（直通 `SkyComputerUseClient mcp`）。
+    Tools,
+    /// `cua_repl` 的 `js` 工具，和 Codex 当前主要的 CU 路径一致。
+    Js,
+}
+
+impl CuMode {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "tools" => Self::Tools,
+            // 未知取值按默认（JS）处理：settings.json 里可能有旧版本或手写的值。
+            _ => Self::Js,
+        }
+    }
+
+    /// 从设置文件现读。读失败按默认处理。
+    pub fn current() -> Self {
+        let value = crate::settings::SettingsStore::default()
+            .load()
+            .map(|settings| settings.computer_use_mode)
+            .unwrap_or_default();
+        Self::parse(&value)
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Js => "js",
+        }
+    }
 }
 
 /// 一条被丢弃的超长帧：只留下回错误所需的信息。
@@ -144,14 +182,23 @@ enum Frame {
 pub fn serve() -> anyhow::Result<()> {
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），Computer Use 不可用")?;
-    let shim = crate::computer_use::ensure_shim()?;
-    let mut child = spawn_child(&runtime, &shim)?;
+    let cu_mode = CuMode::current();
+    let mut child = match cu_mode {
+        CuMode::Tools => spawn_child(&runtime, &crate::computer_use::ensure_shim()?)?,
+        CuMode::Js => spawn_js_child(&runtime)?,
+    };
     let child_stdin = child.stdin.take().context("CU 子进程的标准输入不可用")?;
     let child_stdout = child.stdout.take().context("CU 子进程的标准输出不可用")?;
 
     let (sender, receiver) = mpsc::channel::<Event>();
     spawn_client_reader(sender.clone());
     spawn_child_reader(child_stdout, sender.clone());
+    if cu_mode == CuMode::Js {
+        let turn_sender = sender.clone();
+        crate::claude_hooks::spawn_turn_watcher(move || {
+            let _ = turn_sender.send(Event::TurnEnd);
+        });
+    }
     drop(sender);
 
     let mut forwarder = Forwarder {
@@ -162,8 +209,19 @@ pub fn serve() -> anyhow::Result<()> {
         pending: HashMap::new(),
         session_allowed: BTreeSet::new(),
         next_token: 0,
+        js: (cu_mode == CuMode::Js)
+            .then(|| JsBridge::new(uuid::Uuid::new_v4().to_string())),
+        last_activity: None,
+        tools_init_id: None,
+        // JS 档由 cua_repl 自己下发说明与确认规则；离散工具档由这里补。
+        policy: (cu_mode == CuMode::Tools)
+            .then(|| crate::computer_use_tools::read_confirmations(&runtime.node_module_dirs))
+            .flatten(),
+        policy_call_ids: BTreeSet::new(),
     };
     let outcome = forwarder.run(receiver);
+    // 会话结束：让管理器收起这个会话的悬浮预览。
+    crate::cu_activity::record("end", 0, "", "");
     child.kill();
     child.wait();
     outcome
@@ -187,6 +245,24 @@ fn spawn_child(
     crate::disclaimed_spawn::spawn_clean(
         std::path::Path::new(&runtime.node),
         &[OsStr::new(shim)],
+        &envs,
+    )
+}
+
+/// JS 档：拉起 `cua_repl`（OpenAI 签名的 node 直接执行，和 Codex 的插件配置一致）。
+///
+/// 和直通档一样放弃责任归属、不继承调用方环境；环境见 `RuntimeLocation::js_env`。
+fn spawn_js_child(
+    runtime: &RuntimeLocation,
+) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    anyhow::ensure!(
+        std::path::Path::new(&runtime.cua_repl).is_file(),
+        "当前 ChatGPT.app 没有 cua-repl，JS 操作方式不可用；请在 Computer Use 页改回「离散工具」"
+    );
+    let envs: Vec<(String, String)> = runtime.js_env().into_iter().collect();
+    crate::disclaimed_spawn::spawn_clean(
+        std::path::Path::new(&runtime.node),
+        &[OsStr::new(&runtime.cua_repl)],
         &envs,
     )
 }
@@ -261,8 +337,8 @@ struct Forwarder {
     /// 客户端自己是否声明了 elicitation。
     ///
     /// `None` = 还没握手。这个值决定 `claude` 模式能不能真的转发：
-    /// Claude Code 2.x 不声明（转发出去没人渲染，只会等到超时），
-    /// 3.x 之后声明与否要以实际握手为准，不能按版本号猜。
+    /// 没声明表单式 elicitation 的客户端，转发出去没人渲染，只会等到超时。
+    /// 一律以实际握手为准，不能按客户端名或版本号猜。
     client_supports_elicitation: Option<bool>,
     mode: ApprovalMode,
     /// 我们发给客户端的审批请求 id（字符串，避免与两端数字 id 撞号）→ 待办。
@@ -270,6 +346,16 @@ struct Forwarder {
     /// 本进程内已放行的 app（`session` 语义，不落盘）。
     session_allowed: BTreeSet<String>,
     next_token: u64,
+    /// JS 档的回合与工具面状态；直通档为 `None`，帧原样转发。
+    js: Option<JsBridge>,
+    /// 最近一次记下的被操作应用（bundle id 或应用名）与时间：同一个应用 1 秒内不重复写。
+    last_activity: Option<(String, Instant)>,
+    /// 离散工具档：客户端 `initialize` 的 id，响应里要补使用说明。
+    tools_init_id: Option<String>,
+    /// 离散工具档：还没附上的确认规则（附在本会话第一次成功的工具结果后面）。
+    policy: Option<String>,
+    /// 等着附确认规则的 `tools/call` 请求 id。
+    policy_call_ids: BTreeSet<String>,
 }
 
 impl Forwarder {
@@ -294,6 +380,13 @@ impl Forwarder {
                     self.cancel_all("CU 子进程已退出");
                     return Ok(());
                 }
+                Ok(Event::TurnEnd) => {
+                    if let Some(call) = self.js.as_mut().and_then(JsBridge::end_turn) {
+                        let mut line = serde_json::to_vec(&call)?;
+                        line.push(b'\n');
+                        self.write_child(&line)?;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.cancel_all("客户端已断开");
@@ -317,7 +410,7 @@ impl Forwarder {
         {
             // 先记下客户端**自己**有没有声明，再补。补只是为了不让服务端拒绝，
             // 不代表客户端真的会渲染这个表单——`claude` 模式要看这个值决定能否转发。
-            let supports = declares_capability(&message, "elicitation");
+            let supports = supports_form_elicitation(&message);
             self.client_supports_elicitation = Some(supports);
             crate::computer_use_approval::record_client(
                 message.get("params").and_then(|params| params.get("clientInfo")),
@@ -325,18 +418,50 @@ impl Forwarder {
             );
             declare_elicitation(&mut message);
             self.declare_elicitation = false;
+            if self.js.is_none() {
+                self.tools_init_id = message.get("id").map(Value::to_string);
+            }
             let mut line = serde_json::to_vec(&message)?;
             line.push(b'\n');
             return self.write_child(&line);
         }
-        // 审批答复：没有 method、id 是我们发的字符串。
+        // 审批答复：没有 method、id 是我们发的字符串。客户端回错误（渲染不了）时按取消处理，
+        // 不能干等到超时。
         if !mentions(&frame, b"\"method\"")
-            && mentions(&frame, b"\"result\"")
+            && (mentions(&frame, b"\"result\"") || mentions(&frame, b"\"error\""))
             && let Ok(message) = serde_json::from_slice::<Value>(&frame)
             && let Some(token) = message.get("id").and_then(Value::as_str)
             && let Some(pending) = self.pending.remove(token)
         {
             return self.relay_approval(&pending, &message);
+        }
+        // 离散工具档：`type_text` 含键盘打不出的字符时直接回错误（否则系统会静默丢字）；
+        // 确认规则还没附上时，记下这次调用的 id。
+        if self.js.is_none()
+            && mentions(&frame, b"\"tools/call\"")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+        {
+            if let Some(reply) = crate::computer_use_tools::reject_untypeable(&message) {
+                let mut line = serde_json::to_vec(&reply)?;
+                line.push(b'\n');
+                return write_client(&line);
+            }
+            if self.policy.is_some()
+                && let Some(id) = message.get("id")
+            {
+                self.policy_call_ids.insert(id.to_string());
+            }
+        }
+        // JS 档：`tools/call` 要带回合信息，`tools/list` 的响应要过滤。
+        if let Some(js) = self.js.as_mut()
+            && mentions(&frame, b"\"tools/")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && let ClientFrame::Rewritten(message) = js.on_client(message)
+        {
+            let mut line = serde_json::to_vec(&message)?;
+            line.push(b'\n');
+            return self.write_child(&line);
         }
         self.write_child(&frame)
     }
@@ -370,30 +495,25 @@ impl Forwarder {
     }
 
     /// 逐条答复客户端对审批请求的决定。
+    ///
+    /// 勾了「始终允许」就回 `_meta.persist: "always"`，由 Computer Use 自己记住（和 Codex 一样）。
     fn relay_approval(&mut self, pending: &PendingApproval, message: &Value) -> anyhow::Result<()> {
-        let action = message
-            .get("result")
-            .and_then(|result| result.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("cancel");
-        let content = message
-            .get("result")
-            .and_then(|result| result.get("content"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let outcome = match action {
-            "accept" => Outcome::ClientAccepted,
-            "decline" => Outcome::ClientDeclined,
+        let (result, always) =
+            crate::computer_use_approval::native_reply(message.get("result"));
+        let outcome = match result.get("action").and_then(Value::as_str) {
+            Some("accept") if always => Outcome::ClientAcceptedAlways,
+            Some("accept") => Outcome::ClientAccepted,
+            Some("decline") => Outcome::ClientDeclined,
             _ => Outcome::ClientCanceled,
         };
         if outcome.accepted() {
-            // `session` 语义在本进程内生效；跨会话的持久化交给 `remember`。
+            // 本进程内不再问；跨会话的「始终允许」由 Computer Use 自己记。
             self.session_allowed.insert(pending.key.clone());
         }
         let reply = json!({
             "jsonrpc": "2.0",
             "id": pending.child_id,
-            "result": { "action": action, "content": content }
+            "result": result
         });
         let mut line = serde_json::to_vec(&reply)?;
         line.push(b'\n');
@@ -404,6 +524,15 @@ impl Forwarder {
 
     /// 子进程 → 客户端。审批请求按策略处理，其余帧原样透传。
     fn on_child(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
+        self.note_activity(&frame);
+        // JS 档操作浏览器：同 Codex，用结果里附带的截图更新悬浮预览。
+        if self.js.is_some()
+            && mentions(&frame, b"codex/toolSurface")
+            && mentions(&frame, b"browserUse")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            crate::cu_activity::note_browser_surface(&message);
+        }
         if mentions(&frame, b"\"method\"") && mentions(&frame, b"elicitation/create") {
             if let Ok(message) = serde_json::from_slice::<Value>(&frame) {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
@@ -411,7 +540,70 @@ impl Forwarder {
                 }
             }
         }
+        if self.js.is_none()
+            && (self.tools_init_id.is_some() || !self.policy_call_ids.is_empty())
+            && !mentions(&frame, b"\"method\"")
+            && let Ok(mut message) = serde_json::from_slice::<Value>(&frame)
+            && let Some(id) = message.get("id").map(Value::to_string)
+        {
+            let mut rewritten = false;
+            if self.tools_init_id.as_deref() == Some(id.as_str()) {
+                self.tools_init_id = None;
+                crate::computer_use_tools::add_instructions(&mut message);
+                rewritten = true;
+            } else if self.policy_call_ids.remove(&id)
+                && let Some(policy) = self.policy.as_deref()
+                && crate::computer_use_tools::append_text(&mut message, policy)
+            {
+                self.policy = None;
+                self.policy_call_ids.clear();
+                rewritten = true;
+            }
+            if rewritten {
+                let mut line = serde_json::to_vec(&message)?;
+                line.push(b'\n');
+                return write_client(&line);
+            }
+        }
+        if let Some(js) = self.js.as_mut()
+            && js.wants_child_frames()
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            match js.on_child(message) {
+                ChildFrame::Drop => return Ok(()),
+                ChildFrame::Rewritten(message) => {
+                    let mut line = serde_json::to_vec(&message)?;
+                    line.push(b'\n');
+                    return write_client(&line);
+                }
+                ChildFrame::Forward => {}
+            }
+        }
         write_client(&frame)
+    }
+
+    /// 返回结果里能看出被操作的应用时，告诉管理器（悬浮预览用）：
+    /// 离散工具档有 `App=… (bundleID …, pid …)`，JS 档只有 `App: 名字.`。
+    fn note_activity(&mut self, frame: &[u8]) {
+        let (pid, bundle_id, app_name) = if mentions(frame, b"(bundleID ")
+            && let Some((bundle_id, pid)) = crate::cu_activity::parse_app_line(frame)
+        {
+            (pid, bundle_id, String::new())
+        } else if mentions(frame, b"\", App: ")
+            && let Some(name) = crate::cu_activity::parse_app_name(frame)
+        {
+            (0, String::new(), name)
+        } else {
+            return;
+        };
+        let key = if bundle_id.is_empty() { app_name.clone() } else { bundle_id.clone() };
+        let fresh = self.last_activity.as_ref().is_none_or(|(last, at)| {
+            *last != key || at.elapsed() >= Duration::from_secs(1)
+        });
+        if fresh {
+            crate::cu_activity::record("act", pid, &bundle_id, &app_name);
+            self.last_activity = Some((key, Instant::now()));
+        }
     }
 
     fn on_elicitation(&mut self, message: Value) -> anyhow::Result<()> {
@@ -454,7 +646,7 @@ impl Forwarder {
         //
         // 客户端没声明时转发出去没人渲染，只能干等到超时——那比直接放行更糟：
         // 用户会看到「读应用列表正常、一点击就卡两分钟」。
-        // 版本号不能作为依据（2.x 不声明、3.x 之后可能变），一律以握手时的实际能力为准。
+        // 不按客户端名或版本号猜，一律以握手时声明的能力为准（要支持表单式，只有 url 式不算）。
         if self.client_supports_elicitation == Some(false) {
             let pending = PendingApproval {
                 child_id,
@@ -468,6 +660,8 @@ impl Forwarder {
             );
             return self.accept_now(&pending, Outcome::AutoAccepted);
         }
+        let mut params = params;
+        crate::computer_use_approval::offer_always(&mut params);
         self.next_token += 1;
         let token = format!("codexplus-cu-elicit-{}", self.next_token);
         let forwarded = json!({
@@ -579,14 +773,18 @@ fn write_client(frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 客户端自己有没有声明某个能力（`params.capabilities.<name>` 存在且非 null）。
-pub(crate) fn declares_capability(message: &Value, name: &str) -> bool {
-    message
-        .get("params")
-        .and_then(|params| params.get("capabilities"))
-        .and_then(|capabilities| capabilities.get(name))
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
+/// 客户端能不能渲染表单式的审批卡。
+///
+/// MCP 2025-11-25 起 elicitation 分 `form` 与 `url` 两种：空对象 `{}` 按旧规范视为支持 form；
+/// 只声明 `{url:{}}` 的客户端渲染不了 Computer Use 的审批卡。
+/// 实测 Claude Code 2.1.310 声明的是 `{form:{}, url:{}}`。
+pub(crate) fn supports_form_elicitation(message: &Value) -> bool {
+    match message.pointer("/params/capabilities/elicitation") {
+        Some(Value::Object(modes)) => {
+            modes.is_empty() || modes.get("form").is_some_and(|form| !form.is_null())
+        }
+        _ => false,
+    }
 }
 
 /// 在客户端声明的能力里补上 `elicitation`，其余字段原样保留。
@@ -613,6 +811,18 @@ pub(crate) fn declare_elicitation(message: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_elicitation_support_follows_declared_modes() {
+        let init = |elicitation: Value| {
+            json!({ "method": "initialize", "params": { "capabilities": { "elicitation": elicitation } } })
+        };
+        assert!(supports_form_elicitation(&init(json!({}))));
+        assert!(supports_form_elicitation(&init(json!({ "form": {}, "url": {} }))));
+        assert!(!supports_form_elicitation(&init(json!({ "url": {} }))));
+        assert!(!supports_form_elicitation(&init(Value::Null)));
+        assert!(!supports_form_elicitation(&json!({ "method": "initialize", "params": { "capabilities": {} } })));
+    }
 
     #[test]
     fn declare_elicitation_keeps_existing_capabilities() {

@@ -80,14 +80,20 @@
 .cu-custom-add-head .cu-hint { margin:2px 0 0; }
 .cu-custom-add-row { display:flex; min-width:0; align-items:center; gap:7px; }
 .cu-custom-kind,
+.cu-custom-name,
 .cu-custom-path {
   min-width:0; height:30px; padding:0 9px;
   border:1px solid hsl(var(--border)); border-radius:6px;
   background:hsl(var(--background)); color:inherit; font-size:12px;
 }
 .cu-custom-kind { flex:0 0 auto; }
+.cu-custom-name { flex:0 0 150px; }
 .cu-custom-path { flex:1 1 auto; font-family:var(--font-mono,monospace); font-size:11px; }
-.cu-custom-path:focus,.cu-custom-kind:focus { outline:none; border-color:hsl(var(--brand-accent)/.6); }
+.cu-custom-path:focus,.cu-custom-kind:focus,.cu-custom-name:focus { outline:none; border-color:hsl(var(--brand-accent)/.6); }
+/* 自定义目标就地改名 */
+.cu-rename { display:inline-flex; align-items:center; gap:4px; min-width:0; }
+.cu-rename-input { width:180px; min-width:0; height:24px; padding:0 7px; border:1px solid hsl(var(--brand-accent)/.6); border-radius:5px; background:hsl(var(--background)); color:inherit; font-size:12px; font-weight:600; }
+.cu-rename-input:focus { outline:none; }
 @media(max-width:760px) {
   .cu-custom-add-row { flex-wrap:wrap; }
   .cu-custom-path { flex-basis:100%; order:-1; }
@@ -289,6 +295,10 @@
 .cu-flow-approval { display:flex; flex-direction:column; gap:5px; padding-top:8px; border-top:1px dashed hsl(var(--border)); }
 .cu-flow-approval > span { color:hsl(var(--muted-foreground)); font-size:10.5px; }
 .cu-flow-approval .mg-segmented { width:100%; }
+.cu-flow-recommend { margin-left:4px; padding:0 4px; border-radius:4px; background:hsl(var(--brand-accent)/.15); color:hsl(var(--brand-accent)); font-size:9.5px; font-weight:600; }
+.cu-flow-reason { color:hsl(var(--muted-foreground)); font-size:10.5px; line-height:1.5; }
+.cu-flow-check { display:flex; align-items:center; gap:6px; color:hsl(var(--foreground)); font-size:11px; cursor:pointer; }
+.cu-flow-check input { margin:0; }
 .cu-flow-approval .mg-segmented button { flex:1; padding:3px 6px; font-size:11px; cursor:pointer; }
 .cu-flow-warn { color:hsl(var(--status-warning)); font-size:10.5px; line-height:1.45; }
 .cu-flow-node[data-tone=warn] { border-color:hsl(var(--status-warning) / .5); }
@@ -307,3 +317,25 @@
 .cu-more > summary strong { font-size:13px; font-weight:600; }
 .cu-more > summary small { color:hsl(var(--muted-foreground)); font-size:11.5px; }
 .cu-more > .cu-card { margin:0 12px 12px; }
+
+/* codex-plus-cu 节点上的状态小标签（开关在图下方的设置区）。 */
+.cu-flow-summary { display:flex; flex-wrap:wrap; gap:4px; padding-top:8px; border-top:1px dashed hsl(var(--border)); }
+.cu-flow-summary span { padding:1px 7px; border:1px solid hsl(var(--border)); border-radius:999px; color:hsl(var(--muted-foreground)); font-size:10.5px; white-space:nowrap; }
+.cu-flow-summary span[data-accent] { border-color:hsl(var(--brand-accent)/.4); background:hsl(var(--brand-accent)/.1); color:hsl(var(--brand-accent)); }
+
+/* 图下方的 codex-plus-cu 设置：一行一项，左边说明右边控件。 */
+.cu-settings { display:grid; margin-top:14px; border:1px solid hsl(var(--border)); border-radius:10px; background:hsl(var(--card)/.6); }
+.cu-settings-head { display:flex; align-items:baseline; gap:8px; padding:10px 14px; border-bottom:1px solid hsl(var(--border)); font-size:12.5px; font-weight:600; }
+.cu-settings-head small { color:hsl(var(--muted-foreground)); font-size:11px; font-weight:400; }
+.cu-setting { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:20px; align-items:center; padding:12px 14px; border-bottom:1px solid hsl(var(--border)/.55); }
+.cu-setting:last-child { border-bottom:0; }
+label.cu-setting { cursor:pointer; }
+.cu-setting-copy { display:grid; gap:3px; min-width:0; }
+.cu-setting-copy strong { font-size:12.5px; font-weight:600; }
+.cu-setting-copy small { color:hsl(var(--muted-foreground)); font-size:11.5px; line-height:1.55; }
+.cu-setting-copy small.cu-flow-warn { color:hsl(var(--status-warning)); }
+.cu-setting .mg-segmented { width:auto; flex-wrap:nowrap; }
+.cu-setting .mg-segmented button { white-space:nowrap; }
+.cu-setting-check { width:16px; height:16px; margin:0; }
+@media(max-width:760px) { .cu-setting { grid-template-columns:minmax(0,1fr); gap:8px; } }
+

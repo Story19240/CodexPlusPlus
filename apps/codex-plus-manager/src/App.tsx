@@ -102,7 +102,7 @@ import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { ClaudeProviderPage } from "./ClaudeProviderPage";
-import { ComputerUsePage } from "./ComputerUsePage";
+import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
 import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications } from "./update-notification";
@@ -1236,7 +1236,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
-  // Agent 专属设置：目前只有 Codex 有专属选项（供应商测试模型、图片覆盖层、启动参数）。
+  // Agent 专属设置：目前只有 Codex 有专属选项（图片覆盖层、启动参数）。
   // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
   { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
@@ -1601,6 +1601,27 @@ export function App() {
       if (!silent) showResultNotice(t("概览已检查"), result, { silentSuccess: true });
     }
   };
+
+  // Computer Use 页的开关由后端单独写进 settings.json：重新读取，只合并这几个键和版本号，
+  // 别处没保存的草稿保持不动；否则表单里的旧版本号会让之后的保存全部报冲突。
+  useEffect(() => {
+    const sync = async () => {
+      const result = await run(() => call<SettingsResult>("load_settings"));
+      if (!result) return;
+      const fresh = normalizeSettings(result.settings) as BackendSettings & Record<string, unknown>;
+      setSettings(result);
+      setSettingsForm((current) => {
+        const merged: Record<string, unknown> = { ...current, revision: fresh.revision };
+        for (const key of ["computerUseMode", "computerUseApproval", "computerUsePip"]) merged[key] = fresh[key];
+        return merged as BackendSettings;
+      });
+    };
+    const handler = () => void sync();
+    window.addEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
+    return () => window.removeEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
+    // 只在挂载时注册；run / call 只依赖稳定的 setter。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const refreshSettings = async (silent = false) => {
     const result = await run(() => call<SettingsResult>("load_settings"));
@@ -4306,7 +4327,7 @@ export function App() {
               onDeleteMany={actions.deleteLocalSessions}
               onArchiveMany={actions.archiveLocalSessions}
               onListProjectSessions={actions.listProjectSessions}
-              repairPanel={<SessionRepairPanel form={settingsForm} providerSyncProgress={providerSyncProgress}
+              repairPanel={<SessionRepairPanel dirty={settingsDirty} form={settingsForm} providerSyncProgress={providerSyncProgress}
                 sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
                 sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets}
                 selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={setSettingsForm} actions={actions} />}
@@ -4345,7 +4366,7 @@ export function App() {
               qr={weixinQr}
               sessions={localSessions?.sessions ?? []}
               onFormChange={setSettingsForm}
-              onSave={() => void saveSettings()}
+              autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
               onQrLogin={() => void beginWeixinQrLogin()}
               onStart={() => void startWeixinConnect()}
               onStop={() => void stopWeixinConnect()}
@@ -4419,6 +4440,7 @@ export function App() {
           {route === "settings" ? (
             <GlobalSettingsScreen
               dirty={settingsDirty}
+              form={settingsForm}
               settings={settings}
               theme={theme}
               actions={actions}
@@ -4927,7 +4949,7 @@ function WeixinConnectScreen({
   qr,
   sessions,
   onFormChange,
-  onSave,
+  autoSave,
   onQrLogin,
   onStart,
   onStop,
@@ -4942,7 +4964,7 @@ function WeixinConnectScreen({
   qr: WeixinQrResult | null;
   sessions: LocalSession[];
   onFormChange: (value: BackendSettings) => void;
-  onSave: () => void;
+  autoSave: ReactNode;
   onQrLogin: () => void;
   onStart: () => void;
   onStop: () => void;
@@ -4989,10 +5011,7 @@ function WeixinConnectScreen({
               </div>
             </div>
             <div className="toolbar weixin-connect-actions">
-              <Button onClick={onSave} variant="outline">
-                <Save className="h-4 w-4" />
-                {t("保存")}
-              </Button>
+              {autoSave}
               <Button onClick={onQrLogin} variant="outline">
                 <ScanLine className="h-4 w-4" />
                 {form.weixinConnectToken ? t("重新登录") : t("扫码登录")}
@@ -5551,6 +5570,7 @@ function ProxySettingsScreen({
 
   return (
     <div className="settings-page proxy-settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <Panel>
         <CardHead
           title={t("本地协议代理")}
@@ -5822,15 +5842,6 @@ function ProxySettingsScreen({
 
       <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
 
-      {dirty ? (
-        <div className="settings-save-bar">
-          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-          <Button onClick={() => void actions.saveSettings()}>
-            <Save className="h-4 w-4" />
-            {t("保存设置")}
-          </Button>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -6667,7 +6678,9 @@ function RelayScreen({
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
           {normalized.relayProfilesEnabled ? (
             <>
-            <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+            {/* 分页与「新建」按钮同一行：按钮靠右，不再单独占一行把列表往下推。 */}
+            <div className="provider-view-bar">
+              <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
                 <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
                   <Cable className="h-4 w-4" />
                   <span>{t("直连")}</span>
@@ -6689,6 +6702,19 @@ function RelayScreen({
                   <CircleHelp className="provider-view-help" size={13} />
                 </button>
               </div>
+              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
+                <div className="provider-aggregate-toolbar">
+                  <Button
+                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
               {providerView === "direct" && !visibleProfiles.length ? (
                 <div className="provider-aggregate-empty">
                   <strong>{t("这个分页还没有直连供应商")}</strong>
@@ -6715,18 +6741,6 @@ function RelayScreen({
                   <strong>{t("还没有模型聚合配置")}</strong>
                   <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
                   <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
-                </div>
-              ) : null}
-              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
-                <div className="provider-aggregate-toolbar">
-                  <Button
-                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
-                    size="sm"
-                    variant="secondary"
-                  >
-                    <Plus className="h-4 w-4" />
-                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
-                  </Button>
                 </div>
               ) : null}
               <RelayProfileList
@@ -7592,6 +7606,22 @@ function AutoSaveStatus({ state }: { state: AutoSaveState }) {
       {state.state === "saved" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
       {state.state === "saved" ? t("已自动保存") : label}
     </span>
+  );
+}
+
+/// 设置表单的自动保存：改动后稍等片刻写入，替代原来的「保存设置」按钮。
+/// 做成组件而不是在各页面里直接调用 hook，方便在列表、面板等位置按需插入。
+function SettingsAutoSave({ dirty, form, actions, className = "" }: {
+  dirty: boolean;
+  form: BackendSettings;
+  actions: Actions;
+  className?: string;
+}) {
+  const state = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
+  return (
+    <div className={`enhance-save-actions settings-autosave ${className}`}>
+      <AutoSaveStatus state={state} />
+    </div>
   );
 }
 
@@ -9048,7 +9078,8 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   );
 }
 
-function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActive, sessionIndexRepairReport, sessionIndexRepairReportError, providerSyncTargets, selectedProviderSyncTarget, onFormChange, actions }: {
+function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRepairActive, sessionIndexRepairReport, sessionIndexRepairReportError, providerSyncTargets, selectedProviderSyncTarget, onFormChange, actions }: {
+  dirty: boolean;
   form: BackendSettings;
   providerSyncProgress: ProviderSyncProgress;
   sessionIndexRepairActive: boolean;
@@ -9166,11 +9197,8 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
                 <Wrench className="h-4 w-4" />
                 {sessionIndexRepairActive ? t("正在检查索引…") : t("修复会话索引")}
               </Button>
-              <Button onClick={() => void actions.saveSettings()}>
-                <Save className="h-4 w-4" />
-                {t("保存设置")}
-              </Button>
             </div>
+            <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
           </div>
 
           {providerSyncProgress.active || providerSyncProgress.percent > 0 ? (
@@ -9377,7 +9405,7 @@ function SessionsScreen({
             </div>
           </div>
 
-          <SessionRepairPanel form={form} providerSyncProgress={providerSyncProgress} sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport} sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets} selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={onFormChange} actions={actions} />
+          <SessionRepairPanel dirty={false} form={form} providerSyncProgress={providerSyncProgress} sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport} sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets} selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={onFormChange} actions={actions} />
         </CardContent>
       </Panel>
       <Panel className="sessions-list-panel">
@@ -9793,7 +9821,7 @@ function AboutScreen({
 /// Agent 专属设置页。
 ///
 /// 入口在侧栏各 Agent 自己的菜单里，只放跟随该 Agent 的选项：
-/// - **Codex**：供应商测试模型、图片覆盖层、额外启动参数
+/// - **Codex**：图片覆盖层、额外启动参数
 /// - **Grok / Claude**：供应商与模型在各自页面里管理，这里给出跳转
 ///
 /// 应用级选项（主题、配置备份、配置文件路径）在最左侧齿轮的「设置」里，
@@ -9811,23 +9839,8 @@ function AgentSettingsScreen({
 }) {
   return (
     <div className="settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <>
-        <Panel>
-          <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-          <CardContent className="settings-content setting-rows">
-            <SettingRow
-              title={t("供应商测试模型")}
-              description={t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-            >
-              <Input
-                value={form.relayTestModel}
-                onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
-                placeholder={t("例如 gpt-5.4-mini")}
-              />
-            </SettingRow>
-          </CardContent>
-        </Panel>
-
         <Panel>
           <SwitchPanelHead
             checked={form.codexAppImageOverlayEnabled}
@@ -9922,8 +9935,6 @@ function AgentSettingsScreen({
           </CardContent>
         </Panel>
       </>
-
-      <SettingsSaveBar dirty={dirty} actions={actions} />
     </div>
   );
 }
@@ -9934,12 +9945,14 @@ function AgentSettingsScreen({
 /// Agent 专属选项放在各 Agent 菜单的「设置」里，见 [AgentSettingsScreen]。
 function GlobalSettingsScreen({
   dirty,
+  form,
   settings,
   theme,
   actions,
   onOpenAgentSettings,
 }: {
   dirty: boolean;
+  form: BackendSettings;
   settings: SettingsResult | null;
   theme: Theme;
   actions: Actions;
@@ -9949,6 +9962,7 @@ function GlobalSettingsScreen({
   // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
   return (
     <div className="settings-page global-settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <Panel>
         <CardHead title={t("基础设置")} detail="" />
         <CardContent className="global-settings-list">
@@ -9985,7 +9999,7 @@ function GlobalSettingsScreen({
           <div className="global-setting-row">
             <div className="global-setting-copy">
               <strong>{t("Codex 专属设置")}</strong>
-              <span>{t("供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
+              <span>{t("图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
             </div>
             <div className="global-setting-actions">
               <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
@@ -9993,21 +10007,6 @@ function GlobalSettingsScreen({
           </div>
         </CardContent>
       </Panel>
-      <SettingsSaveBar dirty={dirty} actions={actions} />
-    </div>
-  );
-}
-
-/// 设置页底部的保存条：整体设置与 Agent 设置共用。
-function SettingsSaveBar({ dirty, actions }: { dirty: boolean; actions: Actions }) {
-  if (!dirty) return null;
-  return (
-    <div className="settings-save-bar">
-      <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-      <Button onClick={() => void actions.saveSettings()}>
-        <Save className="h-4 w-4" />
-        {t("保存设置")}
-      </Button>
     </div>
   );
 }
@@ -12453,16 +12452,9 @@ function RelayProfileEditor({
       <div className="relay-bottom-options">
         <RelayFold className="relay-advanced-block" defaultOpen sectionId="advanced" title={t("更多选项")}>
           <p className="relay-fold-description">
-            {t("包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。")}
+            {t("包含上下文大小与压缩阈值；留空即沿用全局默认值。")}
           </p>
           <div className="relay-advanced-fields">
-            <Field className="relay-field-test-model" label={t("测试模型")}>
-              <Input
-                value={profile.testModel}
-                onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
-                placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-              />
-            </Field>
             <Field className="relay-field-context-window" label={t("上下文大小")}>
               <Input
                 inputMode="numeric"
@@ -12789,13 +12781,6 @@ function AggregateRelayProfileEditor({
             placeholder={t("例如 主力聚合池")}
           />
         </Field>
-        {!modelMode ? <Field className="relay-field-test-model" label={t("测试模型")}>
-          <Input
-            value={profile.testModel}
-            onChange={(event) => onProfileChange({ ...profile, testModel: event.currentTarget.value })}
-            placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-          />
-        </Field> : null}
         {!modelMode ? (
           <Field className="aggregate-strategy-field" label={t("聚合策略")}>
             <AppSelect
@@ -14145,6 +14130,21 @@ function ClaudeLocalizationScreen() {
     claudeLocalizationMemo.autoDetected = true;
     void refresh();
   }, []);
+  /**
+   * Claude Desktop 是否已在 Computer Use 页接入 codex-plus-cu（含自定义目录）。
+   * 和这里的电脑控制同时开会让同一个对话里出现两套工具，用来提示二选一；读不到时按未接入处理。
+   */
+  const [claudeDesktopCuConnected, setClaudeDesktopCuConnected] = useState(false);
+  useEffect(() => {
+    const connected = (state?: string) => state === "registered" || state === "needs_update";
+    void invoke<{ targets?: Record<string, { state?: string }>; customTargets?: Array<{ kind?: string; state?: string }> }>("computer_use_status")
+      .then((result) => {
+        if (!mounted.current) return;
+        setClaudeDesktopCuConnected(connected(result.targets?.claudeDesktop?.state)
+          || Boolean(result.customTargets?.some((target) => target.kind === "claudeDesktop" && connected(target.state))));
+      })
+      .catch(() => undefined);
+  }, []);
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
     if (pending.current) return;
     pending.current = true;
@@ -14378,6 +14378,17 @@ function ClaudeLocalizationScreen() {
               </span>
               <ToggleVisual />
             </label>
+            {s?.computerUseSupported !== false ? (
+              s?.computerUse && claudeDesktopCuConnected ? (
+                <p className="claude-l10n-hint is-warning" role="alert">
+                  {t("Claude Desktop 同时接入了「Computer Use」页的 codex-plus-cu：同一个对话里会有两套电脑控制，Claude 可能混着调用、互相抢前台，同一个应用也要确认两次。建议二选一：保留这里的开关，就到「Computer Use」页撤销 Claude Desktop 的接入；或者关掉这里的开关。")}
+                </p>
+              ) : (
+                <p className="claude-l10n-hint">
+                  {t("这里的电脑控制和「Computer Use」页给 Claude Desktop 接入的 codex-plus-cu 是两套独立实现，同一个 Claude Desktop 里二选一即可，不要同时开。")}
+                </p>
+              )
+            ) : null}
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
                 {t("增强版还没制作：开关会先存下来，等你在上方制作好增强版并启动后生效。")}

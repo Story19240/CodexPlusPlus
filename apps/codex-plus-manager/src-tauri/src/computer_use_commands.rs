@@ -136,19 +136,38 @@ pub async fn computer_use_uninstall(target: String) -> CommandResult<Value> {
 
 /// 新增自定义接入目标（只登记，不写客户端配置；接入仍由用户点「接入」触发）。
 #[tauri::command]
-pub async fn computer_use_custom_add(kind: String, path: String) -> CommandResult<Value> {
+pub async fn computer_use_custom_add(
+    kind: String,
+    path: String,
+    name: Option<String>,
+) -> CommandResult<Value> {
     let kind = match codex_plus_core::computer_use::Target::parse(&kind) {
         Ok(kind) => kind,
         Err(error) => return failed(&error.to_string(), json!({})),
     };
+    let name = name.unwrap_or_default();
     let outcome = run_blocking(move || {
-        codex_plus_core::computer_use::add_custom_target(kind, &path)?;
+        codex_plus_core::computer_use::add_custom_target(kind, &path, &name)?;
         codex_plus_core::computer_use::status()
     })
     .await;
     match outcome {
         Ok(report) => ok(
             "已添加自定义目标；点「接入」写入配置。",
+            serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 给自定义目标改名：只改界面显示名，不动客户端配置。`name` 为空恢复默认显示。
+#[tauri::command]
+pub async fn computer_use_custom_rename(id: String, name: String) -> CommandResult<Value> {
+    let outcome =
+        run_blocking(move || codex_plus_core::computer_use::rename_custom_target(&id, &name)).await;
+    match outcome {
+        Ok(report) => ok(
+            "已更新名称。",
             serde_json::to_value(report).unwrap_or_else(|_| json!({})),
         ),
         Err(error) => failed(&error, json!({})),
@@ -291,7 +310,7 @@ pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
 
 /// 当前审批策略与已记忆的应用。
 ///
-/// `auto` = 全部放行（只留痕）；`claude` = 交给 MCP 客户端审批。
+/// `auto` = 全部放行（只留痕）；`claude` = 弹卡确认（转给当前连接的 MCP 客户端，同 Codex）。
 #[tauri::command]
 pub async fn computer_use_approval_get() -> CommandResult<Value> {
     let mode = codex_plus_core::computer_use_approval::ApprovalMode::current();
@@ -299,6 +318,12 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
         "已读取审批策略。",
         json!({
             "mode": mode.id(),
+            // 操作方式：tools（离散工具）/ js（cua_repl）。
+            "cuMode": codex_plus_core::computer_use_proxy::CuMode::current().id(),
+            "pip": codex_plus_core::settings::SettingsStore::default()
+                .load()
+                .map(|settings| settings.computer_use_pip)
+                .unwrap_or(true),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
             "lastClient": codex_plus_core::computer_use_approval::last_client(),
             // 浏览器标签的清理靠 Claude Code 的 Stop 钩子；装上没有要在页面上说清楚。
@@ -328,12 +353,53 @@ pub async fn computer_use_approval_set(mode: String) -> CommandResult<Value> {
     })
     .await
     {
-        Ok(()) => ok("审批策略已保存；对下一个 Claude 会话生效。", json!({})),
+        Ok(()) => ok("审批策略已保存；对新开的客户端会话生效。", json!({})),
         Err(error) => failed(&error, json!({})),
     }
 }
 
-/// 撤销某个应用的审批记忆。
+/// 切换操作方式：`tools`（离散工具）或 `js`（cua_repl，和 Codex 一致）。
+/// 写进 `settings.json` 的 `computerUseMode`，只改这一个键；MCP 进程启动时读取。
+#[tauri::command]
+pub async fn computer_use_mode_set(mode: String) -> CommandResult<Value> {
+    if !matches!(mode.as_str(), "tools" | "js") {
+        return failed("操作方式只能是 tools 或 js", json!({}));
+    }
+    match run_blocking(move || -> anyhow::Result<()> {
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.computer_use_mode = mode;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(()) => ok("操作方式已保存；对新开的客户端会话生效。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 开关「操作时显示悬浮预览」。写进 `settings.json` 的 `computerUsePip`，只改这一个键。
+#[tauri::command]
+pub async fn computer_use_pip_set(enabled: bool) -> CommandResult<Value> {
+    match run_blocking(move || -> anyhow::Result<()> {
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.computer_use_pip = enabled;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(()) => ok(
+            if enabled { "已开启悬浮预览。" } else { "已关闭悬浮预览。" },
+            json!({}),
+        ),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 撤销某个应用的「始终允许」：Computer Use 自己的记录（与 Codex 共用）和旧版文件都删。
 #[tauri::command]
 pub async fn computer_use_approval_forget(app: String) -> CommandResult<Value> {
     match run_blocking(move || codex_plus_core::computer_use_approval::ApprovalStore::forget(&app))

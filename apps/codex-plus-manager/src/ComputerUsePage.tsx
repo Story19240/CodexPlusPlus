@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, AppWindow, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug } from "lucide-react";
+import { AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { PageHeader } from "./ManagementPages";
 import { t, tf } from "./i18n";
@@ -12,8 +12,14 @@ type CuTargetId = "claudeCode" | "claudeDesktop" | "codex" | "dsh" | "zcode" | "
 type CuTargetState = "registered" | "missing" | "needs_update" | "foreign" | "unsupported";
 type CuTarget = { id: string; label: string; configPath: string; registered: boolean; state: CuTargetState; message: string };
 type CuTargets = Record<CuTargetId, CuTarget>;
-/** 自定义目标：同一种客户端换一个配置目录，id 形如 `custom-…`。 */
-type CuCustomTarget = CuTarget & { kind: CuTargetId; path: string };
+/**
+ * 自定义目标：同一种客户端换一个配置目录，id 形如 `custom-…`。
+ * `name` 是用户起的名字（可能为空）；`label` 已按它取好显示名，没起名时是客户端类型名。
+ */
+type CuCustomTarget = CuTarget & { kind: CuTargetId; path: string; name: string };
+
+/** 自定义目标名字的长度上限，与后端 `CUSTOM_NAME_MAX_CHARS` 一致。 */
+const CUSTOM_NAME_MAX = 40;
 type CuStatus = {
   status: string;
   message: string;
@@ -43,12 +49,23 @@ type CuCheck = {
 type CuResult = { status: string; message: string };
 type CuTab = "overview" | "preview" | "diagnose";
 type CuApprovalMode = "auto" | "claude";
-type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
+/** 操作方式：cua_repl 的 js（默认，和 Codex 当前主要路径一致），或离散工具（直通原生 CU）。 */
+type CuMode = "tools" | "js";
+
+/**
+ * 本页的几个开关（操作方式、审批策略、悬浮预览）由后端单独写进 settings.json，文件版本号会变。
+ * 通知主界面同步，否则它表单里的旧版本号会让之后的设置保存报「已被其他操作更新」。
+ */
+export const BACKEND_SETTINGS_CHANGED_EVENT = "codex-plus:backend-settings-changed";
+const announceSettingsChanged = () => window.dispatchEvent(new Event(BACKEND_SETTINGS_CHANGED_EVENT));
+type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number; source?: string };
 type CuLastClient = { name?: string; version?: string; elicitation?: boolean; at?: number };
 type CuApprovalState = {
   status?: string;
   message?: string;
   mode?: CuApprovalMode;
+  cuMode?: CuMode;
+  pip?: boolean;
   approvals?: Array<[string, CuApprovedApp]>;
   lastClient?: CuLastClient | null;
   turnHooks?: { installed?: boolean; events?: string[]; settings?: string } | null;
@@ -105,7 +122,7 @@ function failureText(check: CuCheck): string {
     case "runtime_missing": return t("没找到 ChatGPT.app，请先安装 Codex 桌面版");
     case "untrusted_parent": return t("Computer Use 拒绝了本次调用：ChatGPT.app 版本不兼容，请更新后再试");
     case "permission_required": return t("请在系统设置里给 ChatGPT 授予辅助功能/屏幕录制权限");
-    case "client_unsupported": return t("当前 Claude Code 版本不支持审批表单（elicitation）");
+    case "client_unsupported": return t("当前客户端不支持审批卡（elicitation）");
     case "service_unavailable": return t("Computer Use 服务未就绪，先打开一次 Codex 的 Computer Use");
     case "error": return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
     default: return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
@@ -118,6 +135,9 @@ export function ComputerUsePage() {
   const [backups, setBackups] = useState<Record<string, string>>({});
   const [newKind, setNewKind] = useState<CuTargetId>("claudeCode");
   const [newPath, setNewPath] = useState("");
+  const [newName, setNewName] = useState("");
+  /** 正在改名的自定义目标与草稿。 */
+  const [renaming, setRenaming] = useState<{ id: string; draft: string } | null>(null);
   const [tab, setTab] = useState<CuTab>("overview");
   // 图下方「配置路径与自定义目录」折叠区：图里的「添加自定义配置目录」会展开并滚到这里。
   const [showTargets, setShowTargets] = useState(false);
@@ -151,10 +171,61 @@ export function ComputerUsePage() {
       const result = await invoke<CuResult>("computer_use_approval_set", { mode });
       if (!mounted.current) return;
       if (result.status === "ok") {
+        announceSettingsChanged();
         setNotice(result.message || t("审批策略已保存。"));
         await loadApproval();
       } else {
         setActionError(result.message || t("保存审批策略失败。"));
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const changeCuMode = async (mode: CuMode) => {
+    if (lock.current || approval?.cuMode === mode) return;
+    lock.current = true;
+    setBusy("cuMode");
+    setActionError("");
+    try {
+      const result = await invoke<CuResult>("computer_use_mode_set", { mode });
+      if (!mounted.current) return;
+      if (result.status === "ok") {
+        announceSettingsChanged();
+        setNotice(result.message || t("操作方式已保存；对新开的客户端会话生效。"));
+        await loadApproval();
+      } else {
+        setActionError(result.message || t("保存操作方式失败。"));
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const changePip = async (enabled: boolean) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("pip");
+    setActionError("");
+    try {
+      const result = await invoke<CuResult>("computer_use_pip_set", { enabled });
+      if (!mounted.current) return;
+      if (result.status === "ok") {
+        announceSettingsChanged();
+        setNotice(result.message || (enabled ? t("已开启悬浮预览。") : t("已关闭悬浮预览。")));
+        await loadApproval();
+      } else {
+        setActionError(result.message || t("保存失败，请重试。"));
       }
     } catch (reason) {
       if (mounted.current) setActionError(errorText(reason));
@@ -325,14 +396,49 @@ export function ComputerUsePage() {
     setActionError("");
     setNotice("");
     try {
-      const result = await invoke<CuStatus>("computer_use_custom_add", { kind: newKind, path: newPath.trim() });
+      const result = await invoke<CuStatus>("computer_use_custom_add", { kind: newKind, path: newPath.trim(), name: newName.trim() });
       if (!mounted.current || epoch.current !== stamp) return;
       if (result.status === "ok") {
         setStatus(result);
         setNewPath("");
+        setNewName("");
         setNotice(result.message || t("已添加自定义目标；点「接入」写入配置。"));
       } else {
         setActionError(result.message || t("添加失败，请重试。"));
+      }
+    } catch (reason) {
+      if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current && epoch.current === stamp) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  /** 改名只改显示名，不动客户端配置；名字清空表示恢复默认显示（客户端类型名）。 */
+  const renameCustomTarget = async () => {
+    if (lock.current || !renaming) return;
+    const { id, draft } = renaming;
+    const current = status?.customTargets?.find((item) => item.id === id);
+    if (current && current.name === draft.trim()) {
+      setRenaming(null);
+      return;
+    }
+    lock.current = true;
+    const stamp = ++epoch.current;
+    setBusy(`custom:rename:${id}`);
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuStatus>("computer_use_custom_rename", { id, name: draft.trim() });
+      if (!mounted.current || epoch.current !== stamp) return;
+      if (result.status === "ok") {
+        setStatus(result);
+        setRenaming(null);
+        setNotice(result.message || t("已更新名称。"));
+      } else {
+        setActionError(result.message || t("改名失败，请重试。"));
       }
     } catch (reason) {
       if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
@@ -418,6 +524,7 @@ export function ComputerUsePage() {
     { id: "diagnose", label: t("诊断") },
   ];
   const approvalMode: CuApprovalMode = approval?.mode ?? "auto";
+  const cuMode: CuMode = approval?.cuMode ?? "js";
 
   /** 图里的一个客户端：状态点 + 名称 + 一键接入/移除。路径等细节放在悬停提示与下方折叠区。 */
   const flowClient = (id: string, label: string, target: CuTarget | undefined, custom?: CuCustomTarget) => {
@@ -470,14 +577,15 @@ export function ComputerUsePage() {
   /**
    * 交互式工作原理图：客户端 → Codex++ 两个 MCP 服务 → Codex 运行时 → 被操作的对象。
    *
-   * 接入与审批直接在图上操作：左列每个客户端一键接入/移除；审批方式开关放在 codex-plus-cu
-   * 节点上，因为审批就发生在这一步。用 CSS grid 而不是 SVG，文字随窗口换行、跟随主题。
+   * 接入直接在图上操作：左列每个客户端一键接入/移除。codex-plus-cu 节点只显示当前的操作方式、
+   * 审批与悬浮预览状态，开关放在图下方的设置区——塞进节点会把整张图的行高撑开。
+   * 用 CSS grid 而不是 SVG，文字随窗口换行、跟随主题。
    */
   const renderFlow = () => <section className="cu-card cu-flow-card" aria-labelledby="cu-flow-title">
     <div className="cu-card-head">
       <div>
         <h2 id="cu-flow-title">{t("工作原理")}</h2>
-        <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」，codex-plus-cu 上选审批方式。")}</p>
+        <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式、审批与悬浮预览在图下方设置。")}</p>
       </div>
     </div>
     <div className="cu-flow-scroll">
@@ -499,17 +607,10 @@ export function ComputerUsePage() {
 
         <div className="cu-flow-lane-a" style={{ gridColumn: 3 }}>
           {flowNode(<MousePointerClick size={16} />, "codex-plus-cu", t("桌面操控"), "cu",
-            <div className="cu-flow-approval">
-              <span>{t("首次接管某个应用时")}</span>
-              <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
-                <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
-                  title={t("自动放行所有应用，只记审计日志。")} onClick={() => void changeApprovalMode("auto")}>{t("自动放行")}</button>
-                <button type="button" role="radio" aria-checked={approvalMode === "claude"} data-active={approvalMode === "claude"} disabled={locked}
-                  title={t("把许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("交给 Claude")}</button>
-              </div>
-              {approvalMode === "claude" && approval?.lastClient?.elicitation === false
-                ? <small className="cu-flow-warn">{t("最近连接的客户端不支持审批卡，会退回自动放行")}</small>
-                : null}
+            <div className="cu-flow-summary" title={t("在下方「codex-plus-cu 设置」里修改")}>
+              <span data-accent={cuMode === "js" ? "true" : undefined}>{cuMode === "js" ? t("JS") : t("离散工具")}</span>
+              <span>{approvalMode === "auto" ? t("自动放行") : t("弹卡确认")}</span>
+              {approval?.pip ?? true ? <span>{t("悬浮预览")}</span> : null}
             </div>)}
         </div>
         <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 4 }}><span><ShieldCheck size={12} aria-hidden="true" />{t("审批")}</span></div>
@@ -521,7 +622,8 @@ export function ComputerUsePage() {
         <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 6 }} />
         <div className="cu-flow-lane-a" style={{ gridColumn: 7 }}>{flowNode(<AppWindow size={16} />, t("本机桌面应用"), t("Finder、微信、系统设置…"), "target")}</div>
 
-        <div className="cu-flow-lane-b" style={{ gridColumn: 3 }}>{flowNode(<Globe size={16} />, "codex-plus-browser", t("浏览器控制"), "browser")}</div>
+        <div className="cu-flow-lane-b" style={{ gridColumn: 3 }}>{flowNode(<Globe size={16} />, "codex-plus-browser",
+          cuMode === "js" ? t("JS 方式下并入 codex-plus-cu，同 Codex") : t("浏览器控制"), "browser")}</div>
         <div className="cu-flow-link cu-flow-lane-b" style={{ gridColumn: 4 }} />
         <div className="cu-flow-lane-b" style={{ gridColumn: 5 }}>
           {flowNode(<Plug size={16} />, t("Chrome 扩展"),
@@ -535,7 +637,49 @@ export function ComputerUsePage() {
         <div className="cu-flow-lane-b" style={{ gridColumn: 7 }}>{flowNode(<Globe size={16} />, t("Chrome 标签页"), t("你已登录的真实浏览器"), "target")}</div>
       </div>
     </div>
-    <p className="cu-flow-foot">{t("接入后重启对应客户端，工具名以 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头。")}</p>
+    <div className="cu-settings" aria-labelledby="cu-settings-title">
+      <div className="cu-settings-head" id="cu-settings-title">{t("codex-plus-cu 设置")}<small>{t("对新开的客户端会话生效")}</small></div>
+      <div className="cu-setting">
+        <div className="cu-setting-copy">
+          <strong>{t("操作方式")}</strong>
+          <small>{t("推荐 JS：与 Codex 当前的用法一致，桌面和 Chrome 都在同一个 js 工具里；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}</small>
+          {cuMode === "js"
+            ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）。")}</small>
+            : <small className="cu-flow-warn">{t("离散工具每个动作一次调用，返回都带截图；中文需用 set_value。")}</small>}
+        </div>
+        <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
+          <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
+            title={t("和 Codex 一样，用 cua_repl 的 js 工具操作桌面与 Chrome；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
+          <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
+            title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
+        </div>
+      </div>
+      <div className="cu-setting">
+        <div className="cu-setting-copy">
+          <strong>{t("首次接管某个应用时")}</strong>
+          <small>{t("弹卡确认同 Codex：由当前连接的客户端（Claude Code、Codex 等）弹卡，拒绝即不放行，勾「始终允许」后这个应用以后不再问；客户端不支持弹卡时退回自动放行。自动放行：不询问，只记审计日志。")}</small>
+          {approvalMode === "claude" && approval?.lastClient?.elicitation === false
+            ? <small className="cu-flow-warn">{t("最近连接的客户端不支持审批卡，会退回自动放行")}</small>
+            : null}
+        </div>
+        <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
+          <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
+            title={t("自动放行所有应用，只记审计日志。")} onClick={() => void changeApprovalMode("auto")}>{t("自动放行")}</button>
+          <button type="button" role="radio" aria-checked={approvalMode === "claude"} data-active={approvalMode === "claude"} disabled={locked}
+            title={t("和 Codex 一样，把许可请求转给当前连接的客户端弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("弹卡确认")}</button>
+        </div>
+      </div>
+      <label className="cu-setting">
+        <span className="cu-setting-copy">
+          <strong>{t("操作后台应用时显示悬浮预览")}</strong>
+          <small>{t("同 Codex 的画中画：在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}</small>
+        </span>
+        <input className="cu-setting-check" type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
+      </label>
+    </div>
+    <p className="cu-flow-foot">{cuMode === "js"
+      ? t("接入后重启对应客户端。JS 方式下桌面与浏览器都用 mcp__codex-plus-cu__js，codex-plus-browser 不提供工具。")
+      : t("接入后重启对应客户端，工具名以 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头。")}</p>
   </section>;
 
   /** 一行接入目标。内置与自定义共用；传了 `custom` 才显示「自定义」标记和删除按钮。 */
@@ -548,8 +692,37 @@ export function ComputerUsePage() {
     return <div className="cu-target" key={id} data-custom={custom ? "true" : undefined}>
       <div className="cu-target-main">
         <div className="cu-target-title">
-          <strong>{label}</strong>
-          {custom && <span className="cu-badge cu-badge-custom">{t("自定义")}</span>}
+          {custom && renaming?.id === id
+            ? <span className="cu-rename">
+                <input
+                  aria-label={t("名称")}
+                  autoFocus
+                  className="cu-rename-input"
+                  disabled={locked}
+                  maxLength={CUSTOM_NAME_MAX}
+                  onChange={(event) => setRenaming({ id, draft: event.target.value })}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void renameCustomTarget();
+                    if (event.key === "Escape") setRenaming(null);
+                  }}
+                  placeholder={targetFallback[custom.kind]?.label}
+                  value={renaming.draft}
+                />
+                <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("保存名称")} aria-label={t("保存名称")} onClick={() => void renameCustomTarget()}>
+                  {busy === `custom:rename:${id}` ? <Loader2 size={12} className="cu-spin" /> : <Check size={12} />}
+                </button>
+                <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("取消")} aria-label={t("取消")} onClick={() => setRenaming(null)}>
+                  <X size={12} />
+                </button>
+              </span>
+            : <>
+                <strong>{label}</strong>
+                {custom && <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("改名")} aria-label={tf("给 {0} 改名", [label])} onClick={() => setRenaming({ id, draft: custom.name })}>
+                  <Pencil size={12} />
+                </button>}
+              </>}
+          {/* 起了名字时标签补上客户端类型，否则只看名字分不出是哪种客户端。 */}
+          {custom && <span className="cu-badge cu-badge-custom">{custom.name ? `${targetFallback[custom.kind]?.label ?? custom.kind} · ${t("自定义")}` : t("自定义")}</span>}
           <span className="cu-badge" data-state={status ? state : "unknown"}>{status ? stateLabel(state) : t("未检测")}</span>
         </div>
         <code className="cu-target-path" title={configPath}>{elidePath(configPath)}</code>
@@ -638,6 +811,17 @@ export function ComputerUsePage() {
                   {customKinds.map((kind) => <option key={kind} value={kind}>{targetFallback[kind].label}</option>)}
                 </select>
                 <input
+                  className="cu-custom-name"
+                  type="text"
+                  value={newName}
+                  disabled={locked}
+                  maxLength={CUSTOM_NAME_MAX}
+                  placeholder={t("名称（可选）")}
+                  aria-label={t("名称")}
+                  onChange={(event) => setNewName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter") void addCustomTarget(); }}
+                />
+                <input
                   className="cu-custom-path"
                   type="text"
                   value={newPath}
@@ -660,12 +844,12 @@ export function ComputerUsePage() {
         </details>
 
         <details className="cu-more">
-          <summary><strong>{t("审批记录")}</strong><small>{t("最近连接的客户端是否支持审批卡、浏览器回合钩子、已记住的应用。")}</small></summary>
+          <summary><strong>{t("审批记录")}</strong><small>{t("最近连接的客户端是否支持审批卡、浏览器回合钩子、始终允许的应用。")}</small></summary>
           <section className="cu-card" aria-labelledby="cu-approval-title">
             <div className="cu-card-head">
               <div>
                 <h2 id="cu-approval-title">{t("审批记录")}</h2>
-                <p>{t("审批方式在上图的 codex-plus-cu 节点里切换；这里是客户端能力与已记住的应用。")}</p>
+                <p>{t("审批方式在上方「codex-plus-cu 设置」里切换；这里是客户端能力与始终允许的应用。")}</p>
               </div>
             </div>
             {approval?.lastClient && <p
@@ -676,8 +860,8 @@ export function ComputerUsePage() {
               {approval.lastClient.elicitation
                 ? t("，支持审批卡。")
                 : approval.mode === "claude"
-                  ? t("，未声明审批卡能力（elicitation）。在这个客户端里「交给 Claude 审批」会退回为自动放行，不会弹卡。")
-                  : t("，未声明审批卡能力（elicitation）；如果切到「交给 Claude 审批」，在这个客户端里会退回为自动放行。")}
+                  ? t("，未声明审批卡能力（elicitation）。在这个客户端里「弹卡确认」会退回为自动放行，不会弹卡。")
+                  : t("，未声明审批卡能力（elicitation）；如果切到「弹卡确认」，在这个客户端里会退回为自动放行。")}
             </p>}
             {approval?.turnHooks && <p className={approval.turnHooks.installed ? "cu-hint" : "cu-note cu-note-warn"}>
               {approval.turnHooks.installed
@@ -686,8 +870,8 @@ export function ComputerUsePage() {
             </p>}
             {(approval?.approvals?.length ?? 0) > 0 && <div className="cu-approvals">
               <div className="cu-approvals-head">
-                <strong>{t("已记忆的应用")}</strong>
-                <button className="mg-button" type="button" disabled={locked} onClick={() => void clearApprovals()}>
+                <strong>{t("始终允许的应用")}</strong>
+                <button className="mg-button" type="button" disabled={locked} title={t("Codex 里的「始终允许」也会一起清掉。")} onClick={() => void clearApprovals()}>
                   {busy === "approval:clear" ? <Loader2 size={14} className="cu-spin" /> : null}{t("全部清空")}
                 </button>
               </div>
@@ -695,8 +879,11 @@ export function ComputerUsePage() {
                 {approval!.approvals!.map(([key, entry]) => (
                   <li key={key}>
                     <span className="cu-approval-name">{entry.displayName || key}</span>
-                    <code className="cu-approval-key" title={key}>{key}</code>
-                    <span className="cu-approval-decision" data-decision={entry.decision}>{entry.decision === "allow" ? t("允许") : t("拒绝")}</span>
+                    <code className="cu-approval-key" title={key}>{entry.displayName ? key : ""}</code>
+                    <span className="cu-approval-decision" data-decision={entry.decision}
+                      title={entry.source === "computer-use" ? t("Computer Use 自己记的，Codex 也读这一份；撤销后 Codex 里也会重新询问。") : t("旧版 Codex++ 记录，只对 Codex++ 生效。")}>
+                      {entry.decision !== "allow" ? t("拒绝") : entry.source === "computer-use" ? t("与 Codex 共用") : t("Codex++ 旧记录")}
+                    </span>
                     <button className="mg-button" type="button" disabled={locked} onClick={() => void forgetApproval(key)}>
                       {busy === `forget:${key}` ? <Loader2 size={13} className="cu-spin" /> : null}{t("撤销")}
                     </button>
@@ -704,7 +891,7 @@ export function ComputerUsePage() {
                 ))}
               </ul>
             </div>}
-            {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有记住任何应用。选择「交给 Claude 审批」后，Claude 批准过的应用会出现在这里。")}</p>}
+            {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有始终允许的应用。在「弹卡确认」的卡片上勾选「始终允许」，或在 Codex 里选「始终允许」后，应用会出现在这里（两边共用）。")}</p>}
           </section>
         </details>
       </>}

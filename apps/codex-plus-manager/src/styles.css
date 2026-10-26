@@ -2053,7 +2053,6 @@ body {
 .relay-field-name,
 .relay-field-mode,
 .relay-field-session-provider,
-.relay-field-test-model,
 .relay-field-config-model,
 .relay-field-context-window,
 .relay-field-auto-compact,
@@ -10834,6 +10833,8 @@ select {
 .claude-l10n-step[data-done="false"] .claude-l10n-step-body strong { color: hsl(var(--brand-accent)); }
 .claude-l10n-step-body small { display: block; margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 12.5px; line-height: 1.6; }
 .claude-l10n-hint { margin: 14px 0 0; padding-top: 14px; border-top: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 12.5px; line-height: 1.7; }
+/* 增强版电脑控制与 codex-plus-cu 同时接给 Claude Desktop 时的冲突提醒。 */
+.claude-l10n-hint.is-warning { color: hsl(var(--status-warning)); }
 @media (max-width: 1040px) { .claude-localization-page { grid-template-columns: minmax(0, 1fr); } }
 
 /* 概览卡：标题 + 状态徽标、四项数据卡、提示条与操作区。 */
@@ -11592,9 +11593,22 @@ select {
   font-size: 12px;
 }
 
+.relay-management-page .provider-view-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.relay-management-page .provider-view-bar .provider-aggregate-toolbar {
+  margin: 0;
+}
+
 /* 模式分页：降成与其它页一致的小号分段控件，不再像一排主按钮。 */
 .relay-management-page .provider-view-tabs {
-  margin: 0 0 12px;
+  margin: 0;
   border-color: hsl(var(--border));
   border-radius: 8px;
 }
@@ -12281,3 +12295,13 @@ select {
 .grok-provider-row .grok-provider-delete { opacity: 0; transition: opacity 0.16s ease; }
 .grok-provider-row:hover .grok-provider-delete,
 .grok-provider-row:focus-within .grok-provider-delete { opacity: 1; }
+
+/* 设置页的自动保存状态：靠右一行小字，替代原来底部的「保存设置」条。 */
+.settings-autosave {
+  justify-content: flex-end;
+  min-height: 20px;
+}
+
+.settings-page > .settings-autosave {
+  margin-bottom: -4px;
+}

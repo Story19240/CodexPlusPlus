@@ -136,7 +136,7 @@ impl Target {
     }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
@@ -181,6 +181,80 @@ const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
     "TMPDIR",
     "TZ",
 ];
+
+/// 代理变量。浏览器面打开新网站前要联网做一次安全检查（Codex 里借道应用自己的通道，
+/// 这里没有），国内网络缺了代理会一直卡到 30 秒超时（实测 2026-10-25）。
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// 子进程用的代理，按顺序取第一个有的：
+///
+/// 1. 调用方环境里的代理变量，原样透传；
+/// 2. 系统代理（图形界面客户端如 DeepSeek Harness 拉起时没有终端里的代理变量）；
+/// 3. 都没有、而且直连 chatgpt.com 连不上（国内无代理）：把代理指到本机一个没人监听的
+///    端口，让 Codex 组件访问 OpenAI 的请求（功能开关、错误上报）当场失败。
+///
+/// 第 3 条不是绕过验证：实测（2026-10-25）OpenAI 的地址连不上时，Codex 的浏览器组件本来
+/// 就会继续执行，打开新网站照样会发授权请求；问题只在于国内这些连接不报错、一直挂着，
+/// 整个调用卡到 30 秒超时。改成立刻失败后，新开标签页 0.6 秒完成。网页由 Chrome 自己加载，
+/// 不受这些变量影响。
+pub(crate) fn proxy_env() -> BTreeMap<String, String> {
+    let inherited: BTreeMap<String, String> = PROXY_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect();
+    if !inherited.is_empty() {
+        return inherited;
+    }
+    if let Some(proxy) = crate::proxy::detect_system_proxy() {
+        return proxy_vars(&proxy);
+    }
+    if openai_reachable() {
+        return BTreeMap::new();
+    }
+    proxy_vars(UNREACHABLE_PROXY)
+}
+
+/// 本机不会有人监听的端口（discard）：连接当场被拒。
+const UNREACHABLE_PROXY: &str = "http://127.0.0.1:9";
+
+fn proxy_vars(proxy: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in ["http_proxy", "https_proxy", "all_proxy"] {
+        env.insert(key.to_string(), proxy.to_string());
+        env.insert(key.to_uppercase(), proxy.to_string());
+    }
+    // 本机回环始终直连：Codex 组件之间有本地通信。
+    for key in ["no_proxy", "NO_PROXY"] {
+        env.insert(key.to_string(), "localhost,127.0.0.1,::1".to_string());
+    }
+    env
+}
+
+/// 直连 chatgpt.com:443 能否在 1.5 秒内建立 TCP 连接。国内无代理时这一步就会超时，
+/// 正是 Codex 组件会被挂住的情形。
+fn openai_reachable() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addresses) = ("chatgpt.com", 443).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .take(2)
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(1500)).is_ok())
+}
 
 /// 自定义 CA 证书路径，非空时透传，与 Codex 的 `CUSTOM_CA_ENV_KEYS` 一致。
 /// 原生 server 会联网上报统计，公司代理换了根证书时要靠它们。
@@ -271,9 +345,10 @@ impl RuntimeLocation {
         env.insert("CUA_REPL_ENABLED_SURFACES".into(), "browser".into());
         env.insert("BROWSER_USE_AVAILABLE_BACKENDS".into(), "chrome".into());
         env.insert("BROWSER_USE_TINYSKY_ENABLED".into(), "1".into());
+        // 与 Codex 插件配置（unified-computer-use 的 .mcp.json）原文一致。
         env.insert(
             "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME".into(),
-            "Control the Chrome browser in conjunction with the Chrome Plugin.".into(),
+            "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.".into(),
         );
         env
     }
@@ -293,6 +368,8 @@ impl RuntimeLocation {
     /// - `CODEX_HOME`：默认 `~/.codex` 时可有可无，Codex 目录不在默认位置时才需要。
     ///
     /// `SKY_CUA_SERVICE_PATH` 实测去掉后结果完全相同，不再传。
+    ///
+    /// 代理变量另算（见 [`proxy_env`]）：JS 档的浏览器面没有代理会卡死。
     pub(crate) fn native_client_env(&self) -> BTreeMap<String, String> {
         let mut env: BTreeMap<String, String> = NATIVE_ENV_PASSTHROUGH
             .iter()
@@ -309,6 +386,20 @@ impl RuntimeLocation {
         if let Some(cli) = &self.codex_cli {
             env.insert("CODEX_CLI_PATH".into(), cli.clone());
         }
+        env.extend(proxy_env());
+        env
+    }
+
+    /// JS 档 `cua_repl` 的完整环境：直通档的白名单（含 `CODEX_CLI_PATH`）加上
+    /// `cua_repl` / `node_repl` 需要的那几项，同样不继承调用方的环境。
+    ///
+    /// 和 Codex 一样桌面、浏览器两个面都开：一个 `js` 工具里既能 `cua.getApp` 也能
+    /// `cua.getTab`。这时 `codex-plus-browser` 不再暴露工具（见 `browser_use::serve`），
+    /// 免得两个进程抢同一批标签。Codex 的 `iab` / `mcpapps` 后端只在 Codex 应用里有，不开。
+    pub(crate) fn js_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.native_client_env();
+        env.extend(self.browser_env());
+        env.insert("CUA_REPL_ENABLED_SURFACES".into(), "browser,computer".into());
         env
     }
 
@@ -404,6 +495,8 @@ pub struct CustomTargetStatus {
     pub status: TargetStatus,
     pub kind: Target,
     pub path: String,
+    /// 用户起的名字（可能为空）。`status.label` 已经按它取了显示名。
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -651,6 +744,10 @@ pub struct CustomTarget {
     pub kind: Target,
     /// 用户填写的路径，原样保存：可以是配置目录，也可以直接是配置文件。
     pub path: String,
+    /// 用户起的名字，只用于界面显示；为空时显示客户端类型名。
+    /// 写进客户端配置的 MCP 服务名不受影响（仍是 `codex-plus-cu`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -673,7 +770,33 @@ impl Target {
     }
 }
 
+/// 自定义目标名字的长度上限（按字符计）。
+const CUSTOM_NAME_MAX_CHARS: usize = 40;
+
+/// 规整用户起的名字：去掉首尾空白；不允许控制字符和过长的名字。空字符串表示不起名。
+fn normalize_custom_name(name: &str) -> anyhow::Result<String> {
+    let trimmed = name.trim();
+    ensure!(
+        !trimmed.chars().any(char::is_control),
+        "名称不能包含换行等控制字符"
+    );
+    ensure!(
+        trimmed.chars().count() <= CUSTOM_NAME_MAX_CHARS,
+        "名称最多 {CUSTOM_NAME_MAX_CHARS} 个字"
+    );
+    Ok(trimmed.to_string())
+}
+
 impl CustomTarget {
+    /// 界面上显示的名字：起了名用名字，否则用客户端类型名。
+    pub fn display_name(&self) -> String {
+        if self.name.is_empty() {
+            self.kind.label().to_string()
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// 实际读写的配置文件。
     pub fn config_path(&self) -> PathBuf {
         self.config_path_in(&home_dir())
@@ -757,18 +880,39 @@ pub fn custom_target(id: &str) -> anyhow::Result<CustomTarget> {
         .with_context(|| format!("找不到自定义接入目标：{id}"))
 }
 
-/// 新增一个自定义目标（只登记，不写客户端配置）。
-pub fn add_custom_target(kind: Target, path: &str) -> anyhow::Result<CustomTarget> {
-    with_lock(|| add_custom_in(&custom_store_path(), kind, path, &home_dir()))
+/// 新增一个自定义目标（只登记，不写客户端配置）。`name` 可以为空。
+pub fn add_custom_target(kind: Target, path: &str, name: &str) -> anyhow::Result<CustomTarget> {
+    with_lock(|| add_custom_in(&custom_store_path(), kind, path, name, &home_dir()))
+}
+
+/// 给自定义目标改名（只改显示名，不动客户端配置）。`name` 为空表示恢复默认显示。
+pub fn rename_custom_target(id: &str, name: &str) -> anyhow::Result<StatusReport> {
+    with_lock(|| rename_custom_in(&custom_store_path(), id, name))?;
+    status()
+}
+
+fn rename_custom_in(store: &Path, id: &str, name: &str) -> anyhow::Result<CustomTarget> {
+    let name = normalize_custom_name(name)?;
+    let mut targets = load_custom_from(store)?;
+    let target = targets
+        .iter_mut()
+        .find(|target| target.id == id)
+        .with_context(|| format!("找不到自定义接入目标：{id}"))?;
+    target.name = name;
+    let renamed = target.clone();
+    save_custom_to(store, &targets)?;
+    Ok(renamed)
 }
 
 fn add_custom_in(
     store: &Path,
     kind: Target,
     input: &str,
+    name: &str,
     home: &Path,
 ) -> anyhow::Result<CustomTarget> {
     ensure!(CUSTOM_KINDS.contains(&kind), "{} 不支持自定义配置目录", kind.label());
+    let name = normalize_custom_name(name)?;
     let trimmed = input.trim();
     ensure!(!trimmed.is_empty(), "请填写配置目录");
     let file = resolve_custom_path(kind, trimmed, home);
@@ -802,7 +946,7 @@ fn add_custom_in(
         id = format!("{CUSTOM_ID_PREFIX}{stamp}-{suffix}");
         suffix += 1;
     }
-    let target = CustomTarget { id, kind, path: trimmed.to_string() };
+    let target = CustomTarget { id, kind, path: trimmed.to_string(), name };
     targets.push(target.clone());
     save_custom_to(store, &targets)?;
     Ok(target)
@@ -924,7 +1068,13 @@ fn custom_status(custom: &CustomTarget, runtime: Option<&RuntimeLocation>) -> Cu
         .map(|dir| format!("目录不存在：{}", dir.display()));
     let mut status = status_at(custom.kind, &[file], runtime, dir_missing);
     status.id = custom.id.clone();
-    CustomTargetStatus { status, kind: custom.kind, path: custom.path.clone() }
+    status.label = custom.display_name();
+    CustomTargetStatus {
+        status,
+        kind: custom.kind,
+        path: custom.path.clone(),
+        name: custom.name.clone(),
+    }
 }
 
 /// 按给定的配置文件判定接入状态。`home_missing` 非空时直接判为不支持。
@@ -1424,6 +1574,8 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut handshake_done = false;
     let mut request_sent = false;
+    // JS 档（`computerUseMode = js`）的工具面是 `cua_repl` 的 `js`，按工具面自动判断。
+    let mut js_mode = false;
     let mut failure: Option<HealthReport> = None;
 
     if let Err(error) = send_json(
@@ -1494,22 +1646,29 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
             continue;
         }
         if id == 2 {
-            let text = tool_names(&message).join(", ");
-            if !text.contains("get_app_state") || !text.contains("click") {
+            let names = tool_names(&message);
+            let text = names.join(", ");
+            js_mode = names.iter().any(|name| name == "js");
+            let tools_ok = if js_mode {
+                true
+            } else {
+                text.contains("get_app_state") && text.contains("click")
+            };
+            if !tools_ok {
                 failure = Some(probe_failure(
                     "service_unavailable",
                     &format!("Computer Use 工具面不符（拿到：{text}）"),
                 ));
                 continue;
             }
+            let call = if js_mode {
+                json!({ "name": "js", "arguments": { "code": crate::computer_use_js::PROBE_CODE } })
+            } else {
+                json!({ "name": "list_apps", "arguments": {} })
+            };
             let _ = send_json(
                 &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": { "name": "list_apps", "arguments": {} }
-                }),
+                &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call }),
             );
             request_sent = true;
             continue;
@@ -1532,8 +1691,14 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
                 .and_then(|result| result.get("isError"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if !is_error && !text.trim().is_empty() {
-                let (count, samples) = summarize_apps(&text);
+            // JS 档的首次输出还附带 cua_repl 的使用说明，应用列表在标记之间。
+            let apps = if js_mode {
+                crate::computer_use_js::probe_apps(&text).map(str::to_string)
+            } else {
+                Some(text.clone())
+            };
+            if !is_error && let Some(apps) = apps.filter(|apps| !apps.trim().is_empty()) {
+                let (count, samples) = summarize_apps(&apps);
                 kill_tree(&mut child);
                 return HealthReport {
                     ok: true,
@@ -1953,6 +2118,27 @@ mod tests {
     }
 
     #[test]
+    fn proxy_vars_cover_both_cases_and_bypass_loopback() {
+        let env = proxy_vars("http://127.0.0.1:7897");
+        for key in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            assert_eq!(env[key], "http://127.0.0.1:7897");
+        }
+        assert_eq!(env["no_proxy"], "localhost,127.0.0.1,::1");
+        assert!(env.keys().all(|key| PROXY_ENV_KEYS.contains(&key.as_str())));
+    }
+
+    #[test]
+    fn js_env_enables_browser_and_computer_like_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = sample_runtime(temp.path()).js_env();
+        assert_eq!(env["CUA_REPL_ENABLED_SURFACES"], "browser,computer");
+        assert_eq!(env["BROWSER_USE_AVAILABLE_BACKENDS"], "chrome");
+        assert_eq!(env["BROWSER_USE_TINYSKY_ENABLED"], "1");
+        assert!(env["NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME"].contains("Prefer this method"));
+        assert!(env.contains_key("NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE"));
+    }
+
+    #[test]
     fn native_client_env_only_carries_whitelisted_variables() {
         let temp = tempfile::tempdir().unwrap();
         let mut runtime = sample_runtime(temp.path());
@@ -1970,6 +2156,7 @@ mod tests {
             assert!(
                 NATIVE_ENV_PASSTHROUGH.contains(&key.as_str())
                     || CUSTOM_CA_ENV_KEYS.contains(&key.as_str())
+                    || PROXY_ENV_KEYS.contains(&key.as_str())
                     || key == "CODEX_HOME"
                     || key == "CODEX_CLI_PATH",
                 "unexpected env var {key}"
@@ -2226,30 +2413,73 @@ mod tests {
         let dir = home.join(".rec/config");
         fs::create_dir_all(&dir).unwrap();
 
-        let first = add_custom_in(&store, Target::ClaudeCode, "~/.rec/config", home).unwrap();
+        let first = add_custom_in(&store, Target::ClaudeCode, "~/.rec/config", "", home).unwrap();
         assert!(first.id.starts_with(CUSTOM_ID_PREFIX));
         assert_eq!(first.path, "~/.rec/config");
         assert_eq!(load_custom_from(&store).unwrap(), vec![first.clone()]);
 
         // 同类型同文件不能重复添加；同目录换个类型可以。
-        let duplicate = add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), home);
+        let duplicate = add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), "", home);
         assert!(duplicate.unwrap_err().to_string().contains("已经添加过"));
-        let second = add_custom_in(&store, Target::ClaudeDesktop, "~/.rec/config", home).unwrap();
+        let second = add_custom_in(&store, Target::ClaudeDesktop, "~/.rec/config", "", home).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(load_custom_from(&store).unwrap().len(), 2);
 
         // 目录不存在、相对路径、空路径、不支持的类型都拒绝，且不改存储。
-        assert!(add_custom_in(&store, Target::ClaudeCode, "~/missing/dir", home)
+        assert!(add_custom_in(&store, Target::ClaudeCode, "~/missing/dir", "", home)
             .unwrap_err()
             .to_string()
             .contains("目录不存在"));
-        assert!(add_custom_in(&store, Target::ClaudeCode, "relative/dir", home)
+        assert!(add_custom_in(&store, Target::ClaudeCode, "relative/dir", "", home)
             .unwrap_err()
             .to_string()
             .contains("绝对路径"));
-        assert!(add_custom_in(&store, Target::ClaudeCode, "   ", home).is_err());
-        assert!(add_custom_in(&store, Target::Codex, "~/.rec/config", home).is_err());
+        assert!(add_custom_in(&store, Target::ClaudeCode, "   ", "", home).is_err());
+        assert!(add_custom_in(&store, Target::Codex, "~/.rec/config", "", home).is_err());
         assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn custom_target_names_are_optional_validated_and_renamable() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let store = home.join("state").join(CUSTOM_STORE_FILE);
+        fs::create_dir_all(home.join(".rec/a")).unwrap();
+        fs::create_dir_all(home.join(".rec/b")).unwrap();
+
+        // 起了名就用名字显示，首尾空白去掉；不起名显示类型名，存储里也不写 name 字段。
+        let named = add_custom_in(&store, Target::ClaudeCode, "~/.rec/a", "  工作账号  ", home).unwrap();
+        assert_eq!(named.name, "工作账号");
+        assert_eq!(named.display_name(), "工作账号");
+        let plain = add_custom_in(&store, Target::ClaudeCode, "~/.rec/b", "", home).unwrap();
+        assert_eq!(plain.display_name(), "Claude Code");
+        let text = fs::read_to_string(&store).unwrap();
+        assert_eq!(text.matches("\"name\"").count(), 1);
+
+        // 控制字符、超长名字拒绝，且不改存储。
+        assert!(add_custom_in(&store, Target::ClaudeCode, "~/.rec/b", "a\nb", home).is_err());
+        let long = "名".repeat(CUSTOM_NAME_MAX_CHARS + 1);
+        assert!(rename_custom_in(&store, &named.id, &long).unwrap_err().to_string().contains("最多"));
+        assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+
+        // 改名只动名字；改成空字符串恢复默认显示；不存在的 id 报错。
+        let renamed = rename_custom_in(&store, &plain.id, "个人账号").unwrap();
+        assert_eq!(renamed.path, "~/.rec/b");
+        assert_eq!(load_custom_from(&store).unwrap()[1].name, "个人账号");
+        rename_custom_in(&store, &named.id, "   ").unwrap();
+        assert_eq!(load_custom_from(&store).unwrap()[0].display_name(), "Claude Code");
+        assert!(rename_custom_in(&store, "custom-missing", "x").is_err());
+    }
+
+    #[test]
+    fn custom_store_without_names_still_loads() {
+        // 旧版写的存储没有 name 字段。
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(CUSTOM_STORE_FILE);
+        fs::write(&store, r#"{"targets":[{"id":"custom-1","kind":"claudeCode","path":"/x"}]}"#).unwrap();
+        let targets = load_custom_from(&store).unwrap();
+        assert_eq!(targets[0].name, "");
+        assert_eq!(targets[0].display_name(), "Claude Code");
     }
 
     #[test]
@@ -2260,7 +2490,7 @@ mod tests {
         assert!(load_custom_from(&store).is_err());
         let dir = temp.path().join("cfg");
         fs::create_dir_all(&dir).unwrap();
-        assert!(add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), temp.path()).is_err());
+        assert!(add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), "", temp.path()).is_err());
         assert_eq!(fs::read_to_string(&store).unwrap(), "{ not json");
     }
 
@@ -2296,6 +2526,7 @@ mod tests {
             id: "custom-1".into(),
             kind: Target::ClaudeCode,
             path: "/tmp/rec/config/.claude.json".into(),
+            name: String::new(),
         };
         assert_eq!(
             target.claude_settings_path(),
