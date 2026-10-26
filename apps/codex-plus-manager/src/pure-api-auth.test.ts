@@ -4,10 +4,11 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 import { modelSlugFromRowName, suffixWindowString } from "./model-metadata.ts";
-import { normalizeRelayModelRoutes } from "./model-routes.ts";
+import { independentProxyEnabled, setIndependentProxyConfigured, requestCompatibilityEnabled, normalizeRelayModelRoutes } from "./model-routes.ts";
 import { sessionProviderForProtocol } from "./relay-session.ts";
 import { aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members.ts";
 import { relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey } from "./provider-api-keys.ts";
+import { resolveProviderName, tomlSectionStringValue } from "./provider-name.ts";
 
 // 执行 App 中实际使用的配置 helper，避免把另一份实现复制进测试。
 const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
@@ -39,9 +40,9 @@ const context = vm.createContext({
   exports: {},
   PROTOCOL_PROXY_BASE_URL: "http://127.0.0.1:57321/v1",
   CHAT_UPSTREAM_BASE_URL_KEY: "codex_plus_chat_base_url",
-  normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
+  requestCompatibilityEnabled, independentProxyEnabled, normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
   aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile,
-  relayProfileWithUpdatedApiKey,
+  relayProfileWithUpdatedApiKey, resolveProviderName, tomlSectionStringValue,
 });
 vm.runInContext(code, context);
 
@@ -61,6 +62,25 @@ test("new pure API files use explicit provider auth without requiring official l
   assert.match(generated.configContents, /requires_openai_auth = false/);
   assert.match(generated.configContents, /experimental_bearer_token = "fixture-provider-key"/);
   assert.equal(JSON.parse(generated.authContents).OPENAI_API_KEY, "fixture-provider-key");
+});
+
+test("independent proxy keeps generated and edited Responses configs local without losing upstream or other draft fields", () => {
+  const original = { ...profile(), id: "independent-proxy-regression", userAgent: "unsaved-draft-agent" };
+  setIndependentProxyConfigured(original.id, true);
+  try {
+    const generated = context.withGeneratedRelayFiles(original);
+    assert.match(generated.configContents, /base_url = "http:\/\/127\.0\.0\.1:57321\/v1"/);
+    const edited = context.applyRelayProfilePatchToFiles(original, { baseUrl: "https://edited.example/v1" });
+    assert.match(edited.configContents, /base_url = "http:\/\/127\.0\.0\.1:57321\/v1"/);
+    assert.equal(edited.upstreamBaseUrl, "https://edited.example/v1");
+    assert.equal(edited.userAgent, original.userAgent);
+    assert.equal(edited.apiKey, original.apiKey);
+    setIndependentProxyConfigured(original.id, false);
+    const cleared = context.applyRelayProfilePatchToFiles(edited, { baseUrl: edited.baseUrl });
+    assert.match(cleared.configContents, /base_url = "https:\/\/edited\.example\/v1"/);
+  } finally {
+    setIndependentProxyConfigured(original.id, false);
+  }
 });
 
 test("legacy false, missing, and true templates gain provider auth while preserving their settings", () => {
@@ -339,4 +359,37 @@ test("multiline prompt text never receives provider credentials or supplies fake
     assert.equal(context.codexExperimentalBearerTokenFromConfig(fixture.loaded), "fixture-provider-key");
     assert.equal(context.codexExperimentalBearerTokenFromConfig(fixture.reloaded), "fixture-edited-key");
   }
+});
+
+// issue #2682：改 Base URL 等字段时会走 ensureCodexProviderDefaults，
+// 它必须保留用户已写的 name，只在缺失/空白时回落到 provider id。
+test("editing other provider fields keeps a customized provider name", () => {
+  const original = [
+    'model_provider = "custom"',
+    '',
+    '[model_providers.custom]',
+    'name = "My relay"',
+    'wire_api = "responses"',
+    'base_url = "https://relay.example.invalid/v1"',
+    '',
+  ].join('\n');
+
+  const edited = context.setCodexProviderStringKey(original, 'base_url', 'https://relay2.example.invalid/v1');
+
+  assert.equal(context.tomlSectionStringValue(edited, 'model_providers.custom', 'name'), 'My relay');
+  assert.match(edited, /base_url = "https:\/\/relay2\.example\.invalid\/v1"/);
+});
+
+test("provider defaults still fill the name when it is missing or blank", () => {
+  const missing = 'model_provider = "custom"\n\n[model_providers.custom]\nwire_api = "responses"\n';
+  assert.equal(
+    context.tomlSectionStringValue(context.ensureCodexProviderDefaults(missing, 'custom'), 'model_providers.custom', 'name'),
+    'custom',
+  );
+
+  const blank = 'model_provider = "custom"\n\n[model_providers.custom]\nname = "   "\nwire_api = "responses"\n';
+  assert.equal(
+    context.tomlSectionStringValue(context.ensureCodexProviderDefaults(blank, 'custom'), 'model_providers.custom', 'name'),
+    'custom',
+  );
 });

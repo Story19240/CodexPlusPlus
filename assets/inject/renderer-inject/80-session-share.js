@@ -105,6 +105,7 @@
         const result = await postJson("/undo", { undo_token: undoToken });
         toast.textContent = result.message || "撤销完成";
         if (result.status === "undone") {
+          settings.onUndone?.();
           const refreshed = await refreshRecentConversationsForHost();
           if (!refreshed) window.location.reload();
         }
@@ -498,6 +499,59 @@
     return !!left?.session_id && !!left?.host_id && left.session_id === right?.session_id && left.host_id === right?.host_id;
   }
 
+  /**
+   * 已删除会话的侧栏行隐藏表（#2614）。
+   *
+   * 删除后只移除当前 DOM 行不够：通知 Codex 重读列表依赖内部模块，新版 Codex 里
+   * 已找不到，Codex 内存中的列表仍含这条会话，进设置页再返回时 React 重建侧栏，
+   * 它又会出现，直到重启。这里用一张样式表按原始 thread id 隐藏，React 重建出
+   * 的同 id 行也一并隐藏；不走扫描调度，不会产生自喂扫描。撤销时移除对应规则。
+   */
+  const deletedSessionRowStyleId = "codex-plus-deleted-session-rows";
+  const deletedSessionRowIds = window.__codexPlusDeletedSessionRowIds instanceof Set
+    ? window.__codexPlusDeletedSessionRowIds
+    : (window.__codexPlusDeletedSessionRowIds = new Set());
+
+  function renderDeletedSessionRowStyle() {
+    let style = document.getElementById(deletedSessionRowStyleId);
+    if (!deletedSessionRowIds.size) {
+      style?.remove();
+      return;
+    }
+    if (!style) {
+      style = document.createElement("style");
+      style.id = deletedSessionRowStyleId;
+      style.setAttribute("data-codex-plus-ext", "deleted-session-rows");
+      document.head.appendChild(style);
+    }
+    // Codex 的行属性是带前缀的编码值（`local:<thread>`），React 重建时同一会话
+    // 可能换成另一种写法（裸 id / 带前缀 / 带 host 作用域）。只按删除时读到的原值
+    // 精确匹配会漏掉这些变体，行就会重新出现（#2671）。thread uuid 全局唯一，
+    // 用后缀匹配覆盖全部写法；拿不到 uuid 时才退回精确匹配原值。
+    const rules = new Set();
+    for (const id of deletedSessionRowIds) {
+      const uuid = normalizedCodexThreadUuid(id);
+      if (uuid) rules.add(`[data-app-action-sidebar-thread-id$="${CSS.escape(uuid)}"]{display:none !important}`);
+      else rules.add(`[data-app-action-sidebar-thread-id="${CSS.escape(id)}"]{display:none !important}`);
+    }
+    style.textContent = Array.from(rules).join("\n");
+  }
+
+  function hideDeletedSessionRows(rawThreadId) {
+    if (!rawThreadId || isClientNewThreadId(rawThreadId)) return;
+    deletedSessionRowIds.add(rawThreadId);
+    renderDeletedSessionRowStyle();
+  }
+
+  function unhideDeletedSessionRows(rawThreadIds) {
+    let changed = false;
+    for (const id of rawThreadIds || []) changed = deletedSessionRowIds.delete(id) || changed;
+    if (changed) renderDeletedSessionRowStyle();
+  }
+
+  // 注入脚本重跑（页面未刷新）时按已记录的 id 恢复样式表；首次加载 Set 为空，不做任何事。
+  if (deletedSessionRowIds.size) renderDeletedSessionRowStyle();
+
   function removeDeletedRow(row, button, ref, requestContext) {
     // 删除响应期间，React 可能复用或替换 sidebar 行；不能删除其新身份的 DOM。
     if (!row.isConnected || !sameDeletedSessionRef(sessionRefFromRow(row), ref)) return null;
@@ -510,13 +564,23 @@
     if (shouldLeave) {
       // 已审 native 的 New chat 按钮以 aria-label/newChatMessage 调用 onStartChat。
       // 只走唯一可见的原生 sidebar 控件；不猜内部路由，也不强制 reload。
-      const navigation = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
-        .filter((candidate) => visibleElement(candidate) && !candidate.disabled && !isExtensionUiNode(candidate)
+      const newChatButtons = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
+        .filter((candidate) => !candidate.disabled && !isExtensionUiNode(candidate)
           && candidate.closest("aside.app-shell-left-panel, nav[data-app-navigation-rail]")
           && /^(新聊天|新对话|New chat|New thread)$/i.test((candidate.getAttribute("aria-label") || candidate.textContent || "").trim()));
+      // 先只用可见的候选；侧栏折叠或被隐藏时新聊天按钮不可见，再退回不判可见的
+      // 唯一候选——按钮还在 DOM 里，React 的 onClick 照样能触发（#2671）。
+      const visibleNewChat = newChatButtons.filter(visibleElement);
+      const navigation = visibleNewChat.length === 1 ? visibleNewChat : newChatButtons;
       if (navigation.length === 1) {
         navigation[0].click();
         navigated = true;
+        if (!visibleElement(navigation[0])) {
+          sendCodexPlusDiagnostic("delete_session_new_chat_fallback", {
+            candidateCount: newChatButtons.length,
+            visibleCount: visibleNewChat.length,
+          });
+        }
       }
     }
     // 原生导航也可能同步重建行，移除前再确认一次，保护被复用的节点。
@@ -568,11 +632,23 @@
         }
         // 远端由原生同主机 thread/deleted 通知更新，不能移除可能已重用的本地 DOM。
         let navigationNotice = null;
+        let hiddenRowIds = [];
         if (ref.host_id === "local") {
+          // 在移除前读原始 id：行可能带 host 前缀，与规范化后的 session_id 不同。
+          const rawThreadId = row.isConnected && sameDeletedSessionRef(sessionRefFromRow(row), ref)
+            ? row.getAttribute("data-app-action-sidebar-thread-id") || ""
+            : "";
           navigationNotice = removeDeletedRow(row, button, ref, requestContext);
+          if (rawThreadId) {
+            hideDeletedSessionRows(rawThreadId);
+            hiddenRowIds = [rawThreadId];
+          }
           await refreshRecentConversationsForHost();
         }
-        showToast(navigationNotice || result.message || "删除成功", result.undo_token);
+        showToast(navigationNotice || result.message || "删除成功", {
+          undoToken: result.undo_token,
+          onUndone: () => unhideDeletedSessionRows(hiddenRowIds),
+        });
       } else {
         showToast(result.message || "删除失败", null);
       }

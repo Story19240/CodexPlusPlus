@@ -4,6 +4,8 @@ use codex_plus_core::watcher::{
     macos_launcher_process_names, macos_launch_agent_installed_at, macos_launch_agent_path_at,
     macos_launch_agent_plist, process_id_is_running, process_ids_still_running,
     remove_macos_launch_agent_at, should_recover_stale_launcher, watcher_disabled_flag,
+    set_watcher_start_codex_at, set_watcher_start_codex_on_open_at, set_watcher_start_minimized_at,
+    watcher_start_codex_at, watcher_start_codex_on_open_at, watcher_start_minimized_at,
     write_macos_launch_agent_at,
 };
 
@@ -23,6 +25,14 @@ fn cdp_listening_returns_true_for_bound_loopback_port() {
 
 #[test]
 fn cdp_listening_returns_true_for_bound_ipv6_loopback_port() {
+    // Windows 环境可能禁用 IPv6 loopback 访问；不可用时跳过这个环境专用回归。
+    let probe_listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let probe_port = probe_listener.local_addr().unwrap().port();
+    if std::net::TcpStream::connect(("::1", probe_port)).is_err() {
+        return;
+    }
+    drop(probe_listener);
+
     let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -49,6 +59,42 @@ fn watcher_enable_and_disable_toggle_flag() {
 
     enable_watcher_at(dir.path()).unwrap();
     assert!(!flag.exists());
+}
+
+#[test]
+fn watcher_start_minimized_is_a_separate_persistent_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!watcher_start_minimized_at(dir.path()));
+
+    set_watcher_start_minimized_at(dir.path(), true).unwrap();
+    assert!(watcher_start_minimized_at(dir.path()));
+
+    set_watcher_start_minimized_at(dir.path(), false).unwrap();
+    assert!(!watcher_start_minimized_at(dir.path()));
+}
+
+#[test]
+fn watcher_start_codex_is_a_separate_persistent_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!watcher_start_codex_at(dir.path()));
+
+    set_watcher_start_codex_at(dir.path(), true).unwrap();
+    assert!(watcher_start_codex_at(dir.path()));
+
+    set_watcher_start_codex_at(dir.path(), false).unwrap();
+    assert!(!watcher_start_codex_at(dir.path()));
+}
+
+#[test]
+fn watcher_start_codex_on_open_is_a_separate_persistent_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!watcher_start_codex_on_open_at(dir.path()));
+
+    set_watcher_start_codex_on_open_at(dir.path(), true).unwrap();
+    assert!(watcher_start_codex_on_open_at(dir.path()));
+
+    set_watcher_start_codex_on_open_at(dir.path(), false).unwrap();
+    assert!(!watcher_start_codex_on_open_at(dir.path()));
 }
 
 #[test]

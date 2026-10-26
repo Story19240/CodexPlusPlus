@@ -138,6 +138,16 @@ pub struct RelayProfile {
         skip_serializing_if = "is_false"
     )]
     pub web_search_history_compat: bool,
+    /// 只保留用户指定外部目录中的 Lite 声明，不为未知模型猜测能力。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trust_upstream_catalog_lite: bool,
+    /// 明确选择严格 Responses 历史契约；默认不改写历史。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_responses_reasoning: bool,
+    /// Codex「替我审批」固定请求 `codex-auto-review`，第三方上游通常不认识这个模型；
+    /// 填写后协议代理把它改写成这里的模型（#1446）。留空则原样转发。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_model: String,
     /// Anthropic 上游的认证字段：`x-api-key`（默认，Anthropic 原生）或
     /// `authorization`（多数 Claude 系中转网关用 Bearer）。
     #[serde(
@@ -330,6 +340,9 @@ impl Default for RelayProfile {
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
             web_search_history_compat: false,
+            trust_upstream_catalog_lite: false,
+            strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -349,6 +362,12 @@ impl RelayProfile {
         self.relay_mode == RelayMode::PureApi && self.no_auth
     }
 
+    /// 独立代理由本地转发层消费；纯官方 OAuth 不接管其网络请求。
+    pub fn uses_independent_proxy(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && crate::relay_proxy::configured_proxy_for_profile(&self.id).is_some()
+    }
+
     pub fn web_search_history_compat_enabled(&self) -> bool {
         self.web_search_history_compat
             && self.protocol == RelayProtocol::Responses
@@ -360,6 +379,46 @@ impl RelayProfile {
         self.model_routes
             .iter()
             .any(|route| !route.model.trim().is_empty() && !route.target_relay_id.trim().is_empty())
+    }
+
+    pub fn model_reasoning_parameters(&self, model: &str) -> &str {
+        // 只接受明确已知策略，旧配置与无效值维持自动兼容。
+        let Ok(entries) = serde_json::from_str::<BTreeMap<String, Value>>(&self.model_metadata) else {
+            return "auto";
+        };
+        let Some(metadata) = crate::model_suffix::lookup_model_map(&entries, model) else {
+            return "auto";
+        };
+        match metadata.get("codex_plus_reasoning_parameters").and_then(Value::as_str) {
+            Some("omit") => "omit",
+            Some("passthrough") => "passthrough",
+            _ => "auto",
+        }
+    }
+
+    /// 配置了「自动审批模型」时需要经本地协议代理改写 codex-auto-review（#1446），
+    /// 否则 Responses 直连的供应商根本不经过代理，填了也不生效（#1021）。
+    pub fn rewrites_auto_review_model(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && !self.auto_review_model.trim().is_empty()
+    }
+
+    pub fn request_compatibility_enabled(&self) -> bool {
+        if self.relay_mode == RelayMode::Official && !self.official_mix_api_key {
+            return false;
+        }
+        if self.protocol == RelayProtocol::Responses && self.strict_responses_reasoning {
+            return true;
+        }
+        if !self.model_metadata.contains("codex_plus_reasoning_parameters") {
+            return false;
+        }
+        serde_json::from_str::<Value>(&self.model_metadata).ok().is_some_and(|map| {
+            map.as_object().is_some_and(|map| map.values().any(|entry| {
+                matches!(entry.get("codex_plus_reasoning_parameters").and_then(Value::as_str),
+                    Some("omit" | "passthrough"))
+            }))
+        })
     }
 
     /// 上游协议是否需要本地协议代理转换（Codex 侧恒以 Responses 说话）。
@@ -700,6 +759,10 @@ pub struct BackendSettings {
     pub codex_extra_args: Vec<String>,
     #[serde(rename = "providerSyncEnabled", default)]
     pub provider_sync_enabled: bool,
+    /// 切换供应商/默认模型后，下次启动前把仍停在旧默认模型的会话迁到新默认（#2081）。
+    /// 默认关闭；用户手动改过模型的会话不受影响。
+    #[serde(rename = "threadModelFollowSwitchEnabled", default)]
+    pub thread_model_follow_switch_enabled: bool,
     #[serde(rename = "providerSyncSavedProviders", default)]
     pub provider_sync_saved_providers: Vec<String>,
     #[serde(rename = "providerSyncManualProviders", default)]
@@ -716,12 +779,17 @@ pub struct BackendSettings {
     pub enhancements_enabled: bool,
     #[serde(rename = "codexAppStandaloneQuotaUnlock", default)]
     pub codex_app_standalone_quota_unlock: bool,
+    /// 纯 API 供应商下启动前把详情模式写回 Codex 视图，避开 Work 视图要求 ChatGPT 账号（#2632）。
+    #[serde(rename = "codexAppDisableWorkView", default)]
+    pub codex_app_disable_work_view: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
     pub codex_app_model_whitelist_unlock: bool,
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
     pub codex_app_session_delete: bool,
+    #[serde(rename = "codexAppSideChatSave", default)]
+    pub codex_app_side_chat_save: bool,
     #[serde(rename = "codexAppMarkdownExport", default = "default_true")]
     pub codex_app_markdown_export: bool,
     #[serde(rename = "codexAppSessionShare", default = "default_true")]
@@ -737,6 +805,32 @@ pub struct BackendSettings {
     // 与「准备副本」这件事互不影响——副本只是所有增强共同的前置条件。
     #[serde(rename = "claudeAppLocalization", default = "default_true")]
     pub claude_app_localization: bool,
+    // 默认关闭：Computer Use 需要改写副本的 app.asar 并关掉 Electron 的 asar 完整性校验，
+    // 功能本身还受订阅与组织策略约束；误开没有收益，显式勾选才做。
+    #[serde(rename = "claudeAppComputerUse", default)]
+    pub claude_app_computer_use: bool,
+    /// Codex++ Computer Use 的审批策略。
+    ///
+    /// - `auto`（默认）：代理就地放行，只留痕。适合信任调用方、只想少弹窗的场景。
+    /// - `claude`：把 Codex 原生的 elicitation 表单透传给客户端，由 Claude 侧审批。
+    ///
+    /// 取字符串而不是 bool：以后可能要加「按应用记忆」之类的第三档，
+    /// 用字符串能平滑扩，也不必再改一次 serde 形状。
+    #[serde(
+        rename = "computerUseApproval",
+        default = "default_computer_use_approval"
+    )]
+    pub computer_use_approval: String,
+    /// Computer Use 给客户端的操作方式：
+    /// - `tools`：原生 CU 的 10 个离散工具（直通 `SkyComputerUseClient mcp`）；
+    /// - `js`：`cua_repl` 的 `js` 工具，和 Codex 当前主要的 CU 路径一致。
+    ///
+    /// MCP 进程启动时读取，对之后新开的客户端会话生效。
+    #[serde(rename = "computerUseMode", default = "default_computer_use_mode")]
+    pub computer_use_mode: String,
+    /// Computer Use 操作后台应用时，在屏幕右上角显示目标窗口的悬浮预览（同 Codex 的画中画）。
+    #[serde(rename = "computerUsePip", default = "default_true")]
+    pub computer_use_pip: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -767,6 +861,8 @@ pub struct BackendSettings {
     pub codex_app_activity_overlay_right: bool,
     #[serde(rename = "codexAppCapacityAutoRetry", default)]
     pub codex_app_capacity_auto_retry: bool,
+    #[serde(rename = "codexAppTurnRewind", default)]
+    pub codex_app_turn_rewind: bool,
     #[serde(rename = "codexAppWhaleWidgetEnabled", default)]
     pub codex_app_whale_widget_enabled: bool,
     #[serde(
@@ -923,6 +1019,75 @@ pub struct BackendSettings {
     pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
+    /// 协议代理自动重试：200 流内的过载/容量错误，以及用户在
+    /// `protocolProxyAutoRetryStatusCodes` 里勾选的 HTTP 错误，先在本地代理内部
+    /// 退避重试，不立刻把错误交给 Codex。只影响经过本地协议代理的请求。
+    /// 默认开启：用户看到的失败横幅会显著减少；关闭后恢复「失败立即返回」行为。
+    #[serde(rename = "protocolProxyAutoRetry", default = "default_true")]
+    pub protocol_proxy_auto_retry: bool,
+    /// 最多自动重试次数（不含首次请求）。0 与关闭开关等价。
+    #[serde(
+        rename = "protocolProxyAutoRetryMaxAttempts",
+        default = "default_protocol_proxy_auto_retry_max_attempts"
+    )]
+    pub protocol_proxy_auto_retry_max_attempts: u32,
+    /// 首次重试等待秒数；之后按 2 倍指数退避，单次上限 30 秒。
+    #[serde(
+        rename = "protocolProxyAutoRetryIntervalSeconds",
+        default = "default_protocol_proxy_auto_retry_interval_seconds"
+    )]
+    pub protocol_proxy_auto_retry_interval_seconds: u64,
+    /// 上游直接返回这些 HTTP 状态码时由代理退避重发（Retry-After 优先），
+    /// 与重试次数、总等待预算共用。默认空列表：HTTP 错误一律直接交给 Codex，
+    /// 需要的用户自行加入 429 等（issue #2653）。
+    #[serde(
+        rename = "protocolProxyAutoRetryStatusCodes",
+        default = "default_protocol_proxy_auto_retry_status_codes",
+        deserialize_with = "deserialize_protocol_proxy_auto_retry_status_codes"
+    )]
+    pub protocol_proxy_auto_retry_status_codes: Vec<u16>,
+    /// 过载错误处理模式：
+    /// - `streaming`（默认，流式；推理/工具调用参数先缓冲，首段可见输出后再等
+    ///   `protocolProxyAutoRetryCommitDelayMs`，窗口内仍由代理重试）；
+    /// - `streaming-legacy`（旧流式：遇到第一个输出事件立即提交，不再为工具
+    ///   参数或首字窗口缓冲）；
+    /// - `buffered`（整段缓冲后转发；任何时点的过载都由代理重试，但失去流式）。
+    #[serde(
+        rename = "protocolProxyAutoRetryMode",
+        default = "default_protocol_proxy_auto_retry_mode"
+    )]
+    pub protocol_proxy_auto_retry_mode: String,
+    /// 流式避震的「首字提交延迟」：出现第一段可见输出后，代理继续缓冲多少毫秒
+    /// 再交给 Codex。窗口内遇到容量/过载错误仍可丢弃重试；0 表示一出现可见输出
+    /// 就提交。推理与工具调用参数阶段本来就不向客户端提交，不占这个延迟，所以
+    /// 工具调用可以整项缓冲到完成后再提交。注意 `streaming-legacy` 模式忽略该
+    /// 字段，始终保持旧行为。
+    #[serde(
+        rename = "protocolProxyAutoRetryCommitDelayMs",
+        default = "default_protocol_proxy_auto_retry_commit_delay_ms"
+    )]
+    pub protocol_proxy_auto_retry_commit_delay_ms: u64,
+    /// 目录外模型名映射（#1183 / #1446 / #1457）：Codex 客户端的自动审查
+    /// （codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，
+    /// 不经用户选模；第三方上游没有这些名字，原样转发只会得到
+    /// 「No available channel / 模型不存在」类错误，还可能按失败重试持续消耗额度。
+    /// 开启后，本地协议代理把「不在当前供应商公布模型集里的请求模型」改写为
+    /// 该供应商的默认模型再转发；在公布集合里的模型（含用户显式配置的 gpt-*）
+    /// 不受影响。官方登录（未混入 API）与聚合供应商不适用本映射。
+    /// 供应商配置了自动审批模型（autoReviewModel）时，codex-auto-review 仍按其改写。
+    /// 默认关闭（opt-in）：开启会改写用户手填但没写进 model_list 的模型，不能静默生效。
+    #[serde(rename = "protocolProxyMapUnlistedModels", default)]
+    pub protocol_proxy_map_unlisted_models: bool,
+    /// 本地协议代理（helper）单次 HTTP 请求体上限，单位 MiB。
+    ///
+    /// 默认 128 MiB：1M 上下文窗口的长会话（带截图历史）实测请求体可到 ~50 MB，
+    /// 旧的 32 MiB 硬上限会让长会话直接返回 413 并中断对话。范围 32~512 MiB；
+    /// 环境变量 `CODEX_PLUS_MAX_HTTP_BODY_BYTES`（字节）仍可覆盖本设置。
+    #[serde(
+        rename = "helperMaxRequestBodyMib",
+        default = "default_helper_max_request_body_mib"
+    )]
+    pub helper_max_request_body_mib: u32,
     /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
     /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
     #[serde(rename = "tools", default)]
@@ -943,6 +1108,7 @@ impl Default for BackendSettings {
             codex_app_auto_takeover_when_active: default_auto_takeover_when_active(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
+            thread_model_follow_switch_enabled: false,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
@@ -951,14 +1117,20 @@ impl Default for BackendSettings {
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_standalone_quota_unlock: false,
+            codex_app_disable_work_view: false,
             codex_app_plugin_marketplace_unlock: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
+            codex_app_side_chat_save: false,
             codex_app_markdown_export: true,
             codex_app_session_share: true,
             codex_app_usage_status_line: true,
             claude_app_voice_input: true,
             claude_app_localization: true,
+            claude_app_computer_use: false,
+            computer_use_approval: default_computer_use_approval(),
+            computer_use_mode: default_computer_use_mode(),
+            computer_use_pip: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -971,6 +1143,7 @@ impl Default for BackendSettings {
             codex_app_pet_real_mouse_look: false,
             codex_app_activity_overlay_right: false,
             codex_app_capacity_auto_retry: false,
+            codex_app_turn_rewind: false,
             codex_app_whale_widget_enabled: false,
             codex_app_whale_balance_protocol: default_whale_balance_protocol(),
             codex_app_whale_balance_path: String::new(),
@@ -1021,6 +1194,18 @@ impl Default for BackendSettings {
             aggregate_relay_profiles: Vec::new(),
             active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
+            protocol_proxy_auto_retry: true,
+            protocol_proxy_auto_retry_max_attempts:
+                default_protocol_proxy_auto_retry_max_attempts(),
+            protocol_proxy_auto_retry_interval_seconds:
+                default_protocol_proxy_auto_retry_interval_seconds(),
+            protocol_proxy_auto_retry_status_codes:
+                default_protocol_proxy_auto_retry_status_codes(),
+            protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
+            protocol_proxy_auto_retry_commit_delay_ms:
+                default_protocol_proxy_auto_retry_commit_delay_ms(),
+            protocol_proxy_map_unlisted_models: false,
+            helper_max_request_body_mib: default_helper_max_request_body_mib(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
         }
@@ -1028,6 +1213,11 @@ impl Default for BackendSettings {
 }
 
 impl BackendSettings {
+    /// 当前设置对应的本地代理请求体上限（字节），已夹取到 32~512 MiB。
+    pub fn helper_max_request_body_bytes(&self) -> usize {
+        clamp_helper_max_request_body_mib(self.helper_max_request_body_mib) as usize * 1024 * 1024
+    }
+
     pub fn active_relay_profile(&self) -> RelayProfile {
         if self.active_relay_id == default_active_relay_id()
             && self.relay_profiles.len() == 1
@@ -1078,6 +1268,9 @@ impl BackendSettings {
                 custom_headers: Vec::new(),
                 standard_openai_protocol: false,
                 web_search_history_compat: false,
+                trust_upstream_catalog_lite: false,
+                strict_responses_reasoning: false,
+                auto_review_model: String::new(),
                 anthropic_auth_header: String::new(),
                 anthropic_max_tokens: 0,
                 anthropic_prompt_cache: true,
@@ -1142,6 +1335,9 @@ impl BackendSettings {
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
             web_search_history_compat: false,
+            trust_upstream_catalog_lite: false,
+            strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -1202,9 +1398,10 @@ impl BackendSettings {
             || self.active_relay_profile().requires_protocol_proxy_conversion()
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
-            || self
-                .active_relay_profile()
-                .web_search_history_compat_enabled()
+            || self.active_relay_profile().uses_independent_proxy()
+            || self.active_relay_profile().web_search_history_compat_enabled()
+            || self.active_relay_profile().request_compatibility_enabled()
+            || self.active_relay_profile().rewrites_auto_review_model()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -1417,6 +1614,17 @@ pub fn default_auto_takeover_when_active() -> String {
         .to_string()
 }
 
+/// Computer Use 审批默认放行：与既有行为一致，升级不改变已有用户的使用方式。
+pub fn default_computer_use_approval() -> String {
+    "auto".to_string()
+}
+
+/// Computer Use 默认用 JS（cua_repl）：与 Codex 当前主要的 CU 路径一致，
+/// 自带完整使用说明与确认规则，并能用 paste 输入中文。离散工具需要用户主动切换。
+pub fn default_computer_use_mode() -> String {
+    "js".to_string()
+}
+
 fn default_whale_balance_protocol() -> String {
     "auto".to_string()
 }
@@ -1447,6 +1655,114 @@ pub fn default_active_relay_id() -> String {
 
 pub fn default_relay_test_model() -> String {
     "gpt-5.4-mini".to_string()
+}
+
+/// 协议代理默认最多自动重试 5 次：2+4+8+16+30 秒封顶，合计约 60 秒。
+pub fn default_protocol_proxy_auto_retry_max_attempts() -> u32 {
+    5
+}
+
+pub fn clamp_protocol_proxy_auto_retry_max_attempts(value: u32) -> u32 {
+    value.min(20)
+}
+
+pub fn default_protocol_proxy_auto_retry_interval_seconds() -> u64 {
+    2
+}
+
+pub fn clamp_protocol_proxy_auto_retry_interval_seconds(value: u64) -> u64 {
+    value.min(30)
+}
+
+/// 默认不重试任何 HTTP 状态码：HTTP 错误重试曾按使用反馈整体下线（bd4e90d1），
+/// 现在改为由用户按需选择，升级不改变既有行为。
+pub fn default_protocol_proxy_auto_retry_status_codes() -> Vec<u16> {
+    Vec::new()
+}
+
+/// 只保留 400~599 的错误码，去重排序，最多 20 个；成功码与非法值直接丢弃。
+pub fn normalize_protocol_proxy_auto_retry_status_codes(values: &[u64]) -> Vec<u16> {
+    let mut codes: Vec<u16> = values
+        .iter()
+        .filter(|code| (400..=599).contains(*code))
+        .map(|code| *code as u16)
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.truncate(20);
+    codes
+}
+
+/// 手改的 settings.json 可能写进字符串、负数或超出 u16 的值；
+/// 这里逐项容错，不能让一个坏值把整份设置读失败。
+fn deserialize_protocol_proxy_auto_retry_status_codes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(Value::Array(items)) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(default_protocol_proxy_auto_retry_status_codes());
+    };
+    Ok(normalize_protocol_proxy_auto_retry_status_codes(
+        &status_code_values(&items),
+    ))
+}
+
+fn status_code_values(items: &[Value]) -> Vec<u64> {
+    items
+        .iter()
+        .filter_map(|item| {
+            item.as_u64()
+                .or_else(|| item.as_str().and_then(|text| text.trim().parse().ok()))
+        })
+        .collect()
+}
+
+pub fn default_protocol_proxy_auto_retry_mode() -> String {
+    "streaming".to_string()
+}
+
+pub fn normalize_protocol_proxy_auto_retry_mode(value: &str) -> String {
+    match value.trim() {
+        "buffered" => "buffered".to_string(),
+        // 旧版「流式」行为保留为独立选项，方便随时退回。
+        "streaming-legacy" => "streaming-legacy".to_string(),
+        _ => default_protocol_proxy_auto_retry_mode(),
+    }
+}
+
+/// 流式避震默认在首段可见输出后再缓冲 1 秒：能覆盖「刚开始吐字上游就过载」
+/// 这一大类，首字延迟仍控制在 1 秒内；短回复在 response.completed 到达时
+/// 立即提交，不会白等满 1 秒。
+pub fn default_protocol_proxy_auto_retry_commit_delay_ms() -> u64 {
+    1000
+}
+
+pub fn clamp_protocol_proxy_auto_retry_commit_delay_ms(value: u64) -> u64 {
+    value.min(10_000)
+}
+
+/// 本地协议代理请求体默认上限：128 MiB。
+///
+/// 依据：1M 上下文窗口的长会话（历史里带 Computer Use 截图）实测请求体约 33 MB
+/// 且仍在增长，对应 1M tokens 约 50 MB；旧的 32 MiB 硬上限会在正常长会话里直接
+/// 返回 413 并中断对话。128 MiB 给 1M 窗口留出约 2.5 倍余量。
+pub const DEFAULT_HELPER_MAX_REQUEST_BODY_MIB: u32 = 128;
+/// 请求体上限下限：低于 32 MiB 会误伤正常请求。
+pub const MIN_HELPER_MAX_REQUEST_BODY_MIB: u32 = 32;
+/// 请求体上限上限：helper 会整段缓冲请求体，再高内存开销不可控。
+pub const MAX_HELPER_MAX_REQUEST_BODY_MIB: u32 = 512;
+
+pub fn default_helper_max_request_body_mib() -> u32 {
+    DEFAULT_HELPER_MAX_REQUEST_BODY_MIB
+}
+
+pub fn clamp_helper_max_request_body_mib(value: u32) -> u32 {
+    value.clamp(
+        MIN_HELPER_MAX_REQUEST_BODY_MIB,
+        MAX_HELPER_MAX_REQUEST_BODY_MIB,
+    )
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
@@ -2062,6 +2378,12 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("providerSyncEnabled").and_then(Value::as_bool) {
         target.insert("providerSyncEnabled".to_string(), Value::Bool(value));
     }
+    if let Some(value) = source
+        .get("threadModelFollowSwitchEnabled")
+        .and_then(Value::as_bool)
+    {
+        target.insert("threadModelFollowSwitchEnabled".to_string(), Value::Bool(value));
+    }
     if let Some(value) = source.get("ccsDbPath").and_then(Value::as_str) {
         target.insert(
             "ccsDbPath".to_string(),
@@ -2071,13 +2393,77 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("relayProfilesEnabled").and_then(Value::as_bool) {
         target.insert("relayProfilesEnabled".to_string(), Value::Bool(value));
     }
+    // 协议代理自动重试：管理器整份保存也会经过 normalize，这里补上部分更新路径，
+    // 保证任何走 /settings/set 的调用都不会被静默丢弃。
+    merge_bool_setting(target, source, "protocolProxyAutoRetry");
+    // 目录外模型映射开关同上：漏登记会让 /settings/set 补丁「保存了但没生效」。
+    merge_bool_setting(target, source, "protocolProxyMapUnlistedModels");
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryMaxAttempts")
+        .and_then(Value::as_u64)
+    {
+        target.insert(
+            "protocolProxyAutoRetryMaxAttempts".to_string(),
+            Value::from(clamp_protocol_proxy_auto_retry_max_attempts(
+                value as u32,
+            )),
+        );
+    }
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryIntervalSeconds")
+        .and_then(Value::as_u64)
+    {
+        target.insert(
+            "protocolProxyAutoRetryIntervalSeconds".to_string(),
+            Value::from(clamp_protocol_proxy_auto_retry_interval_seconds(value)),
+        );
+    }
+    if let Some(items) = source
+        .get("protocolProxyAutoRetryStatusCodes")
+        .and_then(Value::as_array)
+    {
+        target.insert(
+            "protocolProxyAutoRetryStatusCodes".to_string(),
+            serde_json::json!(normalize_protocol_proxy_auto_retry_status_codes(
+                &status_code_values(items)
+            )),
+        );
+    }
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryMode")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "protocolProxyAutoRetryMode".to_string(),
+            Value::String(normalize_protocol_proxy_auto_retry_mode(value)),
+        );
+    }
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryCommitDelayMs")
+        .and_then(Value::as_u64)
+    {
+        target.insert(
+            "protocolProxyAutoRetryCommitDelayMs".to_string(),
+            Value::from(clamp_protocol_proxy_auto_retry_commit_delay_ms(value)),
+        );
+    }
+    // 请求体上限也走同一份 settings.json；漏登记会让「保存了但没生效」。
+    if let Some(value) = source.get("helperMaxRequestBodyMib").and_then(Value::as_u64) {
+        let clamped = value.min(u64::from(MAX_HELPER_MAX_REQUEST_BODY_MIB)) as u32;
+        target.insert(
+            "helperMaxRequestBodyMib".to_string(),
+            Value::from(clamp_helper_max_request_body_mib(clamped)),
+        );
+    }
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "codexAppStandaloneQuotaUnlock");
+    merge_bool_setting(target, source, "codexAppDisableWorkView");
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
+    merge_bool_setting(target, source, "codexAppSideChatSave");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
     merge_bool_setting(target, source, "codexAppUsageStatusLine");
@@ -2100,6 +2486,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppActivityOverlayRight");
     merge_bool_setting(target, source, "codexAppCapacityAutoRetry");
+    merge_bool_setting(target, source, "codexAppTurnRewind");
     merge_bool_setting(target, source, "codexAppWhaleWidgetEnabled");
     if let Some(value @ ("auto" | "custom" | "off")) = source
         .get("codexAppWhaleBalanceProtocol")
@@ -2580,6 +2967,8 @@ fn preserve_unknown_settings_fields(
         "customHeaders",
         "standardOpenaiProtocol",
         "webSearchHistoryCompat",
+        "trustUpstreamCatalogLite",
+        "strictResponsesReasoning",
         "anthropicAuthHeader",
         "anthropicMaxTokens",
         "anthropicPromptCache",
@@ -2795,6 +3184,28 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_stepwise_max_output_tokens(settings.codex_app_stepwise_max_output_tokens);
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
+    settings.protocol_proxy_auto_retry_max_attempts =
+        clamp_protocol_proxy_auto_retry_max_attempts(settings.protocol_proxy_auto_retry_max_attempts);
+    settings.protocol_proxy_auto_retry_interval_seconds =
+        clamp_protocol_proxy_auto_retry_interval_seconds(
+            settings.protocol_proxy_auto_retry_interval_seconds,
+        );
+    settings.protocol_proxy_auto_retry_mode =
+        normalize_protocol_proxy_auto_retry_mode(&settings.protocol_proxy_auto_retry_mode);
+    settings.protocol_proxy_auto_retry_status_codes =
+        normalize_protocol_proxy_auto_retry_status_codes(
+            &settings
+                .protocol_proxy_auto_retry_status_codes
+                .iter()
+                .map(|code| u64::from(*code))
+                .collect::<Vec<_>>(),
+        );
+    settings.protocol_proxy_auto_retry_commit_delay_ms =
+        clamp_protocol_proxy_auto_retry_commit_delay_ms(
+            settings.protocol_proxy_auto_retry_commit_delay_ms,
+        );
+    settings.helper_max_request_body_mib =
+        clamp_helper_max_request_body_mib(settings.helper_max_request_body_mib);
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。
@@ -2850,6 +3261,26 @@ fn normalize_text_config(contents: String) -> String {
     }
 }
 
+/// 逐级解析软链接（最多 16 层，防环），返回最终目标路径；不是软链接时返回 None。
+fn resolve_symlink_target(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut resolved = false;
+    for _ in 0..16 {
+        let Ok(metadata) = fs::symlink_metadata(&current) else { break };
+        if !metadata.file_type().is_symlink() {
+            break;
+        }
+        let Ok(target) = fs::read_link(&current) else { break };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current.parent().map(|parent| parent.join(&target)).unwrap_or(target)
+        };
+        resolved = true;
+    }
+    resolved.then_some(current)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     atomic_write_with(path, |file| file.write_all(bytes))
 }
@@ -2860,6 +3291,11 @@ pub fn atomic_write_with(
     path: &Path,
     write_contents: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
+    // 目标是软链接时（常见于把 ~/.codex/config.toml 链到 dotfiles 仓库），
+    // 原子替换要落在链接指向的真实文件上；直接 rename 会把链接本身换成普通文件，
+    // 链接被悄悄断开，dotfiles 里的原文件不再更新。
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_deref().unwrap_or(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -2882,6 +3318,9 @@ pub fn atomic_write_with(
         if let Some(permissions) = existing_permissions {
             temp_file.set_permissions(permissions)?;
         }
+        // rename 前必须落盘：只 flush 时内容可能还在页缓存里，断电或蓝屏后会留下
+        // 已经替换成功、内容却全是 NUL 的 config.toml（#2450）。
+        temp_file.sync_all()?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -2926,14 +3365,27 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
+    // Codex 客户端 / 杀毒软件可能短暂持有目标文件的读句柄，MoveFileExW 会以
+    // ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION 失败。一次失败就让整次
+    // 供应商切换报错对用户表现为「无法切换和保存供应商」（#2601 / #2500 /
+    // #2612）。短退避重试几次，仍失败再把错误上抛。
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
     }
-    Ok(())
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("替换文件失败")))
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -2950,6 +3402,28 @@ fn temp_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_symlink_and_updates_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let dotfiles = temp.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("config.toml");
+        std::fs::write(&target, "model = \"old\"\n").unwrap();
+        let home = temp.path().join(".codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join("config.toml");
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+
+        atomic_write(&link, b"model = \"new\"\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "软链接不能被替换成普通文件");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "model = \"new\"\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().filter_map(Result::ok)
+            .map(|entry| entry.file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "链接所在目录不应残留临时文件：{leftovers:?}");
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -4052,6 +4526,20 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn settings_store_update_persists_disable_work_view_flag() {
+        // 前端开关已上线，后端白名单漏掉这个键时开关永远不生效（#2632）。
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        assert!(!store.load().unwrap().codex_app_disable_work_view);
+
+        let updated = store.update(json!({ "codexAppDisableWorkView": true })).unwrap();
+
+        assert!(updated.codex_app_disable_work_view);
+        assert!(store.load().unwrap().codex_app_disable_work_view);
+    }
+
+    #[test]
     fn settings_store_update_only_mutates_present_known_fields() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -4067,6 +4555,7 @@ experimental_bearer_token = "sk-existing""#
             "codexAppPath": "C:\\Portable\\Codex\\Codex.exe",
             "enhancementsEnabled": false,
             "codexAppSessionDelete": false,
+            "codexAppSideChatSave": true,
             "codexAppConversationView": true,
             "codexAppThreadIdBadge": true,
             "codexAppNativeFastUnlock": true,
@@ -4083,6 +4572,7 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.codex_app_path, r"C:\Portable\Codex\Codex.exe");
         assert!(!updated.enhancements_enabled);
         assert!(!updated.codex_app_session_delete);
+        assert!(updated.codex_app_side_chat_save);
         assert!(updated.codex_app_conversation_view);
         assert!(updated.codex_app_thread_id_badge);
         assert!(updated.codex_app_native_fast_unlock);
@@ -4814,4 +5304,18 @@ experimental_bearer_token = "sk-existing""#
         assert!(reloaded.codex_app_auto_takeover);
         assert_eq!(reloaded.codex_app_auto_takeover_when_active, "immediate");
     }
+
+    #[test]
+    fn turn_rewind_is_opt_in_and_round_trips_through_settings_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        assert!(!BackendSettings::default().codex_app_turn_rewind);
+        store.save(&BackendSettings::default()).unwrap();
+        let updated = store.update(json!({ "codexAppTurnRewind": true })).unwrap();
+        assert!(updated.codex_app_turn_rewind);
+        assert!(store.load().unwrap().codex_app_turn_rewind);
+        store.update(json!({ "codexAppTurnRewind": false })).unwrap();
+        assert!(!store.load().unwrap().codex_app_turn_rewind);
+    }
+
 }

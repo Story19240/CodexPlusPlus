@@ -244,11 +244,9 @@ fn app_paths_resolves_portable_current_link_to_directory_version() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("Codex.exe"), "").unwrap();
     std::fs::write(target.join("version"), "42.1.0\n").unwrap();
-    if let Err(error) = std::os::windows::fs::symlink_dir(&target, &current) {
-        if error.raw_os_error() == Some(1314) {
-            return;
-        }
-        panic!("symlink_dir failed: {error}");
+    // Windows 创建目录符号链接需要额外特权；无权限的机器跳过这个环境专用回归。
+    if std::os::windows::fs::symlink_dir(&target, &current).is_err() {
+        return;
     }
 
     assert_eq!(
@@ -917,11 +915,52 @@ fn launcher_packaged_activation_can_preserve_process_id() {
 }
 
 #[test]
-fn launcher_applies_codexplusplus_window_icon_after_packaged_activation() {
+fn launcher_keeps_taskbar_integration_without_overriding_codex_icons() {
     let source = include_str!("../src/launcher.rs");
+    assert!(source.contains("apply_codexplusplus_taskbar_after_launch(process_id);"));
+    assert!(source.contains("windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id)"));
+    for forbidden in [
+        "apply_codexplusplus_window_icon",
+        "apply_native_codex_taskbar",
+        "apply_codexplusplus_icon",
+        "windows_apply_codexplusplus_icon",
+        "WM_SETICON",
+        "PKEY_AppUserModel",
+        "ImplicitAppShortcuts",
+    ] {
+        assert!(!source.contains(forbidden), "launcher must not override Codex icons: {forbidden}");
+    }
+    for production in [
+        include_str!("../src/windows_integration.rs"),
+        include_str!("../src/windows_taskbar.rs"),
+    ] {
+        for forbidden in ["PKEY_AppUserModel_RelaunchIconResource", "WM_SETICON", "ImplicitAppShortcuts"] {
+            assert!(!production.contains(forbidden), "integration must not override Codex icons: {forbidden}");
+        }
+    }
+}
 
-    assert!(source.contains("apply_codexplusplus_window_icon_after_launch(process_id);"));
-    assert!(source.contains("windows_apply_codexplusplus_icon_to_process_window"));
+#[test]
+fn local_relaunch_process_pattern_matches_literal_bundle_paths_only() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/relaunch-local.mjs");
+    let fixture = r#"
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const fn = source.match(/^function localBundleProcessPattern\(bundle\) \{[^]*?^\}/m);
+assert.ok(fn);
+const pattern = new Function(fn[0] + '; return localBundleProcessPattern;')();
+const bundle = '/tmp/work+[fixture]/Codex++.app';
+const re = new RegExp(pattern(bundle));
+assert.ok(re.test(bundle + '/Contents/MacOS/CodexPlusPlus'));
+assert.ok(!re.test('/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus'));
+assert.ok(!re.test('/tmp/work+[fixture]/Codexxx.app/Contents/MacOS/CodexPlusPlus'));
+assert.ok(!re.test(bundle + '.other/Contents/MacOS/CodexPlusPlus'));
+"#;
+    let output = std::process::Command::new("node")
+        .args(["-e", fixture]).arg(script).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]
@@ -2023,6 +2062,9 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
             web_search_history_compat: false,
+            trust_upstream_catalog_lite: false,
+            strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,

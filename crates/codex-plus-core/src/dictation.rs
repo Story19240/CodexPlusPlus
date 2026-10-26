@@ -451,6 +451,11 @@ async fn download_local_asset(client: &reqwest::Client, asset: &LocalAsset, comp
         if failed.is_none() && (bytes != asset.bytes || format!("{:x}", digest.finalize()) != asset.sha256) {
             failed = Some("模型文件完整性校验失败".to_string());
         }
+        // tokio 的 write_all 只把数据交给后台线程，不 flush 就 drop/rename，文件可能还没写完：
+        // 发布出去的是半截模型，随后的校验在 Windows 上会失败（CI 偶发红过）。
+        if failed.is_none() && tokio::io::AsyncWriteExt::flush(&mut file).await.is_err() {
+            failed = Some("写入模型文件失败".to_string());
+        }
         drop(file);
         if failed.is_none() {
             if tokio::fs::rename(&partial, &destination).await.is_ok() { return Ok(destination); }
@@ -1542,6 +1547,7 @@ mod tests {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (server_cancel_sender, server_cancel_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
@@ -1569,9 +1575,8 @@ mod tests {
                 bytes.extend_from_slice(&buffer[..count]);
             }
             started_sender.send(()).unwrap();
-            // 取消分支会立即丢弃 reqwest future；hyper 的后台连接驱动
-            // 不保证同步发送 FIN，这里不能让测试服务端等待客户端 EOF。
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // 等主线程确认取消后再关闭连接；断言业务结果，不依赖 TCP FIN 的投递时机。
+            let _ = server_cancel_receiver.await;
             let _ = stream.shutdown().await;
         });
         let payload = bridge_payload(b"delayed-audio", "audio/wav");
@@ -1588,6 +1593,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancel_bridge(&payload).unwrap()["cancelled"], true);
+        let _ = server_cancel_sender.send(());
         let error = tokio::time::timeout(Duration::from_secs(1), job)
             .await
             .unwrap()

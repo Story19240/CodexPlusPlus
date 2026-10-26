@@ -250,20 +250,26 @@ body::after {
 .hero-inner {
   position: relative;
   z-index: 2;
-  max-width: 1280px;
+  max-width: 1420px;
   width: 100%;
   margin: 0 auto;
-  padding: 120px 28px 90px;
+  padding: 108px 28px 74px;
+  display: grid;
+  grid-template-columns: minmax(380px, 0.86fr) minmax(560px, 1.14fr);
+  gap: clamp(34px, 4vw, 72px);
+  align-items: center;
 }
+.hero-copy { min-width: 0; }
 
 .hero-title {
-  font-size: clamp(52px, 9.5vw, 128px);
+  font-size: clamp(52px, 7.2vw, 96px);
   font-weight: 900;
   line-height: 1.06;
   letter-spacing: 0;
   margin: 26px 0 24px;
 }
-.hero-title .line { display: block; overflow: hidden; }
+/* 逐字入场动画靠 overflow 裁切；底部留出余量，免得 g、y 这类下伸字母被切掉。 */
+.hero-title .line { display: block; overflow: hidden; padding-bottom: 0.22em; }
 .hero-title .w {
   display: inline-block;
   will-change: transform;
@@ -309,6 +315,33 @@ body::after {
 }
 .stat dd { color: var(--txt-2); font-size: 13px; margin-top: 2px; }
 
+.hero-manager {
+  width: 100%;
+  max-width: 780px;
+  min-width: 0;
+  justify-self: end;
+}
+.hero-manager-window {
+  --manager-scale: 0.78;
+  width: 100%;
+  height: clamp(470px, 42vw, 620px);
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 255, 0.28);
+  border-radius: 18px;
+  background: #080a10;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.58), 0 0 90px rgba(93, 107, 255, 0.14);
+}
+.hero-manager-window iframe {
+  display: block;
+  width: calc(100% / var(--manager-scale));
+  height: calc(100% / var(--manager-scale));
+  min-width: 760px;
+  border: 0;
+  transform: scale(var(--manager-scale));
+  transform-origin: top left;
+  background: #0a0c12;
+}
+
 .scroll-cue {
   position: absolute;
   left: 50%;
@@ -336,7 +369,7 @@ body::after {
 
 .demo {
   position: relative;
-  padding: clamp(90px, 12vw, 160px) 24px;
+  padding: clamp(68px, 8vw, 108px) 24px;
   overflow: hidden;
 }
 .demo-bg {
@@ -416,7 +449,7 @@ body::after {
 
 .features {
   position: relative;
-  padding: clamp(90px, 12vw, 160px) 24px;
+  padding: clamp(68px, 8vw, 108px) 24px;
   background:
     radial-gradient(52% 36% at 8% 4%, rgba(156, 134, 255, 0.08), transparent 70%),
     radial-gradient(46% 34% at 96% 90%, rgba(109, 139, 255, 0.09), transparent 70%),
@@ -458,6 +491,17 @@ body::after {
   font-size: 12px;
   color: var(--txt-2);
   letter-spacing: 0.2em;
+}
+.fcard-new {
+  margin-left: 10px;
+  padding: 2px 7px;
+  border: 1px solid rgba(232, 184, 109, 0.4);
+  border-radius: 999px;
+  color: var(--amber);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  vertical-align: 1px;
 }
 .fcard h3 {
   font-size: 17.5px;
@@ -549,7 +593,7 @@ body::after {
 
 .modes {
   position: relative;
-  padding: clamp(90px, 12vw, 160px) 24px;
+  padding: clamp(68px, 8vw, 108px) 24px;
   background:
     radial-gradient(50% 38% at 92% 6%, rgba(110, 231, 242, 0.06), transparent 70%),
     radial-gradient(46% 40% at 6% 96%, rgba(156, 134, 255, 0.08), transparent 70%),
@@ -680,7 +724,7 @@ body::after {
 
 .steps {
   position: relative;
-  padding: clamp(90px, 12vw, 160px) 24px;
+  padding: clamp(68px, 8vw, 108px) 24px;
   background:
     radial-gradient(48% 36% at 10% 10%, rgba(102, 200, 160, 0.05), transparent 70%),
     var(--bg-1);
@@ -730,7 +774,7 @@ body::after {
 
 .whatsnew {
   position: relative;
-  padding: clamp(90px, 12vw, 150px) 24px;
+  padding: clamp(68px, 8vw, 104px) 24px;
   background: var(--bg-0);
   border-top: 1px solid var(--line-soft);
 }
@@ -785,7 +829,7 @@ body::after {
 
 .faq {
   position: relative;
-  padding: clamp(90px, 12vw, 150px) 24px;
+  padding: clamp(68px, 8vw, 104px) 24px;
   background: var(--bg-1);
   border-top: 1px solid var(--line-soft);
 }
@@ -1074,7 +1118,7 @@ body::after {
 
 .cta {
   position: relative;
-  padding: clamp(110px, 15vw, 200px) 24px;
+  padding: clamp(84px, 10vw, 140px) 24px;
   overflow: hidden;
   text-align: center;
   border-top: 1px solid var(--line-soft);
@@ -1182,7 +1226,7 @@ body::after {
 /* ============ 入场基态（JS 接管前隐藏，避免闪烁） ============ */
 
 .reveal { opacity: 0; transform: translateY(26px); }
-.hero-title .w { transform: translateY(110%); }
+.hero-title .w { transform: translateY(135%); }
 body.no-anim .reveal, body.no-anim .hero-title .w { opacity: 1; transform: none; }
 body.no-anim .term-out { opacity: 1; transform: none; }
 body.no-anim .bar-fill { transition: none; }
@@ -1190,6 +1234,9 @@ body.no-anim .bar-fill { transition: none; }
 /* ============ 响应式 ============ */
 
 @media (max-width: 1080px) {
+  .hero-inner { grid-template-columns: 1fr; gap: 42px; }
+  .hero-manager { max-width: 900px; justify-self: center; }
+  .hero-manager-window { --manager-scale: 0.88; height: 620px; }
   .feature-grid { grid-template-columns: repeat(2, 1fr); }
   .context-cols { grid-template-columns: 1fr; }
   .nav-links { display: none; }
@@ -1202,7 +1249,9 @@ body.no-anim .bar-fill { transition: none; }
 
 @media (max-width: 640px) {
   .nav-version { display: none; }
-  .hero-inner { padding-top: 104px; }
+  .hero-inner { padding-top: 104px; padding-left: 20px; padding-right: 20px; }
+  .hero-title { font-size: clamp(48px, 15vw, 76px); }
+  .hero-manager-window { --manager-scale: 0.7; height: 540px; }
   .hero-stats { gap: 22px 34px; }
   .feature-grid { grid-template-columns: 1fr; }
   .showcase { padding-right: 20px; padding-left: 20px; }
@@ -1227,4 +1276,91 @@ body.no-anim .bar-fill { transition: none; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+
+/* ============ 2026-10 结构整理 ============ */
+
+/* 首屏：支持的 Agent */
+.hero-agents {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  margin-top: 26px;
+}
+.hero-agents-label {
+  color: var(--txt-2);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+.hero-agents ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.hero-agents li {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(20, 25, 40, 0.55);
+  color: var(--txt-1);
+  font-size: 13px;
+  backdrop-filter: blur(8px);
+}
+.hero-agents li.more { color: var(--txt-2); padding-left: 12px; }
+.agent-icon {
+  width: 15px;
+  height: 15px;
+  background: currentColor;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+
+/* 首屏数据：四项固定一行，不再把最后一项挤到第二行 */
+.hero-stats {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  justify-content: start;
+  gap: 18px clamp(22px, 3.4vw, 52px);
+  margin-top: 52px;
+}
+.stat dd { white-space: nowrap; }
+
+/* Codex 供应商：上下文窗口并入为子块 */
+.modes-context {
+  max-width: 1180px;
+  margin: clamp(64px, 8vw, 100px) auto 0;
+}
+.modes-context-head {
+  max-width: 720px;
+  margin: 0 auto 36px;
+  text-align: center;
+}
+.modes-context-head h3 {
+  font-size: clamp(22px, 2.6vw, 30px);
+  font-weight: 800;
+  margin-bottom: 10px;
+}
+.modes-context-head p { color: var(--txt-2); font-size: 14.5px; line-height: 1.8; }
+.modes-context-head .mono { color: var(--amber); font-size: 0.9em; }
+
+/* 更新日志里的长路径不再撑破卡片 */
+.rel-card { min-width: 0; }
+.rel-card li { overflow-wrap: anywhere; }
+
+@media (max-width: 640px) {
+  .hero-stats { grid-template-columns: repeat(2, auto); }
+  /* 顶栏右侧只留「下载」与语言切换，避免挤出屏幕 */
+  .nav-actions { gap: 8px; }
+  .nav-actions .btn-ghost:not([hreflang]) { display: none; }
 }

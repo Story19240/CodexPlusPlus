@@ -42,6 +42,7 @@
     tl.to(".hero-title .w", { y: 0, duration: 1.15, stagger: 0.09 }, 0.15)
       .to(".hero .eyebrow", { opacity: 1, y: 0, duration: 0.8 }, 0.35)
       .to(".hero-sub", { opacity: 1, y: 0, duration: 0.9 }, 0.7)
+      .to(".hero-agents", { opacity: 1, y: 0, duration: 0.9 }, 0.78)
       .to(".hero-cta", { opacity: 1, y: 0, duration: 0.9 }, 0.85)
       .to(".hero-stats", { opacity: 1, y: 0, duration: 0.9 }, 1.0);
 
@@ -435,6 +436,7 @@
     if (!grid) return;
 
     var REMOTE = [
+      "https://ads.codexpp.cc/ads.json",
       "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
       "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json"
     ];
