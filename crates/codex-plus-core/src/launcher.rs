@@ -1132,7 +1132,8 @@ fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
 fn apply_codexplusplus_taskbar_after_launch(process_id: u32) {
     tokio::spawn(async move {
         for attempt in 1..=30 {
-            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id) {
+            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id)
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1273,7 +1274,11 @@ impl LaunchHooks for DefaultLaunchHooks {
             .join("\n\n"),
         );
         crate::relay_config::apply_relay_profile_with_preservation(
-            &home, &profile, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
+            &home,
+            &profile,
+            &common_config,
+            crate::protocol_proxy::protocol_proxy_port(),
+            settings.relay_preserve_nonprovider_settings,
         )?;
         Ok(())
     }
@@ -2464,12 +2469,7 @@ struct ProxyRequestLog {
 }
 
 impl ProxyRequestLog {
-    fn begin(
-        method: &str,
-        path: &str,
-        request: Option<&Value>,
-        thread_id: Option<String>,
-    ) -> Self {
+    fn begin(method: &str, path: &str, request: Option<&Value>, thread_id: Option<String>) -> Self {
         let started_at_ms = current_time_ms();
         let model = request
             .and_then(|request| request.get("model"))
@@ -2846,7 +2846,10 @@ async fn handle_protocol_proxy_connection(
                 let tail = bridge.finish();
                 converter.push_upstream_bytes(&tail);
                 if !bridge.has_successful_compaction_completion() {
-                    converter.fail("Anthropic 压缩流缺少正常 message_stop".to_string(), Some("compaction_incomplete".to_string()));
+                    converter.fail(
+                        "Anthropic 压缩流缺少正常 message_stop".to_string(),
+                        Some("compaction_incomplete".to_string()),
+                    );
                 }
             }
             let outcome = converter.finish_with_outcome();
@@ -2857,7 +2860,11 @@ async fn handle_protocol_proxy_connection(
             );
             stream.write_all(&outcome.payload).await?;
             log_helper_response(
-                if outcome.succeeded { "helper.protocol_proxy_compaction_ok" } else { "helper.protocol_proxy_compaction_failed" },
+                if outcome.succeeded {
+                    "helper.protocol_proxy_compaction_ok"
+                } else {
+                    "helper.protocol_proxy_compaction_failed"
+                },
                 method,
                 path,
                 "200 OK",
@@ -2889,7 +2896,11 @@ async fn handle_protocol_proxy_connection(
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(exec_succeeded);
             }
-            request_log.record_stream((!exec_succeeded).then_some("exec stream failed"), None, None);
+            request_log.record_stream(
+                (!exec_succeeded).then_some("exec stream failed"),
+                None,
+                None,
+            );
             stream.shutdown().await?;
             return Ok(());
         }
@@ -2965,10 +2976,19 @@ async fn handle_protocol_proxy_connection(
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
             let original: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-            if let Err(error) = crate::protocol_proxy::validate_compaction_json_completion(&original, upstream.wire_api) {
+            if let Err(error) = crate::protocol_proxy::validate_compaction_json_completion(
+                &original,
+                upstream.wire_api,
+            ) {
                 let mut converter = crate::protocol_proxy::CompactionSseConverter::new("");
                 converter.fail(error.to_string(), Some("compaction_incomplete".to_string()));
-                write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &converter.finish()).await?;
+                write_http_response(
+                    stream,
+                    "200 OK",
+                    "text/event-stream; charset=utf-8",
+                    &converter.finish(),
+                )
+                .await?;
                 stream.shutdown().await?;
                 return Ok(());
             }
@@ -3179,7 +3199,10 @@ mod dictation_receipt_tests {
         let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(again["port"], 57322);
         assert_eq!(again["token"], "token-def");
-        assert!(!path.with_extension("json.tmp").exists(), "临时文件必须被改名走");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "临时文件必须被改名走"
+        );
         // 端口不匹配时不能误删：常驻 helper 与会话 helper 可能同时在跑。
         remove_dictation_helper_receipt_at_for_port(&path, 57321);
         assert!(path.exists(), "非本端口的凭据必须保留");
@@ -3702,7 +3725,6 @@ async fn forward_protocol_proxy_stream(
     Ok((None, None, None, first_output_at_ms))
 }
 
-
 async fn wait_with_web_search_keepalive<T>(
     stream: &mut tokio::net::TcpStream,
     future: impl Future<Output = T>,
@@ -3753,6 +3775,290 @@ async fn complete_web_search_with_results(
     }
     let completed = converter.finish();
     stream.write_all(&completed).await?;
+    Ok(())
+}
+
+fn failed_web_search_outputs(
+    calls: &[crate::web_search::WebSearchToolCall],
+    message: &str,
+) -> Vec<crate::web_search::WebSearchToolOutput> {
+    calls
+        .iter()
+        .map(|call| {
+            let mut content = String::new();
+            for query in &call.queries {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str(&format!(
+                    "Web search failed for query: {query}\nError: {message}"
+                ));
+            }
+            if content.is_empty() {
+                content.push_str(&format!("Web search failed.\nError: {message}"));
+            }
+            crate::web_search::WebSearchToolOutput {
+                call_id: call.call_id.clone(),
+                queries: call.queries.clone(),
+                content: content.clone(),
+                summary: content,
+            }
+        })
+        .collect()
+}
+
+/// 三类降级的统一出口：把失败原因与已取得的搜索结果一起交给模型，
+/// 让它产出最终总结，而不是只回填摘要后直接 `response.completed`。
+///
+/// 旧行为（`complete_web_search_with_results`）只把摘要写给客户端，模型侧
+/// 对失败与结果都一无所知，用户看到的就是「工具调用完突然没下文」。这里
+/// 在降级之后再发一次**去掉 web_search 工具**的收尾请求，让模型把
+/// 「出了什么事 + 基于已有信息能答什么」讲清楚。
+///
+/// 收尾请求本身失败时仍退回 `complete_web_search_with_results`，
+/// 保证最差情況不比改造前更糟（不断流、不 failed）。
+async fn finish_web_search_with_model_summary(
+    stream: &mut tokio::net::TcpStream,
+    converter: &mut crate::protocol_proxy::ChatSseToResponsesConverter,
+    context: &crate::protocol_proxy::WebSearchExecutionContext,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
+    chat_request: &Value,
+    parsed: &crate::web_search::ParsedChatResponse,
+    request_search_outputs: &[crate::web_search::WebSearchToolOutput],
+    client_search_outputs: &[crate::web_search::WebSearchToolOutput],
+    notice: crate::web_search::WebSearchFollowupNotice,
+    search_round: usize,
+) -> anyhow::Result<()> {
+    let max_rounds = usize::from(context.settings.web_search.max_rounds);
+    let summary_request =
+        match crate::web_search::build_web_search_followup_request_with_web_search_tool(
+            chat_request,
+            parsed,
+            request_search_outputs,
+            false,
+            Some(notice),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                // 收尾请求都构造不出来：维持旧降级行为，不把这事升级成 failed。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.summary_fallback",
+                    serde_json::json!({
+                        "stage": "build_summary",
+                        "searchRound": search_round,
+                        "maxRounds": max_rounds,
+                        "message": error.to_string()
+                    }),
+                );
+                return complete_web_search_with_results(stream, converter, client_search_outputs)
+                    .await;
+            }
+        };
+    if let Some(messages) = summary_request.get("messages").and_then(Value::as_array) {
+        crate::context_usage::remember_request_boundary(
+            session_headers.thread_id,
+            summary_request
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            messages,
+        );
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.summary_request",
+        serde_json::json!({
+            "messageCount": summary_request
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            "searchRound": search_round,
+            "maxRounds": max_rounds,
+            "resultCount": request_search_outputs.len()
+        }),
+    );
+
+    let mut summary = match wait_with_web_search_keepalive(
+        stream,
+        crate::protocol_proxy::send_web_search_followup_request(
+            context,
+            &summary_request,
+            session_headers,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.summary_fallback",
+                serde_json::json!({
+                    "stage": "send_summary",
+                    "searchRound": search_round,
+                    "maxRounds": max_rounds,
+                    "message": error.to_string()
+                }),
+            );
+            return complete_web_search_with_results(stream, converter, client_search_outputs)
+                .await;
+        }
+        Err(error) => return Err(error),
+    };
+    if !summary.is_success() {
+        let status_code = summary.status_code;
+        let mut response = summary.take_response()?;
+        let body = match crate::protocol_proxy::read_limited_upstream_body(
+            &mut response,
+            WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.summary_fallback",
+                    serde_json::json!({
+                        "stage": "read_summary_error",
+                        "searchRound": search_round,
+                        "maxRounds": max_rounds,
+                        "message": error.to_string()
+                    }),
+                );
+                return complete_web_search_with_results(stream, converter, client_search_outputs)
+                    .await;
+            }
+        };
+        let upstream_message = crate::protocol_proxy::upstream_error_message(
+            status_code,
+            &summary.content_type,
+            &body,
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.summary_fallback",
+            serde_json::json!({
+                "stage": "send_summary",
+                "searchRound": search_round,
+                "maxRounds": max_rounds,
+                "statusCode": status_code,
+                "message": upstream_message
+            }),
+        );
+        return complete_web_search_with_results(stream, converter, client_search_outputs).await;
+    }
+
+    // 总结响应先完整解析再下发，避免已经发出失败事件后无法退回旧降级。
+    let mut response = summary.take_response()?;
+    let body = match crate::protocol_proxy::read_limited_upstream_body(
+        &mut response,
+        WEB_SEARCH_FOLLOWUP_BODY_LIMIT,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.summary_fallback",
+                serde_json::json!({
+                    "stage": "read_summary",
+                    "searchRound": search_round,
+                    "maxRounds": max_rounds,
+                    "message": error.to_string()
+                }),
+            );
+            return complete_web_search_with_results(stream, converter, client_search_outputs)
+                .await;
+        }
+    };
+    let summary_parsed = match crate::web_search::parse_chat_response(&body, &summary.content_type)
+    {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "web_search.summary_fallback",
+                serde_json::json!({
+                    "stage": "parse_summary",
+                    "searchRound": search_round,
+                    "maxRounds": max_rounds,
+                    "message": error.to_string()
+                }),
+            );
+            return complete_web_search_with_results(stream, converter, client_search_outputs)
+                .await;
+        }
+    };
+    let (summary_search_calls, summary_has_client_tool) =
+        match summary_parsed.web_search_calls_with_client_tools() {
+            Ok(calls) => calls,
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "web_search.summary_fallback",
+                    serde_json::json!({
+                        "stage": "parse_summary_calls",
+                        "searchRound": search_round,
+                        "maxRounds": max_rounds,
+                        "message": error.to_string()
+                    }),
+                );
+                return complete_web_search_with_results(stream, converter, client_search_outputs)
+                    .await;
+            }
+        };
+    let has_summary_text = summary_parsed
+        .message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    if summary_parsed.finish_reason.is_none() || !summary_search_calls.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.summary_fallback",
+            serde_json::json!({
+                "stage": "invalid_summary",
+                "searchRound": search_round,
+                "maxRounds": max_rounds,
+                "finishReason": summary_parsed.finish_reason,
+                "searchCallCount": summary_search_calls.len()
+            }),
+        );
+        return complete_web_search_with_results(stream, converter, client_search_outputs).await;
+    }
+    if !has_summary_text && !summary_has_client_tool {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "web_search.summary_fallback",
+            serde_json::json!({
+                "stage": "empty_summary",
+                "searchRound": search_round,
+                "maxRounds": max_rounds
+            }),
+        );
+        return complete_web_search_with_results(stream, converter, client_search_outputs).await;
+    }
+
+    if !client_search_outputs.is_empty() {
+        let search_results = converter.push_web_search_results(client_search_outputs);
+        stream.write_all(&search_results).await?;
+    }
+    // 收尾请求成功：模型的总结按普通二段响应转发，客户端能看到最终答案。
+    converter.resume_after_web_search(&parsed.id);
+    let output = converter.push_parsed_chat_response(&summary_parsed);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "web_search.summary_response",
+        serde_json::json!({
+            "searchRound": search_round,
+            "maxRounds": max_rounds,
+            "finishReason": summary_parsed.finish_reason,
+            "contentLength": summary_parsed
+                .message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0),
+            "outputLength": output.len()
+        }),
+    );
+    stream.write_all(&output).await?;
+    let completed = converter.finish();
+    stream.write_all(&completed).await?;
+    record_chat_converter_usage(session_headers.thread_id, converter);
     Ok(())
 }
 
@@ -3962,9 +4268,11 @@ async fn forward_web_search_protocol_proxy_stream(
             Ok(Err(error)) => {
                 // 搜索 provider 失败只降级当前轮的 call item：
                 // 已流式输出的 reasoning/text 不丢，前面轮次已完成的结果
-                // 照常回填，响应仍以 completed 收尾。
+                // 照常回填，响应仍以 completed 收尾。降级之后再问模型一次，
+                // 让它把失败原因和已有信息的结论讲清楚，而不是直接没下文。
                 let message = error.to_string();
-                let degraded = converter.degrade_web_search_calls("web_search_provider_failed", message);
+                let degraded = converter
+                    .degrade_web_search_calls("web_search_provider_failed", message.clone());
                 stream.write_all(&degraded).await?;
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "web_search.degraded",
@@ -3974,10 +4282,37 @@ async fn forward_web_search_protocol_proxy_stream(
                         "maxRounds": max_rounds
                     }),
                 );
-                complete_web_search_with_results(
+                if current_has_client_tool {
+                    // 混合调用时不能把带客户端 tool_call 的 assistant 消息再发给模型：
+                    // 那会留下未配对的客户端调用。搜索失败项和客户端工具一起交还 Codex。
+                    let client_tools_done = converter.complete_client_tool_calls();
+                    stream.write_all(&client_tools_done).await?;
+                    if !accumulated_search_outputs.is_empty() {
+                        let search_results =
+                            converter.push_web_search_results(&accumulated_search_outputs);
+                        stream.write_all(&search_results).await?;
+                    }
+                    let completed = converter.finish();
+                    stream.write_all(&completed).await?;
+                    log_web_search_turn_usage(&converter, search_round);
+                    record_chat_converter_usage(session_headers.thread_id, &converter);
+                    return Ok(None);
+                }
+                let failed_outputs = failed_web_search_outputs(&current_search_calls, &message);
+                finish_web_search_with_model_summary(
                     stream,
                     &mut converter,
+                    &context,
+                    session_headers,
+                    &current_chat_request,
+                    &current_parsed,
+                    &failed_outputs,
                     &accumulated_search_outputs,
+                    crate::web_search::WebSearchFollowupNotice::ProviderFailed {
+                        search_round,
+                        reason: message,
+                    },
+                    search_round,
                 )
                 .await?;
                 return Ok(None);
@@ -4099,10 +4434,21 @@ async fn forward_web_search_protocol_proxy_stream(
                         "message": error.to_string()
                     }),
                 );
-                complete_web_search_with_results(
+                // followup 请求发送失败（连接/超时）：搜索已成功但模型读不到，
+                // 走统一降级出口，让模型基于已有结果给出总结。
+                finish_web_search_with_model_summary(
                     stream,
                     &mut converter,
+                    &context,
+                    session_headers,
+                    &current_chat_request,
+                    &current_parsed,
+                    &search_outputs,
                     &accumulated_search_outputs,
+                    crate::web_search::WebSearchFollowupNotice::UpstreamFailed {
+                        reason: error.to_string(),
+                    },
+                    search_round,
                 )
                 .await?;
                 return Ok(None);
@@ -4132,10 +4478,21 @@ async fn forward_web_search_protocol_proxy_stream(
                     "message": upstream_message
                 }),
             );
-            complete_web_search_with_results(
+            // followup 发出去了但上游返回非 2xx（如 new-api 渠道 500）：
+            // 与发送失败同一类，走统一降级出口。
+            finish_web_search_with_model_summary(
                 stream,
                 &mut converter,
+                &context,
+                session_headers,
+                &current_chat_request,
+                &current_parsed,
+                &search_outputs,
                 &accumulated_search_outputs,
+                crate::web_search::WebSearchFollowupNotice::UpstreamFailed {
+                    reason: format!("status {status_code}: {upstream_message}"),
+                },
+                search_round,
             )
             .await?;
             return Ok(None);
@@ -4262,12 +4619,14 @@ async fn forward_web_search_protocol_proxy_stream(
         if !retain_web_search_tool {
             // 工具声明已移除但模型仍发起下一次 web_search：只把该次调用
             // 落成 failed item，已完成轮次的结果照常回填，响应正常收尾。
+            // 之后仍走统一降级出口：模型明确知道已达上限、必须现在收尾。
             let message = format!(
                 "本次用户请求内 web_search 已达上限（{max_rounds}/{max_rounds}），该次调用未执行。\
                  请基于已返回的搜索结果直接作答；信息不足时说明缺什么，\
                  本请求内不要再次调用 web_search，收到下一条用户消息后可继续搜索。"
             );
-            let degraded = converter.degrade_web_search_calls("web_search_round_limit", message);
+            let degraded =
+                converter.degrade_web_search_calls("web_search_round_limit", message.clone());
             stream.write_all(&degraded).await?;
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "web_search.degraded",
@@ -4277,10 +4636,21 @@ async fn forward_web_search_protocol_proxy_stream(
                     "maxRounds": max_rounds
                 }),
             );
-            complete_web_search_with_results(
+            let failed_outputs = failed_web_search_outputs(&current_search_calls, &message);
+            finish_web_search_with_model_summary(
                 stream,
                 &mut converter,
+                &context,
+                session_headers,
+                &followup_request,
+                &current_parsed,
+                &failed_outputs,
                 &accumulated_search_outputs,
+                crate::web_search::WebSearchFollowupNotice::Exhausted {
+                    completed_rounds: search_round,
+                    max_rounds,
+                },
+                search_round,
             )
             .await?;
             return Ok(None);
@@ -4601,16 +4971,17 @@ impl ChunkedScanState {
                     trailer_start += trailer_end_offset + 2;
                 }
             }
-            let next_decoded_len = self
-                .decoded_len
-                .checked_add(chunk_size)
-                .ok_or_else(|| HttpRequestReadError::payload_too_large_with_limit(max_body_bytes))?;
+            let next_decoded_len = self.decoded_len.checked_add(chunk_size).ok_or_else(|| {
+                HttpRequestReadError::payload_too_large_with_limit(max_body_bytes)
+            })?;
             if next_decoded_len > max_body_bytes {
-                return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
+                return Err(HttpRequestReadError::payload_too_large_with_limit(
+                    max_body_bytes,
+                ));
             }
-            let chunk_end = data_start
-                .checked_add(chunk_size)
-                .ok_or_else(|| HttpRequestReadError::payload_too_large_with_limit(max_body_bytes))?;
+            let chunk_end = data_start.checked_add(chunk_size).ok_or_else(|| {
+                HttpRequestReadError::payload_too_large_with_limit(max_body_bytes)
+            })?;
             if encoded.len() < chunk_end + 2 {
                 return Ok(ChunkedBodyScan::Incomplete);
             }
@@ -4659,22 +5030,28 @@ async fn read_http_request_with_limits(
         if let Some(end) = header_end {
             let body = &buffer[end + 4..];
             if body.len() > limits.encoded {
-                return Err(HttpRequestReadError::payload_too_large_with_limit(limits.decoded));
+                return Err(HttpRequestReadError::payload_too_large_with_limit(
+                    limits.decoded,
+                ));
             }
             match framing {
                 HttpBodyFraming::Empty => break,
                 HttpBodyFraming::ContentLength(content_length) => {
                     if content_length > limits.decoded {
-                        return Err(HttpRequestReadError::payload_too_large_with_limit(limits.decoded));
+                        return Err(HttpRequestReadError::payload_too_large_with_limit(
+                            limits.decoded,
+                        ));
                     }
                     if body.len() >= content_length {
                         break;
                     }
                 }
-                HttpBodyFraming::Chunked => match chunked_scan.advance_with_limit(body, limits.decoded)? {
-                    ChunkedBodyScan::Incomplete => {}
-                    ChunkedBodyScan::Complete => break,
-                },
+                HttpBodyFraming::Chunked => {
+                    match chunked_scan.advance_with_limit(body, limits.decoded)? {
+                        ChunkedBodyScan::Incomplete => {}
+                        ChunkedBodyScan::Complete => break,
+                    }
+                }
             }
         }
     }
@@ -4688,14 +5065,16 @@ async fn read_http_request_with_limits(
         HttpBodyFraming::ContentLength(content_length) => {
             content_length_body_with_limit(encoded_body, content_length, limits.decoded)?
         }
-        HttpBodyFraming::Chunked => match decode_chunked_body_with_limit(encoded_body, limits.decoded)? {
-            ChunkedBody::Complete(body) => body,
-            ChunkedBody::Incomplete => {
-                return Err(HttpRequestReadError::bad_request(
-                    "chunked HTTP 请求体不完整",
-                ));
+        HttpBodyFraming::Chunked => {
+            match decode_chunked_body_with_limit(encoded_body, limits.decoded)? {
+                ChunkedBody::Complete(body) => body,
+                ChunkedBody::Incomplete => {
+                    return Err(HttpRequestReadError::bad_request(
+                        "chunked HTTP 请求体不完整",
+                    ));
+                }
             }
-        },
+        }
     };
 
     Ok(HttpRequest { headers, body })
@@ -4766,7 +5145,9 @@ fn content_length_body_with_limit(
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, HttpRequestReadError> {
     if content_length > max_body_bytes {
-        return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
+        return Err(HttpRequestReadError::payload_too_large_with_limit(
+            max_body_bytes,
+        ));
     }
     if encoded.len() < content_length {
         return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
@@ -4826,7 +5207,9 @@ fn decode_chunked_body_with_limit(
             }
         }
         if decoded.len().saturating_add(chunk_size) > max_body_bytes {
-            return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
+            return Err(HttpRequestReadError::payload_too_large_with_limit(
+                max_body_bytes,
+            ));
         }
         let chunk_end = position
             .checked_add(chunk_size)
@@ -5523,7 +5906,10 @@ async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<(
 }
 
 fn native_fast_launch_state(result: &Value) -> (bool, bool, bool) {
-    let Some(text) = result.pointer("/result/result/value").and_then(Value::as_str) else {
+    let Some(text) = result
+        .pointer("/result/result/value")
+        .and_then(Value::as_str)
+    else {
         return (false, false, false);
     };
     let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -6839,10 +7225,19 @@ mod tests {
         assert_eq!(resolve_http_body_bytes(None, 4096 * mib), 512 * mib);
 
         // 环境变量优先于设置；低于下限或非法值忽略，高于上限夹取。
-        assert_eq!(resolve_http_body_bytes(Some(" 402653184 "), 64 * mib), 384 * mib);
+        assert_eq!(
+            resolve_http_body_bytes(Some(" 402653184 "), 64 * mib),
+            384 * mib
+        );
         assert_eq!(resolve_http_body_bytes(Some("1048576"), 64 * mib), 64 * mib);
-        assert_eq!(resolve_http_body_bytes(Some("not-a-number"), 64 * mib), 64 * mib);
-        assert_eq!(resolve_http_body_bytes(Some("1073741824"), 64 * mib), 512 * mib);
+        assert_eq!(
+            resolve_http_body_bytes(Some("not-a-number"), 64 * mib),
+            64 * mib
+        );
+        assert_eq!(
+            resolve_http_body_bytes(Some("1073741824"), 64 * mib),
+            512 * mib
+        );
     }
 
     #[test]
@@ -7312,10 +7707,11 @@ mod tests {
                     if expected_len.is_none() {
                         if let Some(header_end) = find_header_end(&request) {
                             let headers = String::from_utf8_lossy(&request[..header_end]);
-                            let content_length = header_value_from_headers(&headers, "content-length")
-                                .unwrap()
-                                .parse::<usize>()
-                                .unwrap();
+                            let content_length =
+                                header_value_from_headers(&headers, "content-length")
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap();
                             expected_len = Some(header_end + 4 + content_length);
                         }
                     }
@@ -7357,7 +7753,10 @@ mod tests {
 
         let text = String::from_utf8_lossy(&response);
         assert!(text.contains("resp_ok"), "{text}");
-        assert!(!text.contains("server_is_overloaded"), "buffered 模式不应把过载错误交给客户端");
+        assert!(
+            !text.contains("server_is_overloaded"),
+            "buffered 模式不应把过载错误交给客户端"
+        );
         let entries = crate::request_log::read_request_logs_at(&log_path, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].success);
@@ -8019,8 +8418,7 @@ mod proxy_stream_tests {
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
         let (failure, output, _) =
-            forward_fixture_with_prefix_and_delay(&[], body, truncated, wire, Duration::ZERO)
-                .await;
+            forward_fixture_with_prefix_and_delay(&[], body, truncated, wire, Duration::ZERO).await;
         (failure, output)
     }
 
@@ -8093,7 +8491,11 @@ mod proxy_stream_tests {
         reader.read_to_end(&mut bytes).await.unwrap();
         let (result, first_output_at_ms) = forwarded.await.unwrap();
         upstream_task.await.unwrap();
-        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms)
+        (
+            result,
+            String::from_utf8(bytes).unwrap(),
+            first_output_at_ms,
+        )
     }
 
     #[tokio::test]
@@ -8767,10 +9169,211 @@ mod proxy_stream_tests {
         );
         assert!(response.contains("event: response.completed"));
         assert!(!response.contains("event: response.failed"));
+        // 第一次 followup 500 后，会再发一次无 web_search 工具的总结请求；
+        // 总结请求也失败时，才退回旧的搜索摘要回填。
         assert_eq!(
-            followup_model_server.received_requests().await.unwrap().len(),
-            1
+            followup_model_server
+                .received_requests()
+                .await
+                .unwrap()
+                .len(),
+            2
         );
+        let requests = followup_model_server.received_requests().await.unwrap();
+        let summary_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let summary_messages = summary_body["messages"].as_array().unwrap();
+        assert_eq!(summary_messages[1]["tool_calls"][0]["id"], "call_search");
+        assert_eq!(summary_messages[2]["tool_call_id"], "call_search");
+        assert_eq!(summary_messages[3]["role"], "user");
+        assert!(
+            summary_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("upstream transport failure"),
+            "总结请求缺少上游失败提示: {summary_messages:?}"
+        );
+        assert!(summary_body.get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn web_search_followup_error_asks_model_for_summary() {
+        use crate::settings::{
+            BackendSettings, RelayProfile, RelayProtocol, WebSearchProvider, WebSearchSettings,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let search_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "title": "Codex result",
+                    "url": "https://example.com/codex",
+                    "text": "Codex content"
+                }]
+            })))
+            .mount(&search_server)
+            .await;
+
+        let first_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-search\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&first_model_server)
+            .await;
+
+        let followup_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": { "message": "upstream unavailable" }
+            })))
+            .up_to_n_times(1)
+            .mount(&followup_model_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-summary\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"Upstream transport failed; based on Codex result.\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&followup_model_server)
+            .await;
+
+        let first_response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", first_model_server.uri()))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let relay = RelayProfile {
+            base_url: format!("{}/v1", followup_model_server.uri()),
+            api_key: "sk-upstream".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            ..RelayProfile::default()
+        };
+        let mut upstream = UpstreamProxyResponse {
+            status_code: 200,
+            is_stream: true,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            response: Some(first_response),
+            web_search_context: None,
+            stream_prefix: Vec::new(),
+            request_trace: None,
+            exec_adapted: false,
+            exec_outcome: None,
+        };
+
+        let mut settings = BackendSettings::default();
+        settings.web_search = WebSearchSettings {
+            enabled: true,
+            provider: WebSearchProvider::Exa,
+            exa_api_key: "exa-key".to_string(),
+            exa_api_key_env: String::new(),
+            tavily_api_key: String::new(),
+            tavily_api_key_env: String::new(),
+            result_limit: 1,
+            max_rounds: 3,
+            timeout_seconds: 5,
+        };
+        let context = WebSearchExecutionContext {
+            relay,
+            endpoint: format!("{}/v1/chat/completions", followup_model_server.uri()),
+            chat_request: serde_json::json!({
+                "model": "fixture-model",
+                "messages": [{ "role": "user", "content": "search Codex" }],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "web_search", "parameters": { "type": "object" } }
+                }]
+            }),
+            original_request: serde_json::json!({
+                "model": "fixture-model",
+                "input": "search Codex",
+                "stream": true,
+                "tools": [{ "type": "web_search" }]
+            }),
+            settings,
+            original_user_agent: None,
+            beta_features: None,
+            search_endpoint: Some(format!("{}/search", search_server.uri())),
+        };
+
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let failure = forward_web_search_protocol_proxy_stream(
+                &mut writer,
+                &mut upstream,
+                context,
+                ProxySessionHeaders::default(),
+            )
+            .await
+            .unwrap();
+            assert!(failure.is_none(), "web search stream failed: {failure:?}");
+            writer.shutdown().await.unwrap();
+        });
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        forwarded.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Web search results for query: Codex"));
+        assert!(
+            response.contains("Upstream transport failed; based on Codex result."),
+            "missing model summary: {response}"
+        );
+        assert!(response.contains("event: response.completed"));
+        assert!(!response.contains("event: response.failed"));
+        assert!(!response.contains("Internal reminder"));
+        assert_eq!(
+            followup_model_server
+                .received_requests()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let requests = followup_model_server.received_requests().await.unwrap();
+        let summary_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let summary_messages = summary_body["messages"].as_array().unwrap();
+        assert_eq!(summary_messages[1]["tool_calls"][0]["id"], "call_search");
+        assert_eq!(summary_messages[2]["tool_call_id"], "call_search");
+        assert!(
+            summary_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("upstream transport failure"),
+            "总结请求缺少上游失败提示: {summary_messages:?}"
+        );
+        assert!(summary_body.get("tools").is_none());
     }
 
     #[tokio::test]
@@ -8986,8 +9589,22 @@ mod proxy_stream_tests {
             .mount(&first_model_server)
             .await;
 
-        // provider 失败必须原地降级，不能再发二段模型请求。
+        // provider 失败先落成 item 级 failed，再把失败原因交给模型总结。
         let followup_model_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-provider-summary\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"Search service unavailable; please retry.\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&followup_model_server)
+            .await;
 
         let first_response = reqwest::Client::new()
             .post(format!("{}/v1/chat/completions", first_model_server.uri()))
@@ -9068,7 +9685,10 @@ mod proxy_stream_tests {
             )
             .await
             .unwrap();
-            assert!(failure.is_none(), "provider failure must degrade: {failure:?}");
+            assert!(
+                failure.is_none(),
+                "provider failure must degrade: {failure:?}"
+            );
             writer.shutdown().await.unwrap();
         });
         let mut response = Vec::new();
@@ -9086,10 +9706,42 @@ mod proxy_stream_tests {
         assert!(response.contains("Exa 搜索返回 HTTP 500"));
         assert!(response.contains("event: response.completed"));
         assert!(!response.contains("event: response.failed"));
+        assert!(
+            response.contains("Search service unavailable; please retry."),
+            "missing model summary: {response}"
+        );
         // 第一轮就失败：没有已完成结果，不能回填空摘要。
         assert!(!response.contains("Web search results for"));
         assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
-        assert_eq!(followup_model_server.received_requests().await.unwrap().len(), 0);
+        assert_eq!(
+            followup_model_server
+                .received_requests()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let requests = followup_model_server.received_requests().await.unwrap();
+        let summary_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let summary_messages = summary_body["messages"].as_array().unwrap();
+        assert_eq!(summary_messages[1]["tool_calls"][0]["id"], "call_search");
+        assert_eq!(summary_messages[2]["tool_call_id"], "call_search");
+        assert!(
+            summary_messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Exa 搜索返回 HTTP 500"),
+            "provider 失败结果没有交给模型: {summary_messages:?}"
+        );
+        assert!(
+            summary_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("provider failed on the current call in round 1"),
+            "provider 失败提示不完整: {summary_messages:?}"
+        );
+        assert!(summary_body.get("tools").is_none());
+        assert!(!response.contains("Internal reminder"));
     }
 
     #[tokio::test]
@@ -9137,6 +9789,21 @@ mod proxy_stream_tests {
                 concat!(
                     "data: {\"id\":\"chatcmpl-second\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_second\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Go\\\"}\"}}]}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .up_to_n_times(1)
+            .mount(&followup_model_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"id\":\"chatcmpl-limit-summary\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"content\":\"Search budget is spent; here is the final answer.\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                     "data: [DONE]\n\n"
                 )
                 .as_bytes()
@@ -9244,14 +9911,37 @@ mod proxy_stream_tests {
         // 已完成轮次的结果摘要照常回填。
         assert!(response.contains("Web search results for query: Codex"));
         assert!(response.contains("1. Codex result - https://example.com/codex"));
+        assert!(
+            response.contains("Search budget is spent; here is the final answer."),
+            "missing model summary: {response}"
+        );
         assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
-        assert_eq!(followup_model_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            followup_model_server
+                .received_requests()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         // max_rounds=1：该 followup 已用尽预算，收尾提示必须发给模型，
         // 且只出现在上游请求里，不出现在客户端响应流。
         let exhausted_requests = followup_model_server.received_requests().await.unwrap();
         let exhausted_body: serde_json::Value =
-            serde_json::from_slice(&exhausted_requests[0].body).unwrap();
+            serde_json::from_slice(&exhausted_requests[1].body).unwrap();
         let exhausted_messages = exhausted_body["messages"].as_array().unwrap();
+        assert_eq!(exhausted_messages.len(), 7);
+        assert_eq!(exhausted_messages[1]["tool_calls"][0]["id"], "call_first");
+        assert_eq!(exhausted_messages[2]["tool_call_id"], "call_first");
+        assert_eq!(exhausted_messages[4]["tool_calls"][0]["id"], "call_second");
+        assert_eq!(exhausted_messages[5]["tool_call_id"], "call_second");
+        assert!(
+            exhausted_messages[5]["content"]
+                .as_str()
+                .unwrap()
+                .contains("已达上限"),
+            "超限调用的 tool 输出缺少失败原因: {exhausted_messages:?}"
+        );
         let exhausted_text = exhausted_messages.last().unwrap()["content"]
             .as_str()
             .unwrap();
@@ -9779,13 +10469,16 @@ mod proxy_stream_tests {
             loop {
                 let byte = socket.read_u8().await.unwrap();
                 request.push(byte);
-                if request.ends_with(b"\r\n\r\n") { break; }
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
             }
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-            let mut chunks = vec![b"data:{\"type\":\"response.output_item.done\",\"image\":\"".to_vec()];
+            let mut chunks =
+                vec![b"data:{\"type\":\"response.output_item.done\",\"image\":\"".to_vec()];
             // 20 * 256 KiB = 5 MiB，超过 4 MiB 改写缓冲上限
             for _ in 0..20 {
                 chunks.push(vec![b'A'; 256 * 1024]);
@@ -9840,10 +10533,17 @@ mod proxy_stream_tests {
         .unwrap()
         .0;
         writer.shutdown().await.unwrap();
-        assert!(forwarded.is_none(), "超大事件后有 response.completed，流应判为成功：{forwarded:?}");
+        assert!(
+            forwarded.is_none(),
+            "超大事件后有 response.completed，流应判为成功：{forwarded:?}"
+        );
 
         let forwarded_bytes = reader_task.await.unwrap();
-        assert!(forwarded_bytes.len() > 5 * 1024 * 1024, "超大事件必须完整转发，收到 {} 字节", forwarded_bytes.len());
+        assert!(
+            forwarded_bytes.len() > 5 * 1024 * 1024,
+            "超大事件必须完整转发，收到 {} 字节",
+            forwarded_bytes.len()
+        );
         assert!(forwarded_bytes.ends_with(b"data:{\"type\":\"response.completed\"}\n\n"));
         upstream_task.abort();
     }

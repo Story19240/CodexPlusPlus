@@ -525,7 +525,7 @@ fn parse_chat_sse_response(text: &str) -> anyhow::Result<ParsedChatResponse> {
 /// 多轮搜索的内部提示：追加在 followup 请求末尾，只发给上游 Chat 模型，
 /// 不进入客户端可见的响应流（历史转换只处理带 content 的项，web_search_call 连
 /// error 一起被丢弃，所以这里是唯一能把话递到模型手里的通道）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSearchFollowupNotice {
     /// 预算内：工具仍在，告知已用与剩余轮数，避免模型无度连搜或提前认输。
     RoundsLeft {
@@ -537,6 +537,11 @@ pub enum WebSearchFollowupNotice {
         completed_rounds: usize,
         max_rounds: usize,
     },
+    /// 搜索 provider 失败：当前轮没有拿到结果，要把失败原因告诉模型。
+    ProviderFailed { search_round: usize, reason: String },
+    /// followup 请求被上游拒绝（连接失败或非 2xx）：搜索已成功，
+    /// 但模型侧读不到结果，需要说明这是上游传输问题、不是搜索失败。
+    UpstreamFailed { reason: String },
 }
 
 impl WebSearchFollowupNotice {
@@ -564,6 +569,26 @@ impl WebSearchFollowupNotice {
                  answer now. If they are insufficient, state exactly what information is missing \
                  and tell the user that searching can continue after their next message. Other \
                  available tools may still be used if necessary."
+            ),
+            Self::ProviderFailed {
+                search_round,
+                reason,
+            } => format!(
+                "Internal reminder: the web_search provider failed on the current call \
+                 in round {search_round} ({reason}), so that call returned no results. \
+                 The web_search tool is no longer available for this request; do not announce or \
+                 request another search. If this conversation already contains results from earlier \
+                 rounds, use them to produce your final answer. If nothing usable was retrieved, \
+                 tell the user plainly that the web search service was unavailable, include this \
+                 failure reason, and explain what they can retry."
+            ),
+            Self::UpstreamFailed { reason } => format!(
+                "Internal reminder: the web search results for this request were retrieved \
+                 successfully, but the model request that had to read them was rejected by the \
+                 upstream relay ({reason}). This is an upstream transport failure, not a search \
+                 failure. The web_search tool is no longer available for this request. Use the \
+                 search results already present in this conversation to produce your final answer \
+                 now; do not announce another web search."
             ),
         }
     }
@@ -623,15 +648,56 @@ pub fn build_web_search_followup_request_with_web_search_tool(
         first_message["content"] = json!("");
     }
     messages.push(first_message);
+
+    // Chat 协议要求 assistant tool_calls 与后续 role:tool 一一配对。
+    // 这里提前拒绝缺漏、重复或无关 call_id，避免把注定被上游 400 的请求发出去。
+    let expected_call_ids = first_response
+        .message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool_call| {
+            tool_call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "web_search")
+        })
+        .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let mut appended_call_ids = Vec::with_capacity(outputs.len());
     for output in outputs {
         if output.call_id.trim().is_empty() {
             bail!("Web 搜索结果缺少 tool_call_id");
         }
+        if !expected_call_ids
+            .iter()
+            .any(|call_id| *call_id == output.call_id)
+        {
+            bail!(
+                "Web 搜索结果 tool_call_id {} 不属于本次 web_search 调用",
+                output.call_id
+            );
+        }
+        if appended_call_ids
+            .iter()
+            .any(|call_id| *call_id == output.call_id)
+        {
+            bail!("Web 搜索结果重复追加 tool_call_id {}", output.call_id);
+        }
+        appended_call_ids.push(output.call_id.clone());
         messages.push(json!({
             "role": "tool",
             "tool_call_id": output.call_id,
             "content": output.content
         }));
+    }
+    if appended_call_ids.len() != expected_call_ids.len() {
+        bail!(
+            "Web 搜索结果缺少 tool_call_id；期望 {} 条，实际 {} 条",
+            expected_call_ids.len(),
+            appended_call_ids.len()
+        );
     }
 
     // 内部提示放在 tool 结果之后：配对关系不受影响，也不会夹在连续 tool 结果之间。
@@ -689,7 +755,12 @@ pub fn summarize_search_results(query: &str, results: &[WebSearchResult]) -> Str
     }
     let mut output = format!("Web search results for query: {query}");
     for (index, result) in results.iter().enumerate() {
-        output.push_str(&format!("\n{}. {} - {}", index + 1, result.title, result.url));
+        output.push_str(&format!(
+            "\n{}. {} - {}",
+            index + 1,
+            result.title,
+            result.url
+        ));
     }
     output
 }
@@ -1242,6 +1313,37 @@ mod tests {
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_search");
         assert_eq!(messages[2]["content"], "Web search result");
+    }
+
+    #[test]
+    fn followup_rejects_unpaired_search_outputs() {
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-search\",\"model\":\"fixture-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_search\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Codex\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let parsed = parse_chat_response(stream.as_bytes(), "text/event-stream").unwrap();
+        let request = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        let output = |call_id: &str| WebSearchToolOutput {
+            call_id: call_id.to_string(),
+            queries: vec!["Codex".to_string()],
+            content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
+        };
+
+        let unknown = build_web_search_followup_request(&request, &parsed, &[output("call_other")])
+            .unwrap_err();
+        assert!(unknown.to_string().contains("不属于本次 web_search 调用"));
+
+        let duplicate = build_web_search_followup_request(
+            &request,
+            &parsed,
+            &[output("call_search"), output("call_search")],
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("重复追加"));
+
+        let missing = build_web_search_followup_request(&request, &parsed, &[]).unwrap_err();
+        assert!(missing.to_string().contains("缺少 tool_call_id"));
     }
 
     #[test]
