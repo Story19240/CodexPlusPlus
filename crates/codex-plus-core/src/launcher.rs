@@ -4011,12 +4011,26 @@ async fn forward_web_search_protocol_proxy_stream(
         }
 
         let retain_web_search_tool = search_round < max_rounds;
+        // 每个 followup 都带一条内部提示：预算内告知剩余轮数，预算用尽要求
+        // 立即收尾。只进上游请求，客户端可见的响应流里看不到这段文案。
+        let followup_notice = if retain_web_search_tool {
+            crate::web_search::WebSearchFollowupNotice::RoundsLeft {
+                completed_rounds: search_round,
+                max_rounds,
+            }
+        } else {
+            crate::web_search::WebSearchFollowupNotice::Exhausted {
+                completed_rounds: search_round,
+                max_rounds,
+            }
+        };
         let followup_request =
             match crate::web_search::build_web_search_followup_request_with_web_search_tool(
                 &current_chat_request,
                 &current_parsed,
                 &search_outputs,
                 retain_web_search_tool,
+                Some(followup_notice),
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -8574,9 +8588,40 @@ mod proxy_stream_tests {
         );
         assert_eq!(followup_requests[0]["tool_choice"], "auto");
         let first_messages = followup_requests[0]["messages"].as_array().unwrap();
-        assert_eq!(first_messages.last().unwrap()["tool_call_id"], "call_first");
+        // tool 结果之后跟一条内部提示：预算内告知剩余轮数，只进上游请求。
+        assert_eq!(first_messages[2]["role"], "tool");
+        assert_eq!(first_messages[2]["tool_call_id"], "call_first");
+        let first_reminder = first_messages.last().unwrap();
+        assert_eq!(first_reminder["role"], "user");
+        assert!(
+            first_reminder["content"]
+                .as_str()
+                .unwrap()
+                .contains("web_search has completed 1 of 3"),
+            "预算内 followup 缺少剩余轮数提示: {first_reminder:?}"
+        );
+        // 提示只发给上游模型，客户端可见的响应流里不能出现。
+        assert!(!response.contains("Internal reminder"));
         let second_messages = followup_requests[1]["messages"].as_array().unwrap();
-        assert_eq!(second_messages.len(), first_messages.len() + 2);
+        assert_eq!(second_messages.len(), first_messages.len() + 3);
+        let second_reminder = second_messages.last().unwrap();
+        assert!(
+            second_reminder["content"]
+                .as_str()
+                .unwrap()
+                .contains("web_search has completed 2 of 3"),
+            "第二轮 followup 缺少剩余轮数提示: {second_reminder:?}"
+        );
+        // 预算上限为 3，第 2 轮仍在预算内：工具保留，提示只报进度。
+        assert!(
+            followup_requests[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |tool| tool.pointer("/function/name") == Some(&serde_json::json!("web_search"))
+                )
+        );
     }
 
     #[tokio::test]
@@ -9201,6 +9246,20 @@ mod proxy_stream_tests {
         assert!(response.contains("1. Codex result - https://example.com/codex"));
         assert_eq!(search_server.received_requests().await.unwrap().len(), 1);
         assert_eq!(followup_model_server.received_requests().await.unwrap().len(), 1);
+        // max_rounds=1：该 followup 已用尽预算，收尾提示必须发给模型，
+        // 且只出现在上游请求里，不出现在客户端响应流。
+        let exhausted_requests = followup_model_server.received_requests().await.unwrap();
+        let exhausted_body: serde_json::Value =
+            serde_json::from_slice(&exhausted_requests[0].body).unwrap();
+        let exhausted_messages = exhausted_body["messages"].as_array().unwrap();
+        let exhausted_text = exhausted_messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            exhausted_text.contains("reached the configured limit of 1 rounds"),
+            "最终 followup 缺少收尾提示: {exhausted_text}"
+        );
+        assert!(!response.contains("Internal reminder"));
     }
 
     #[tokio::test]

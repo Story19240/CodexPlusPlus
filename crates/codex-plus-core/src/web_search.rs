@@ -522,6 +522,53 @@ fn parse_chat_sse_response(text: &str) -> anyhow::Result<ParsedChatResponse> {
     })
 }
 
+/// 多轮搜索的内部提示：追加在 followup 请求末尾，只发给上游 Chat 模型，
+/// 不进入客户端可见的响应流（历史转换只处理带 content 的项，web_search_call 连
+/// error 一起被丢弃，所以这里是唯一能把话递到模型手里的通道）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchFollowupNotice {
+    /// 预算内：工具仍在，告知已用与剩余轮数，避免模型无度连搜或提前认输。
+    RoundsLeft {
+        completed_rounds: usize,
+        max_rounds: usize,
+    },
+    /// 预算用尽：工具声明已移除，模型必须基于已有结果立即收尾。
+    Exhausted {
+        completed_rounds: usize,
+        max_rounds: usize,
+    },
+}
+
+impl WebSearchFollowupNotice {
+    /// 提示正文。直接给上游模型读，不面向用户，故用英文。
+    pub fn reminder_text(&self) -> String {
+        match self {
+            Self::RoundsLeft {
+                completed_rounds,
+                max_rounds,
+            } => format!(
+                "Internal reminder: web_search has completed {completed_rounds} of {max_rounds} \
+                 allowed rounds in this request ({} remaining). If the results already answer the \
+                 request, answer now and stop searching; only continue when specific information \
+                 is still missing.",
+                max_rounds - completed_rounds
+            ),
+            Self::Exhausted {
+                completed_rounds,
+                max_rounds,
+            } => format!(
+                "Internal reminder: web_search for this request has reached the configured limit \
+                 of {max_rounds} rounds ({completed_rounds} executed), and the web_search tool is \
+                 no longer available. Do not announce another web search and do not request one. \
+                 Use the search results already present in this conversation to produce your final \
+                 answer now. If they are insufficient, state exactly what information is missing \
+                 and tell the user that searching can continue after their next message. Other \
+                 available tools may still be used if necessary."
+            ),
+        }
+    }
+}
+
 pub fn build_web_search_followup_request(
     chat_request: &Value,
     first_response: &ParsedChatResponse,
@@ -532,6 +579,7 @@ pub fn build_web_search_followup_request(
         first_response,
         outputs,
         false,
+        None,
     )
 }
 
@@ -540,6 +588,7 @@ pub fn build_web_search_followup_request_with_web_search_tool(
     first_response: &ParsedChatResponse,
     outputs: &[WebSearchToolOutput],
     retain_web_search_tool: bool,
+    notice: Option<WebSearchFollowupNotice>,
 ) -> anyhow::Result<Value> {
     let mut request = chat_request.clone();
     // 默认二段不暴露服务端搜索工具。连续搜索轮次保留全部工具，但禁用并行
@@ -583,6 +632,11 @@ pub fn build_web_search_followup_request_with_web_search_tool(
             "tool_call_id": output.call_id,
             "content": output.content
         }));
+    }
+
+    // 内部提示放在 tool 结果之后：配对关系不受影响，也不会夹在连续 tool 结果之间。
+    if let Some(notice) = notice {
+        messages.push(json!({ "role": "user", "content": notice.reminder_text() }));
     }
 
     // 二段请求必须流式拿响应头，避免大上下文下非流式上游超过 30 秒头部超时。
@@ -1191,6 +1245,133 @@ mod tests {
     }
 
     #[test]
+    fn followup_appends_internal_round_reminder() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-search".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Codex\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+        let outputs = vec![WebSearchToolOutput {
+            call_id: "call_search".to_string(),
+            queries: vec!["Codex".to_string()],
+            content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
+        }];
+        let chat_request = json!({
+            "model": "fixture-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": { "name": "web_search", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": { "type": "web_search" }
+        });
+
+        let in_budget = build_web_search_followup_request_with_web_search_tool(
+            &chat_request,
+            &parsed,
+            &outputs,
+            true,
+            Some(WebSearchFollowupNotice::RoundsLeft {
+                completed_rounds: 1,
+                max_rounds: 5,
+            }),
+        )
+        .unwrap();
+        let in_budget_messages = in_budget["messages"].as_array().unwrap();
+        assert_eq!(in_budget_messages.len(), 4);
+        // 提示必须是最后一条 user 消息，不破坏 assistant tool_calls 与 tool 的配对。
+        assert_eq!(in_budget_messages[2]["role"], "tool");
+        assert_eq!(in_budget_messages[3]["role"], "user");
+        let in_budget_text = in_budget_messages[3]["content"].as_str().unwrap();
+        assert!(in_budget_text.contains("web_search has completed 1 of 5"));
+        assert!(in_budget_text.contains("4 remaining"));
+        assert!(in_budget_text.contains("answer now"));
+        // 预算内工具仍在。
+        assert!(
+            in_budget["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.pointer("/function/name") == Some(&json!("web_search")))
+        );
+
+        let exhausted = build_web_search_followup_request_with_web_search_tool(
+            &chat_request,
+            &parsed,
+            &outputs,
+            false,
+            Some(WebSearchFollowupNotice::Exhausted {
+                completed_rounds: 5,
+                max_rounds: 5,
+            }),
+        )
+        .unwrap();
+        let exhausted_messages = exhausted["messages"].as_array().unwrap();
+        let exhausted_text = exhausted_messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(exhausted_text.contains("reached the configured limit of 5 rounds"));
+        assert!(exhausted_text.contains("produce your final answer now"));
+        assert!(exhausted_text.contains("Do not announce another web search"));
+        // 预算用尽时工具声明被移除。
+        assert!(exhausted.get("tools").is_none());
+    }
+
+    #[test]
+    fn followup_without_notice_keeps_tool_output_tail() {
+        let parsed = ParsedChatResponse {
+            id: "chatcmpl-search".to_string(),
+            model: "fixture-model".to_string(),
+            message: json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Codex\"}"
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        };
+        let outputs = vec![WebSearchToolOutput {
+            call_id: "call_search".to_string(),
+            queries: vec!["Codex".to_string()],
+            content: "Web search result".to_string(),
+            summary: "Web search results for query: Codex".to_string(),
+        }];
+        let followup = build_web_search_followup_request_with_web_search_tool(
+            &json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+            &parsed,
+            &outputs,
+            true,
+            None,
+        )
+        .unwrap();
+        let messages = followup["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.last().unwrap()["role"], "tool");
+    }
+
+    #[test]
     fn followup_can_retain_web_search_for_another_round() {
         let parsed = ParsedChatResponse {
             id: "chatcmpl-search".to_string(),
@@ -1231,6 +1412,7 @@ mod tests {
             &parsed,
             &outputs,
             true,
+            None,
         )
         .unwrap();
 
