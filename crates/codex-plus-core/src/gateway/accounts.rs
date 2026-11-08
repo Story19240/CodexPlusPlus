@@ -21,6 +21,12 @@ const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CALLBACK_PORT: u16 = 1455;
 const CALLBACK_PATH: &str = "/auth/callback";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// 回调监听上每条连接最多等这么久收请求（测试里缩短，免得空连接拖慢测试）。
+const CALLBACK_READ_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(5)
+};
 
 /// 一次登录拿到的账号。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,13 +66,18 @@ fn redirect_uri() -> String {
     format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}")
 }
 
+/// ChatGPT 登录申请的权限，和 Codex 自带 CLI 的登录一致（26.1029 的 codex 二进制里就是这一串）。
+/// 少了 `api.connectors.*` 时，桌面端拿到借出的 token 仍判定未登录、启动即弹登录页（#2908）。
+const CHATGPT_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+
 /// 浏览器要打开的登录地址。
 pub fn chatgpt_authorize_url(challenge: &str, state: &str) -> String {
     let params = [
         ("response_type", "code".to_string()),
         ("client_id", OFFICIAL_OAUTH_CLIENT_ID.to_string()),
         ("redirect_uri", redirect_uri()),
-        ("scope", "openid profile email offline_access".to_string()),
+        ("scope", CHATGPT_SCOPES.to_string()),
         ("code_challenge", challenge.to_string()),
         ("code_challenge_method", "S256".to_string()),
         ("id_token_add_organizations", "true".to_string()),
@@ -105,6 +116,11 @@ fn callback_params(
     request_line: &str,
     callback_path: &str,
 ) -> Option<Result<BTreeMap<String, String>, String>> {
+    callback_query(request_line, callback_path).map(callback_result)
+}
+
+/// 回调请求行里的查询参数（不做校验）；路径不对返回 None。
+fn callback_query(request_line: &str, callback_path: &str) -> Option<BTreeMap<String, String>> {
     let target = request_line.split_whitespace().nth(1)?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != callback_path {
@@ -115,17 +131,22 @@ fn callback_params(
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         params.entry(decode(key)).or_insert_with(|| decode(value));
     }
+    Some(params)
+}
+
+/// 带 error 或缺 code 时返回错误。
+fn callback_result(params: BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
     if let Some(error) = params
         .get("error_description")
         .or_else(|| params.get("error"))
         .filter(|error| !error.is_empty())
     {
-        return Some(Err(error.clone()));
+        return Err(error.clone());
     }
     if params.get("code").is_none_or(|code| code.is_empty()) {
-        return Some(Err("回调里没有授权码".to_string()));
+        return Err("回调里没有授权码".to_string());
     }
-    Some(Ok(params))
+    Ok(params)
 }
 
 fn decode(value: &str) -> String {
@@ -150,7 +171,7 @@ fn decode(value: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn jwt_claims(token: &str) -> Value {
+pub(crate) fn jwt_claims(token: &str) -> Value {
     token
         .split('.')
         .nth(1)
@@ -206,7 +227,9 @@ pub fn account_from_tokens(tokens: &Value) -> anyhow::Result<ChatGptAccount> {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "account_id": account_id,
-        }
+        },
+        // Codex 26.1029 起缺这个字段会判定未登录（#2890）。
+        "last_refresh": crate::official_login::last_refresh_stamp(None),
     }))?;
     Ok(ChatGptAccount {
         email,
@@ -240,6 +263,14 @@ pub fn chatgpt_relay(account: &ChatGptAccount, models: &[String]) -> RelayProfil
     }
 }
 
+/// 两份 ChatGPT 登录凭据（auth.json 结构）是不是同一个人的同一个账号。
+/// Team / Business 工作区的成员共用 chatgpt_account_id，只比它会把另一个成员的登录覆盖掉，
+/// 所以还要比 ID token 里的用户（sub，没有再看 chatgpt_user_id、邮箱）。
+/// 身份不完整时只接受同一代完整 token；只有一边读得出身份时当作不同的人。
+pub fn same_chatgpt_login(left: &str, right: &str) -> bool {
+    crate::native_auth::same_account(left, right)
+}
+
 /// 跑一次 ChatGPT 浏览器登录：在 1455 端口等回调，换 token。`open_browser` 负责打开登录页。
 pub async fn chatgpt_login(open_browser: impl FnOnce(&str)) -> anyhow::Result<ChatGptAccount> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
@@ -268,7 +299,7 @@ async fn wait_for_callback(
     Ok(params.get("code").cloned().unwrap_or_default())
 }
 
-async fn wait_for_callback_params(
+pub(crate) async fn wait_for_callback_params(
     listener: &tokio::net::TcpListener,
     callback_path: &str,
     state: &str,
@@ -276,10 +307,18 @@ async fn wait_for_callback_params(
     loop {
         let (mut stream, _) = listener.accept().await?;
         let mut buffer = vec![0_u8; 8192];
-        let read = stream.read(&mut buffer).await.unwrap_or(0);
+        // 浏览器常预先连上却不发请求：读不到就丢掉这条连接，别把后面的回调堵住。
+        let read = tokio::time::timeout(CALLBACK_READ_TIMEOUT, stream.read(&mut buffer))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        if read == 0 {
+            continue;
+        }
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
         let line = request.lines().next().unwrap_or_default();
-        let Some(result) = callback_params(line, callback_path) else {
+        let Some(params) = callback_query(line, callback_path) else {
             let _ = stream
                 .write_all(
                     b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
@@ -287,29 +326,36 @@ async fn wait_for_callback_params(
                 .await;
             continue;
         };
-        let state_ok = |params: &BTreeMap<String, String>| {
-            params.get("state").map(String::as_str) == Some(state)
-        };
+        // state 不一致多半是之前放弃的登录页（旧标签页）回调过来的：告诉浏览器这页作废，
+        // 接着等这次登录的回调，不结束整个登录。
+        if params.get("state").map(String::as_str) != Some(state) {
+            respond_callback_page(
+                &mut stream,
+                "这个登录页已失效（state 不一致），请在 Codex++ 最新打开的登录页里完成登录。",
+            )
+            .await;
+            continue;
+        }
+        let result = callback_result(params);
         let page = match &result {
-            Ok(params) if state_ok(params) => "登录成功，可以回到 Codex++ 了。",
-            Ok(_) => "登录校验失败（state 不一致），请回到 Codex++ 重新登录。",
+            Ok(_) => "登录成功，可以回到 Codex++ 了。",
             Err(_) => "登录没有完成，请回到 Codex++ 重新登录。",
         };
-        let body = format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>Codex++</title><body style=\"font-family:system-ui;padding:48px;text-align:center\"><h2>{page}</h2></body>"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-        return match result {
-            Ok(params) if state_ok(&params) => Ok(params),
-            Ok(_) => bail!("登录校验失败（state 不一致）"),
-            Err(error) => bail!("登录失败：{error}"),
-        };
+        respond_callback_page(&mut stream, page).await;
+        return result.map_err(|error| anyhow::anyhow!("登录失败：{error}"));
     }
+}
+
+async fn respond_callback_page(stream: &mut tokio::net::TcpStream, page: &str) {
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Codex++</title><body style=\"font-family:system-ui;padding:48px;text-align:center\"><h2>{page}</h2></body>"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 async fn exchange_code(code: &str, verifier: &str) -> anyhow::Result<ChatGptAccount> {
@@ -349,6 +395,7 @@ pub const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_USER_URL: &str = "https://api.github.com/copilot_internal/user";
 const GITHUB_USER_URL: &str = "https://api.github.com/user";
 const COPILOT_DEFAULT_API: &str = "https://api.githubcopilot.com";
 /// 凭据里标识账号类型的字段。
@@ -379,15 +426,24 @@ pub struct DeviceCode {
     pub expires_in: u64,
 }
 
-fn http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent("GitHubCopilotChat/0.26.7")
-        .timeout(Duration::from_secs(30))
-        .build()?)
+/// GitHub / Copilot 请求的 client。`proxy` 是所属供应商的代理设置（[`relay_proxy`]）；
+/// 登录时还没有供应商，传 None 走系统代理 / 环境变量（#2775）。
+fn http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    crate::http_client::build_with_relay_proxy(
+        reqwest::Client::builder()
+            .user_agent("GitHubCopilotChat/0.26.7")
+            .timeout(Duration::from_secs(30)),
+        proxy,
+    )
+}
+
+/// 供应商自己的代理设置：已经建好的账号类供应商，token 刷新、额度和模型查询都按它发（#2775）。
+fn relay_proxy(relay: &RelayProfile) -> Option<String> {
+    crate::relay_proxy::proxy_for_relay(relay)
 }
 
 pub async fn copilot_device_code() -> anyhow::Result<DeviceCode> {
-    let response = http_client()?
+    let response = http_client(None)?
         .post(GITHUB_DEVICE_CODE_URL)
         .header(reqwest::header::ACCEPT, "application/json")
         .form(&[("client_id", COPILOT_CLIENT_ID), ("scope", "read:user")])
@@ -464,7 +520,7 @@ pub fn parse_device_poll(value: &Value) -> DevicePoll {
 
 /// 等用户在浏览器里输入验证码，拿到 GitHub token。
 pub async fn copilot_wait_for_github_token(code: &DeviceCode) -> anyhow::Result<String> {
-    let client = http_client()?;
+    let client = http_client(None)?;
     let mut interval = code.interval;
     let deadline = std::time::Instant::now() + Duration::from_secs(code.expires_in.max(60));
     while std::time::Instant::now() < deadline {
@@ -499,6 +555,8 @@ pub struct CopilotToken {
     pub token: String,
     pub expires_at_ms: u64,
     pub api_base: String,
+    /// 订阅档位（GitHub 返回的 `sku`，如 `free_limited_copilot`、`plus_monthly_subscriber_quota`），没有时为空。
+    pub sku: String,
 }
 
 pub fn parse_copilot_token(value: &Value) -> anyhow::Result<CopilotToken> {
@@ -520,11 +578,48 @@ pub fn parse_copilot_token(value: &Value) -> anyhow::Result<CopilotToken> {
         token,
         expires_at_ms: value.get("expires_at").and_then(Value::as_u64).unwrap_or(0) * 1000,
         api_base,
+        sku: value
+            .get("sku")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
-pub async fn copilot_exchange(github_token: &str) -> anyhow::Result<CopilotToken> {
-    let mut request = http_client()?
+/// Copilot 账号信息（含本月高级请求额度）：`api.github.com/copilot_internal/user`。
+pub async fn copilot_user(relay: &RelayProfile) -> anyhow::Result<Value> {
+    let github_token = account_kind(relay)
+        .and_then(|(_, value)| {
+            value
+                .get("github_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|token| !token.is_empty())
+        .context("Copilot 登录信息不完整，请重新登录")?;
+    let mut request = http_client(relay_proxy(relay).as_deref())?
+        .get(COPILOT_USER_URL)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("token {github_token}"),
+        )
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (key, value) in copilot_headers() {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.context("连不上 GitHub")?;
+    if !response.status().is_success() {
+        bail!("查询 Copilot 额度失败：HTTP {}", response.status().as_u16());
+    }
+    Ok(response.json().await?)
+}
+
+/// `proxy`：所属供应商的代理设置，登录时传 None。
+pub async fn copilot_exchange(
+    github_token: &str,
+    proxy: Option<&str>,
+) -> anyhow::Result<CopilotToken> {
+    let mut request = http_client(proxy)?
         .get(COPILOT_TOKEN_URL)
         .header(
             reqwest::header::AUTHORIZATION,
@@ -550,7 +645,7 @@ pub async fn copilot_exchange(github_token: &str) -> anyhow::Result<CopilotToken
 }
 
 async fn github_login_name(github_token: &str) -> String {
-    let Ok(client) = http_client() else {
+    let Ok(client) = http_client(None) else {
         return String::new();
     };
     let Ok(response) = client
@@ -578,9 +673,9 @@ async fn github_login_name(github_token: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Copilot 账号可用的对话模型。
-pub async fn copilot_models(token: &CopilotToken) -> Vec<String> {
-    let Ok(client) = http_client() else {
+/// Copilot 账号可用的对话模型。`proxy`：所属供应商的代理设置，登录时传 None。
+pub async fn copilot_models(token: &CopilotToken, proxy: Option<&str>) -> Vec<String> {
+    let Ok(client) = http_client(proxy) else {
         return Vec::new();
     };
     let mut request = client
@@ -638,6 +733,7 @@ pub fn copilot_relay(
         "copilot_token": token.token,
         "expires_at_ms": token.expires_at_ms,
         "api_base": token.api_base,
+        "sku": token.sku,
     });
     RelayProfile {
         name: if login.is_empty() {
@@ -666,9 +762,9 @@ pub fn copilot_relay(
 /// 完成 Copilot 登录：拿 GitHub token → 换 Copilot token → 读模型。
 pub async fn copilot_finish(code: &DeviceCode) -> anyhow::Result<RelayProfile> {
     let github_token = copilot_wait_for_github_token(code).await?;
-    let token = copilot_exchange(&github_token).await?;
+    let token = copilot_exchange(&github_token, None).await?;
     let login = github_login_name(&github_token).await;
-    let models = copilot_models(&token).await;
+    let models = copilot_models(&token, None).await;
     Ok(copilot_relay(&login, &github_token, &token, &models))
 }
 
@@ -686,15 +782,153 @@ const GROK_REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 const GROK_DEFAULT_MODELS: &[&str] =
     &["grok-4.6", "grok-build-0.1", "grok-4.3", "grok-code-fast-1"];
 
-/// 推理代理要求的客户端标识，缺了会回 426。版本号被 xAI 提高时要跟着改。
-pub fn grok_proxy_headers() -> Vec<(&'static str, &'static str)> {
+/// 冒充的 Grok CLI 版本兜底值。xAI 会抬高最低版本（低于时回 426 Upgrade Required），
+/// 平时联网取官方稳定版，取不到或比这个旧时才用它。
+const GROK_CLIENT_VERSION: &str = "1.0.70";
+/// 官方安装脚本读的稳定渠道指针，正文第一行是版本号；x.ai 不通时脚本回退到 GCS 镜像。
+const GROK_STABLE_CHANNEL_URLS: &[&str] = &[
+    "https://x.ai/cli/stable",
+    "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+];
+const GROK_VERSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const GROK_VERSION_RETRY: Duration = Duration::from_secs(60 * 60);
+
+struct GrokVersionCache {
+    /// 最近一次取到的版本号；查询失败时保留上次的值。
+    version: Option<String>,
+    checked_at: std::time::Instant,
+    ok: bool,
+}
+
+static GROK_VERSION_CACHE: std::sync::Mutex<Option<GrokVersionCache>> = std::sync::Mutex::new(None);
+
+/// 推理代理要求的客户端标识，缺了会回 426。
+pub fn grok_proxy_headers() -> Vec<(&'static str, String)> {
     vec![
-        ("X-XAI-Token-Auth", "xai-grok-cli"),
-        ("x-authenticateresponse", "authenticate-response"),
-        ("x-grok-client-mode", "headless"),
-        ("x-grok-client-version", "1.0.5"),
-        ("x-grok-client-identifier", "grok-shell"),
+        ("X-XAI-Token-Auth", "xai-grok-cli".to_string()),
+        (
+            "x-authenticateresponse",
+            "authenticate-response".to_string(),
+        ),
+        ("x-grok-client-mode", "headless".to_string()),
+        ("x-grok-client-version", grok_client_version()),
+        ("x-grok-client-identifier", "grok-shell".to_string()),
     ]
+}
+
+fn grok_client_version() -> String {
+    let fetched = GROK_VERSION_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().and_then(|cache| cache.version.clone()));
+    pick_grok_client_version(fetched.as_deref())
+}
+
+/// 联网值和兜底常量取较新的那个；联网值格式不对就不用。
+fn pick_grok_client_version(fetched: Option<&str>) -> String {
+    let fallback = parse_grok_version(GROK_CLIENT_VERSION).expect("兜底版本号格式正确");
+    let (major, minor, patch) = fetched
+        .and_then(parse_grok_version)
+        .filter(|version| *version > fallback)
+        .unwrap_or(fallback);
+    format!("{major}.{minor}.{patch}")
+}
+
+/// 只认 `X.Y.Z`，预发布后缀、HTML 错误页之类一律不用。
+fn parse_grok_version(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.lines().next()?.trim();
+    let mut parts = value.split('.').map(|part| {
+        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    });
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(version)
+}
+
+/// 缓存过期才联网，并发请求共用一次查询。查询失败只影响版本号来源，不挡请求本身。
+async fn refresh_grok_client_version() {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK.get_or_init(Default::default).lock().await;
+    let due = match GROK_VERSION_CACHE.lock() {
+        Ok(cache) => cache.as_ref().is_none_or(|cache| {
+            let ttl = if cache.ok {
+                GROK_VERSION_TTL
+            } else {
+                GROK_VERSION_RETRY
+            };
+            cache.checked_at.elapsed() >= ttl
+        }),
+        Err(_) => false,
+    };
+    if !due {
+        return;
+    }
+    let fetched = fetch_grok_stable_version().await;
+    if let Ok(mut cache) = GROK_VERSION_CACHE.lock() {
+        let previous = cache.take().and_then(|cache| cache.version);
+        *cache = Some(GrokVersionCache {
+            ok: fetched.is_some(),
+            version: fetched.or(previous),
+            checked_at: std::time::Instant::now(),
+        });
+    }
+}
+
+async fn fetch_grok_stable_version() -> Option<String> {
+    for url in GROK_STABLE_CHANNEL_URLS {
+        let Ok(client) = crate::http_client::proxied_client_for_url_with_timeouts(
+            "",
+            url,
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+        ) else {
+            continue;
+        };
+        let body = match client.get(*url).send().await {
+            Ok(response) if response.status().is_success() => response.text().await.ok(),
+            _ => None,
+        };
+        if let Some((major, minor, patch)) = body.as_deref().and_then(parse_grok_version) {
+            return Some(format!("{major}.{minor}.{patch}"));
+        }
+    }
+    None
+}
+
+/// 与官方 CLI 一致的 User-Agent：`grok-shell/<版本> (<系统>; <架构>)`。
+fn grok_user_agent() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86" => "386",
+        other => other,
+    };
+    format!(
+        "grok-shell/{} ({}; {arch})",
+        grok_client_version(),
+        std::env::consts::OS
+    )
+}
+
+/// 登录时这些头已存进供应商配置，版本号升级后老账号仍带旧值。
+/// 每次请求前用当前值覆盖同名头，用户自加的其他头保留。
+fn sync_grok_proxy_headers(relay: &mut RelayProfile) {
+    relay.user_agent = grok_user_agent();
+    let current = grok_proxy_headers();
+    relay.custom_headers.retain(|header| {
+        !current
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(header.key.trim()))
+    });
+    relay
+        .custom_headers
+        .extend(
+            current
+                .into_iter()
+                .map(|(key, value)| crate::settings::RelayHeaderKeyValue {
+                    key: key.to_string(),
+                    value,
+                }),
+        );
 }
 
 pub fn grok_authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
@@ -764,16 +998,17 @@ pub fn parse_grok_tokens(value: &Value, previous_refresh: &str) -> anyhow::Resul
     })
 }
 
-async fn grok_token_request(form: &[(&str, &str)]) -> anyhow::Result<Value> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?
-        .post(GROK_TOKEN_URL)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(form)
-        .send()
-        .await
-        .context("连不上 auth.x.ai")?;
+async fn grok_token_request(form: &[(&str, &str)], proxy: Option<&str>) -> anyhow::Result<Value> {
+    let response = crate::http_client::build_with_relay_proxy(
+        reqwest::Client::builder().timeout(Duration::from_secs(30)),
+        proxy,
+    )?
+    .post(GROK_TOKEN_URL)
+    .header(reqwest::header::ACCEPT, "application/json")
+    .form(form)
+    .send()
+    .await
+    .context("连不上 auth.x.ai")?;
     let status = response.status();
     let value: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() && value.get("access_token").is_none() {
@@ -806,26 +1041,51 @@ pub async fn grok_login(open_browser: impl FnOnce(&str)) -> anyhow::Result<GrokT
     )
     .await
     .map_err(|_| anyhow::anyhow!("登录超时：5 分钟内没有完成浏览器登录"))??;
-    let value = grok_token_request(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", &redirect_uri),
-        ("client_id", GROK_CLIENT_ID),
-        ("code_verifier", &verifier),
-    ])
+    let value = grok_token_request(
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &redirect_uri),
+            ("client_id", GROK_CLIENT_ID),
+            ("code_verifier", &verifier),
+        ],
+        None,
+    )
     .await?;
     parse_grok_tokens(&value, "")
 }
 
-/// SuperGrok 账号可用的模型；读不到时用常见的几个。
-pub async fn grok_models(access_token: &str) -> Vec<String> {
+/// SuperGrok 订阅的额度（Grok CLI 的 `/usage` 读的同一个接口）。`relay` 要先经过 `prepare_relay`。
+pub async fn grok_billing(relay: &RelayProfile) -> anyhow::Result<Value> {
+    let mut request = http_client(relay_proxy(relay).as_deref())?
+        .get(format!("{GROK_PROXY_BASE}/billing?format=credits"))
+        .bearer_auth(&relay.api_key)
+        .header(reqwest::header::USER_AGENT, grok_user_agent())
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (key, value) in grok_proxy_headers() {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.context("连不上 SuperGrok")?;
+    if !response.status().is_success() {
+        bail!(
+            "查询 SuperGrok 额度失败：HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    Ok(response.json().await?)
+}
+
+/// SuperGrok 账号可用的模型；读不到时用常见的几个。`proxy`：所属供应商的代理设置，登录时传 None。
+pub async fn grok_models(access_token: &str, proxy: Option<&str>) -> Vec<String> {
+    refresh_grok_client_version().await;
     let fetched = async {
-        let mut request = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .ok()?
-            .get(format!("{GROK_PROXY_BASE}/models-v2"))
-            .bearer_auth(access_token);
+        let mut request = crate::http_client::build_with_relay_proxy(
+            reqwest::Client::builder().timeout(Duration::from_secs(20)),
+            proxy,
+        )
+        .ok()?
+        .get(format!("{GROK_PROXY_BASE}/models-v2"))
+        .bearer_auth(access_token);
         for (key, value) in grok_proxy_headers() {
             request = request.header(key, value);
         }
@@ -895,7 +1155,7 @@ pub fn grok_relay(tokens: &GrokTokens, models: &[String]) -> RelayProfile {
             .into_iter()
             .map(|(key, value)| crate::settings::RelayHeaderKeyValue {
                 key: key.to_string(),
-                value: value.to_string(),
+                value,
             })
             .collect(),
         ..RelayProfile::default()
@@ -917,10 +1177,12 @@ fn grok_from_auth(relay: &RelayProfile, value: &Value) -> Option<RelayProfile> {
     let mut updated = relay.clone();
     updated.api_key = token.to_string();
     updated.base_url = GROK_PROXY_BASE.to_string();
+    sync_grok_proxy_headers(&mut updated);
     Some(updated)
 }
 
 async fn prepare_grok(relay: &RelayProfile, value: &Value) -> anyhow::Result<RelayProfile> {
+    refresh_grok_client_version().await;
     if let Some(ready) = grok_from_auth(relay, value) {
         return Ok(ready);
     }
@@ -948,32 +1210,89 @@ async fn prepare_grok(relay: &RelayProfile, value: &Value) -> anyhow::Result<Rel
     if refresh.is_empty() {
         bail!("SuperGrok 登录已过期，请重新登录");
     }
-    let response = grok_token_request(&[
-        ("grant_type", "refresh_token"),
-        ("client_id", GROK_CLIENT_ID),
-        ("refresh_token", &refresh),
-    ])
+    let response = grok_token_request(
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", GROK_CLIENT_ID),
+            ("refresh_token", &refresh),
+        ],
+        relay_proxy(relay).as_deref(),
+    )
     .await
     .context("SuperGrok 登录已失效，请重新登录")?;
-    let tokens = parse_grok_tokens(&response, &refresh)?;
+    grok_finish_refresh(&store, relay, &latest, &response, &refresh)
+}
+
+/// 刷新响应写回凭据。refresh token 可能已经轮换：先落盘再看响应能不能用，
+/// 响应缺 access token 时也要把新的 refresh token 存下，否则下次刷新只剩 refresh_token_reused。
+fn grok_finish_refresh(
+    store: &crate::gateway::store::GatewayStore,
+    relay: &RelayProfile,
+    latest: &Value,
+    response: &Value,
+    refresh: &str,
+) -> anyhow::Result<RelayProfile> {
+    let parsed = parse_grok_tokens(response, refresh);
     let mut auth = latest.clone();
-    auth["access_token"] = json!(tokens.access_token);
-    auth["refresh_token"] = json!(tokens.refresh_token);
-    auth["expires_at_ms"] = json!(tokens.expires_at_ms);
+    match &parsed {
+        Ok(tokens) => {
+            auth["access_token"] = json!(tokens.access_token);
+            auth["refresh_token"] = json!(tokens.refresh_token);
+            auth["expires_at_ms"] = json!(tokens.expires_at_ms);
+        }
+        Err(_) => {
+            if let Some(rotated) = response
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+            {
+                auth["refresh_token"] = json!(rotated);
+            }
+        }
+    }
+    if auth != *latest {
+        let auth_contents = auth.to_string();
+        persist_account_auth(store, relay, "grok", |stored| {
+            stored.auth_contents = auth_contents;
+        });
+    }
+    let tokens = parsed?;
     let mut updated = relay.clone();
     updated.auth_contents = auth.to_string();
     updated.api_key = tokens.access_token.clone();
     updated.base_url = GROK_PROXY_BASE.to_string();
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
+    sync_grok_proxy_headers(&mut updated);
+    Ok(updated)
+}
+
+/// 刷新得到的凭据写回 gateway.json：后台刷新 token 和界面命令可能同时改，带锁读改写免得互相覆盖。
+/// 写不进去要留痕——refresh token 可能已经轮换，没存下来下次就得重新登录。日志里不写凭据。
+fn persist_account_auth(
+    store: &crate::gateway::store::GatewayStore,
+    relay: &RelayProfile,
+    kind: &str,
+    apply: impl FnOnce(&mut RelayProfile),
+) {
+    let result = store.update(|gateway| {
+        if let Some(provider) = gateway
             .providers
             .iter_mut()
             .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = updated.auth_contents.clone();
-        let _ = store.save(&gateway);
+        {
+            apply(&mut provider.relay);
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "gateway.account_token_persist_failed",
+            json!({
+                "relayId": relay.id,
+                "kind": kind,
+                "error": error.to_string(),
+            }),
+        );
     }
-    Ok(updated)
 }
 
 /* —————————————— ChatGPT API（用 ChatGPT 登录） —————————————— */
@@ -1089,10 +1408,7 @@ pub fn siwc_from_tokens(
         .filter(|value| *value > 0.0)
         .context("OpenAI 返回的 token 没有有效期")?;
     let scopes = text("scope");
-    if !scopes
-        .split_whitespace()
-        .any(|scope| scope == SIWC_DIRECT_SCOPE)
-    {
+    if !siwc_has_direct_scope(&scopes) {
         bail!(
             "OpenAI 没有授权通过 API 使用这个套餐（{SIWC_DIRECT_SCOPE}），这个 ChatGPT 账号可能不符合条件"
         );
@@ -1112,16 +1428,7 @@ pub fn siwc_from_tokens(
             .unwrap_or_default()
             .to_string()
     };
-    let plan = [&claims, &jwt_claims(&access_token)]
-        .iter()
-        .find_map(|value| {
-            value
-                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
-                .and_then(Value::as_str)
-                .filter(|plan| !plan.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
+    let plan = siwc_plan(&claims, &access_token);
     Ok(SiwcAccount {
         client_id: client_id.to_string(),
         host_id: host_id.to_string(),
@@ -1132,6 +1439,27 @@ pub fn siwc_from_tokens(
         refresh_token,
         expires_at_ms: now_ms() + (expires_in * 1000.0) as u64,
     })
+}
+
+/// 套餐类型：先看 ID token，再看 access token；都没有为空。
+fn siwc_plan(id_claims: &Value, access_token: &str) -> String {
+    [id_claims, &jwt_claims(access_token)]
+        .iter()
+        .find_map(|value| {
+            value
+                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+                .and_then(Value::as_str)
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// 授权范围里有没有直连 API 的那一项。
+fn siwc_has_direct_scope(scopes: &str) -> bool {
+    scopes
+        .split_whitespace()
+        .any(|scope| scope == SIWC_DIRECT_SCOPE)
 }
 
 /// ID token 必须是 OpenAI 签发、给这个 client、带着这次登录的 nonce、没过期。
@@ -1165,15 +1493,19 @@ fn siwc_check_id(claims: &Value, client_id: &str, nonce: &str) -> anyhow::Result
     Ok(())
 }
 
-async fn siwc_token_request(form: &[(&str, &str)]) -> Result<Value, (String, String)> {
+async fn siwc_token_request(
+    form: &[(&str, &str)],
+    proxy: Option<&str>,
+) -> Result<Value, (String, String)> {
     let token_url = std::env::var("CODEX_PLUS_SIWC_TOKEN_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| SIWC_TOKEN_URL.to_string());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| (String::new(), error.to_string()))?;
+    let client = crate::http_client::build_with_relay_proxy(
+        reqwest::Client::builder().timeout(Duration::from_secs(30)),
+        proxy,
+    )
+    .map_err(|error| (String::new(), error.to_string()))?;
     let response = client
         .post(token_url)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -1243,14 +1575,17 @@ pub async fn chatgpt_api_login(
         .filter(|id| !id.is_empty())
         .context("OpenAI 没有完成应用注册（回调里没有 client_id），请重新登录")?;
     let code = params.get("code").cloned().unwrap_or_default();
-    let value = siwc_token_request(&[
-        ("grant_type", "authorization_code"),
-        ("client_id", &client_id),
-        ("code", &code),
-        ("code_verifier", &verifier),
-        ("redirect_uri", &redirect_uri),
-        ("resource", SIWC_API),
-    ])
+    let value = siwc_token_request(
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_id),
+            ("code", &code),
+            ("code_verifier", &verifier),
+            ("redirect_uri", &redirect_uri),
+            ("resource", SIWC_API),
+        ],
+        None,
+    )
     .await
     .map_err(|(_, message)| anyhow::anyhow!("换取登录 token 失败：{message}"))?;
     let account = siwc_from_tokens(&value, &client_id, &host_id, Some(&nonce))?;
@@ -1262,20 +1597,26 @@ pub async fn chatgpt_api_login(
 
 /// 账号可用的模型：OpenAI 给这个 token 列出的模型，再补上 Codex 为 ChatGPT 套餐列出的
 /// （本机 Codex 的模型缓存里有，目录里没列也能用）；目录里标为隐藏的不加。
-pub async fn chatgpt_api_models(access_token: &str, codex_home: &Path) -> Vec<String> {
+/// `proxy`：所属供应商的代理设置，登录时传 None。
+pub async fn chatgpt_api_models(
+    access_token: &str,
+    codex_home: &Path,
+    proxy: Option<&str>,
+) -> Vec<String> {
     let fetched = async {
-        let value: Value = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .ok()?
-            .get(format!("{SIWC_API}/models"))
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let value: Value = crate::http_client::build_with_relay_proxy(
+            reqwest::Client::builder().timeout(Duration::from_secs(20)),
+            proxy,
+        )
+        .ok()?
+        .get(format!("{SIWC_API}/models"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
         Some(value)
     }
     .await
@@ -1403,6 +1744,12 @@ fn chatgpt_api_from_auth(relay: &RelayProfile, value: &Value) -> Option<RelayPro
     if token.is_empty() || expires <= now_ms() + SIWC_REFRESH_AHEAD_MS {
         return None;
     }
+    // 刷新时记下的授权范围里没有直连那一项：这个 token 发不到 API，下次再刷新、报清楚原因。
+    if let Some(scopes) = value.get("scope").and_then(Value::as_str)
+        && !siwc_has_direct_scope(scopes)
+    {
+        return None;
+    }
     let mut updated = relay.clone();
     updated.api_key = token.to_string();
     updated.base_url = value
@@ -1446,12 +1793,15 @@ async fn prepare_chatgpt_api(relay: &RelayProfile, value: &Value) -> anyhow::Res
     if client_id.is_empty() || refresh.is_empty() {
         bail!("ChatGPT API 登录信息不完整，请重新登录");
     }
-    let response = siwc_token_request(&[
-        ("grant_type", "refresh_token"),
-        ("client_id", &client_id),
-        ("refresh_token", &refresh),
-        ("resource", SIWC_API),
-    ])
+    let response = siwc_token_request(
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &refresh),
+            ("resource", SIWC_API),
+        ],
+        relay_proxy(relay).as_deref(),
+    )
     .await;
     let response = match response {
         Ok(value) => value,
@@ -1463,29 +1813,82 @@ async fn prepare_chatgpt_api(relay: &RelayProfile, value: &Value) -> anyhow::Res
         }
         Err((_, message)) => bail!("刷新 ChatGPT API 登录失败：{message}"),
     };
-    let account = siwc_from_tokens(&response, &client_id, &text("host_id"), None)?;
+    siwc_finish_refresh(&store, relay, &latest, &response)
+}
+
+/// 刷新响应合进已存凭据。没返回 refresh_token / scope 时沿用旧的；
+/// 没返回有效期时读 access token 自带的 exp，再没有就记为已过期（下次重新刷新）。
+fn siwc_merge_refresh(latest: &Value, response: &Value) -> Value {
+    let text = |key: &str| {
+        response
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
     let mut auth = latest.clone();
-    auth["access_token"] = json!(account.access_token);
-    auth["refresh_token"] = json!(account.refresh_token);
-    auth["expires_at_ms"] = json!(account.expires_at_ms);
-    if !account.plan.is_empty() {
-        auth["plan"] = json!(account.plan);
+    for key in ["access_token", "refresh_token", "scope"] {
+        if let Some(value) = text(key) {
+            auth[key] = json!(value);
+        }
     }
+    if let Some(access_token) = text("access_token") {
+        let expires_at_ms = response
+            .get("expires_in")
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0)
+            .map(|seconds| now_ms() + (seconds * 1000.0) as u64)
+            .or_else(|| {
+                jwt_claims(access_token)
+                    .get("exp")
+                    .and_then(Value::as_u64)
+                    .map(|exp| exp * 1000)
+            })
+            .unwrap_or(0);
+        auth["expires_at_ms"] = json!(expires_at_ms);
+        let plan = siwc_plan(
+            &jwt_claims(text("id_token").unwrap_or_default()),
+            access_token,
+        );
+        if !plan.is_empty() {
+            auth["plan"] = json!(plan);
+        }
+    }
+    auth
+}
+
+/// 刷新请求一到服务端，旧 refresh token 就作废了：新凭据先落盘，再校验能不能用。
+/// 校验不过只是这次请求失败，新 refresh token 已经存下，下次还能接着刷新。
+fn siwc_finish_refresh(
+    store: &crate::gateway::store::GatewayStore,
+    relay: &RelayProfile,
+    latest: &Value,
+    response: &Value,
+) -> anyhow::Result<RelayProfile> {
+    let auth = siwc_merge_refresh(latest, response);
     let mut updated = relay.clone();
     updated.auth_contents = auth.to_string();
-    let Some(ready) = chatgpt_api_from_auth(&updated, &auth) else {
-        bail!("刷新 ChatGPT API 登录失败：新 token 的有效期太短");
-    };
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
-            .providers
-            .iter_mut()
-            .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = ready.auth_contents.clone();
-        let _ = store.save(&gateway);
+    if auth != *latest {
+        let auth_contents = updated.auth_contents.clone();
+        persist_account_auth(store, relay, "chatgpt-api", |stored| {
+            stored.auth_contents = auth_contents;
+        });
     }
-    Ok(ready)
+    if response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        bail!("刷新 ChatGPT API 登录失败：OpenAI 没有返回 token");
+    }
+    if let Some(scopes) = auth.get("scope").and_then(Value::as_str)
+        && !siwc_has_direct_scope(scopes)
+    {
+        bail!(
+            "OpenAI 没有授权通过 API 使用这个套餐（{SIWC_DIRECT_SCOPE}），这个 ChatGPT 账号可能不符合条件"
+        );
+    }
+    chatgpt_api_from_auth(&updated, &auth)
+        .context("刷新 ChatGPT API 登录失败：新 token 的有效期太短")
 }
 
 /// 删除 ChatGPT API 账号时让 OpenAI 吊销它的 refresh token（按发现文档里的吊销地址）。
@@ -1497,9 +1900,10 @@ pub async fn chatgpt_api_revoke(relay: &RelayProfile) -> anyhow::Result<()> {
         return Ok(());
     }
     let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let client = crate::http_client::build_for_relay(
+        reqwest::Client::builder().timeout(Duration::from_secs(15)),
+        relay,
+    )?;
     let discovery: Value = client
         .get(format!("{SIWC_ISSUER}/.well-known/openid-configuration"))
         .send()
@@ -1535,6 +1939,122 @@ fn now_ms() -> u64 {
 }
 
 /// 账号类供应商的类型（`copilot` / `grok` / `chatgpt-api`）；普通供应商为 None。
+/// 订阅账号的套餐，如「ChatGPT Pro」「Copilot Pro+」「SuperGrok」；不是订阅账号或读不出来时为空。
+/// 只读登录时存下的凭据，不发请求。
+pub fn account_plan(relay: &RelayProfile) -> String {
+    if crate::official_login::member_uses_official_login_transport(relay) {
+        let value: Value = serde_json::from_str(&relay.auth_contents).unwrap_or(Value::Null);
+        let id_token = value
+            .pointer("/tokens/id_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let plan = jwt_claims(id_token)
+            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return with_plan("ChatGPT", &plan);
+    }
+    let Some((kind, value)) = account_kind(relay) else {
+        return String::new();
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match kind.as_str() {
+        "chatgpt-api" => with_plan("ChatGPT", &text("plan")),
+        "copilot" => copilot_plan_label(&text("sku"), &text("api_base")),
+        "grok" => "SuperGrok".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `pro` → 「ChatGPT Pro」；没有套餐时只写产品名。
+fn with_plan(product: &str, plan: &str) -> String {
+    let plan = plan.trim();
+    if plan.is_empty() {
+        return product.to_string();
+    }
+    let mut chars = plan.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    format!("{product} {first}{}", chars.as_str())
+}
+
+/// Copilot 的 `sku` → 套餐名。旧账号没存 `sku` 时按 API 地址（individual / business / enterprise）推断。
+pub fn copilot_plan_label(sku: &str, api_base: &str) -> String {
+    let sku = sku.to_ascii_lowercase();
+    let label = if sku.contains("enterprise") {
+        "Copilot Enterprise"
+    } else if sku.contains("business") {
+        "Copilot Business"
+    } else if sku.contains("plus") {
+        "Copilot Pro+"
+    } else if sku.contains("educational") {
+        "Copilot Pro"
+    } else if sku.contains("free") {
+        "Copilot Free"
+    } else if !sku.is_empty() {
+        "Copilot Pro"
+    } else if api_base.contains(".enterprise.") {
+        "Copilot Enterprise"
+    } else if api_base.contains(".business.") {
+        "Copilot Business"
+    } else {
+        "Copilot"
+    };
+    label.to_string()
+}
+
+/// 账号名打码，与管理器的 `maskAccountName` 一致：邮箱只打本地部分；
+/// 「ChatGPT / Copilot / SuperGrok … · 账号」里不是邮箱的账号整体打码。写进 Agent 配置、给 Agent 看的名字都要过它。
+pub fn mask_account_name(name: &str) -> String {
+    let masked = name
+        .split(' ')
+        .map(|word| match word.split_once('@') {
+            Some((local, domain))
+                if !local.is_empty() && domain.contains('.') && !domain.ends_with('.') =>
+            {
+                format!("{}@{domain}", mask_token(local))
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let account_prefix = ["ChatGPT", "Copilot", "SuperGrok", "GitHub Copilot"]
+        .iter()
+        .any(|prefix| masked.starts_with(prefix));
+    if let Some((head, rest)) = masked.split_once('·')
+        && account_prefix
+        && !rest.contains('@')
+        && !rest.trim().is_empty()
+    {
+        let spaces = &rest[..rest.len() - rest.trim_start().len()];
+        return format!("{head}·{spaces}{}", mask_token(rest.trim()));
+    }
+    masked
+}
+
+/// 4 个字符以内只留第一个；更长的留头两个、尾两个，中间固定 4 个星号（不暴露长度）。
+fn mask_token(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 4 {
+        return format!(
+            "{}***",
+            chars.first().map(char::to_string).unwrap_or_default()
+        );
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}****{tail}")
+}
+
 pub fn relay_account_kind(relay: &RelayProfile) -> Option<String> {
     account_kind(relay).map(|(kind, _)| kind)
 }
@@ -1551,6 +2071,9 @@ pub async fn prepare_relay(relay: &RelayProfile) -> anyhow::Result<RelayProfile>
     let Some((kind, value)) = account_kind(relay) else {
         return Ok(relay.clone());
     };
+    if kind.starts_with(crate::gateway::subscriptions::KIND_PREFIX) {
+        return Ok(crate::gateway::subscriptions::prepare(relay));
+    }
     match kind.as_str() {
         "copilot" => prepare_copilot(relay, &value).await,
         "grok" => prepare_grok(relay, &value).await,
@@ -1609,32 +2132,51 @@ async fn prepare_copilot(relay: &RelayProfile, value: &Value) -> anyhow::Result<
     if github_token.is_empty() {
         bail!("Copilot 登录信息不完整，请重新登录");
     }
-    let token = copilot_exchange(github_token).await?;
+    let token = copilot_exchange(github_token, relay_proxy(relay).as_deref()).await?;
     let mut updated = relay.clone();
     let mut auth = value.clone();
     auth["copilot_token"] = json!(token.token);
     auth["expires_at_ms"] = json!(token.expires_at_ms);
     auth["api_base"] = json!(token.api_base);
+    if !token.sku.is_empty() {
+        auth["sku"] = json!(token.sku);
+    }
     updated.auth_contents = auth.to_string();
     updated.api_key = token.token.clone();
     updated.base_url = format!("{}#", token.api_base);
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
-            .providers
-            .iter_mut()
-            .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = updated.auth_contents.clone();
-        provider.relay.api_key = updated.api_key.clone();
-        provider.relay.base_url = updated.base_url.clone();
-        let _ = store.save(&gateway);
-    }
+    persist_account_auth(&store, relay, "copilot", |stored| {
+        stored.auth_contents = updated.auth_contents.clone();
+        stored.api_key = updated.api_key.clone();
+        stored.base_url = updated.base_url.clone();
+    });
     Ok(updated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_account_names_like_the_manager() {
+        assert_eq!(
+            mask_account_name("ChatGPT Pro · 2649340134@qq.com"),
+            "ChatGPT Pro · 26****34@qq.com"
+        );
+        assert_eq!(
+            mask_account_name("ChatGPT Plus · ab@x.io"),
+            "ChatGPT Plus · a***@x.io"
+        );
+        assert_eq!(
+            mask_account_name("Copilot Pro+ · octocat-dev"),
+            "Copilot Pro+ · oc****ev"
+        );
+        assert_eq!(mask_account_name("DeepSeek"), "DeepSeek");
+        assert_eq!(
+            mask_account_name("Relay · team"),
+            "Relay · team",
+            "普通供应商名不动"
+        );
+    }
 
     fn jwt(payload: Value) -> String {
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1655,7 +2197,9 @@ mod tests {
         let url = chatgpt_authorize_url(&challenge, "st");
         assert!(url.starts_with("https://auth.openai.com/oauth/authorize?response_type=code"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
-        assert!(url.contains("scope=openid%20profile%20email%20offline_access"));
+        assert!(url.contains(
+            "scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke"
+        ), "scope 要和 Codex 自带 CLI 一致，少了 api.connectors.* 桌面端会弹登录页（#2908）：{url}");
         assert!(url.contains(&format!("code_challenge={challenge}")));
     }
 
@@ -1705,7 +2249,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::gateway::store::GatewayStore::at(temp.path().join("gateway.json"));
         let account = account_from_tokens(
-            &json!({ "access_token": "old-at", "refresh_token": "old-rt", "id_token": "" }),
+            &json!({
+                "access_token": "old-at",
+                "refresh_token": "old-rt",
+                "id_token": jwt(json!({
+                    "sub": "test-user",
+                    "https://api.openai.com/auth": { "chatgpt_account_id": "acc-1" }
+                }))
+            }),
         )
         .unwrap();
         let mut relay = chatgpt_relay(&account, &["gpt-6.1-sol".to_string()]);
@@ -1717,19 +2268,42 @@ mod tests {
                 enabled: true,
                 source: "login:chatgpt".to_string(),
                 price: None,
+                model_prices: Default::default(),
+                model_windows: Default::default(),
+                context_window: None,
                 proxy: String::new(),
+                key_rpm: None,
+                key_concurrency: None,
+                upstream_new: Vec::new(),
+                upstream_gone: Vec::new(),
+                models_checked_at_ms: 0,
+                newapi_access: None,
+            subscription_policy: None,
+                upstream_meta: Default::default(),
                 relay,
+                extra: Default::default(),
             });
         store.save(&gateway).unwrap();
-        crate::official_login::persist_gateway_login(
-            &store, "chatgpt", "new-at", "new-rt", "acc-9",
-        );
+        let saved = store.load().unwrap();
+        let expected = saved
+            .provider("chatgpt")
+            .unwrap()
+            .relay
+            .auth_contents
+            .clone();
+        let mut updated_value: Value = serde_json::from_str(&expected).unwrap();
+        updated_value["tokens"]["access_token"] = json!("new-at");
+        updated_value["tokens"]["refresh_token"] = json!("new-rt");
+        let updated = updated_value.to_string();
+        assert!(crate::official_login::persist_gateway_login(
+            &store, "chatgpt", &expected, &updated,
+        ).unwrap());
         let saved = store.load().unwrap();
         let auth: Value =
             serde_json::from_str(&saved.provider("chatgpt").unwrap().relay.auth_contents).unwrap();
         assert_eq!(auth["tokens"]["access_token"], "new-at");
         assert_eq!(auth["tokens"]["refresh_token"], "new-rt");
-        assert_eq!(auth["tokens"]["account_id"], "acc-9");
+        assert_eq!(auth["tokens"]["account_id"], "acc-1");
         assert_eq!(auth[GATEWAY_OWNED_MARKER], true, "标记保留");
     }
 
@@ -1795,6 +2369,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_copilot_tokens_are_used_as_is() {
         let token = CopilotToken {
+            sku: String::new(),
             token: "fresh".to_string(),
             expires_at_ms: now_ms() + 3_600_000,
             api_base: "https://api.githubcopilot.com".to_string(),
@@ -1862,6 +2437,68 @@ mod tests {
         stored.api_key.clear();
         let ready = grok_from_auth(&stored, &account_kind(&relay).unwrap().1).unwrap();
         assert_eq!(ready.api_key, "at");
+
+        // 老账号存的是旧版本号，请求前要换成当前值，用户自加的头保留
+        for header in &mut stored.custom_headers {
+            if header.key == "x-grok-client-version" {
+                header.value = "1.0.5".to_string();
+            }
+        }
+        stored
+            .custom_headers
+            .push(crate::settings::RelayHeaderKeyValue {
+                key: "X-Custom".to_string(),
+                value: "keep".to_string(),
+            });
+        let ready = grok_from_auth(&stored, &account_kind(&relay).unwrap().1).unwrap();
+        let versions: Vec<_> = ready
+            .custom_headers
+            .iter()
+            .filter(|header| header.key.eq_ignore_ascii_case("x-grok-client-version"))
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(versions, vec![grok_client_version()]);
+        assert!(
+            ready
+                .user_agent
+                .starts_with(&format!("grok-shell/{} (", grok_client_version()))
+        );
+        assert!(
+            ready
+                .custom_headers
+                .iter()
+                .any(|header| header.key == "X-Custom" && header.value == "keep")
+        );
+    }
+
+    #[test]
+    fn grok_client_version_prefers_newer_stable_and_falls_back_to_constant() {
+        assert_eq!(parse_grok_version("1.0.70\n"), Some((1, 0, 70)));
+        assert_eq!(parse_grok_version("  2.10.3\r\nextra"), Some((2, 10, 3)));
+        for bad in [
+            "",
+            "1.0",
+            "1.0.70.1",
+            "1.0.70-rc1",
+            "+1.0.70",
+            "v1.0.70",
+            "<html>",
+        ] {
+            assert_eq!(parse_grok_version(bad), None, "{bad:?} 不是合法版本号");
+        }
+
+        assert_eq!(pick_grok_client_version(Some("1.0.73")), "1.0.73");
+        assert_eq!(pick_grok_client_version(Some("1.1.0")), "1.1.0");
+        assert_eq!(
+            pick_grok_client_version(Some("1.0.13")),
+            GROK_CLIENT_VERSION,
+            "联网值比兜底旧时用兜底"
+        );
+        assert_eq!(
+            pick_grok_client_version(Some("garbage")),
+            GROK_CLIENT_VERSION
+        );
+        assert_eq!(pick_grok_client_version(None), GROK_CLIENT_VERSION);
     }
 
     #[test]
@@ -1958,5 +2595,287 @@ mod tests {
             merge_siwc_models(&json!({ "data": [{ "id": "gpt-5.5" }] }), &Value::Null),
             vec!["gpt-5.5"]
         );
+    }
+
+    #[test]
+    fn account_plan_reads_stored_credentials() {
+        let copilot = |sku: &str, api: &str| copilot_plan_label(sku, api);
+        assert_eq!(copilot("free_limited_copilot", ""), "Copilot Free");
+        assert_eq!(copilot("plus_monthly_subscriber_quota", ""), "Copilot Pro+");
+        assert_eq!(copilot("monthly_subscriber_quota", ""), "Copilot Pro");
+        assert_eq!(copilot("free_educational_quota", ""), "Copilot Pro");
+        assert_eq!(
+            copilot("copilot_for_business_seat_quota", ""),
+            "Copilot Business"
+        );
+        assert_eq!(
+            copilot("", "https://api.enterprise.githubcopilot.com"),
+            "Copilot Enterprise"
+        );
+        assert_eq!(
+            copilot("", "https://api.individual.githubcopilot.com"),
+            "Copilot"
+        );
+
+        let grok = grok_relay(
+            &GrokTokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: 0,
+                email: "g@x.ai".into(),
+            },
+            &[],
+        );
+        assert_eq!(account_plan(&grok), "SuperGrok");
+
+        let account = account_from_tokens(&json!({
+            "access_token": "a",
+            "refresh_token": "r",
+            "id_token": jwt(json!({
+                "email": "me@example.com",
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acc", "chatgpt_plan_type": "pro" }
+            })),
+        }))
+        .unwrap();
+        assert_eq!(account_plan(&chatgpt_relay(&account, &[])), "ChatGPT Pro");
+        assert_eq!(account_plan(&RelayProfile::default()), "");
+    }
+
+    /// 只有一个供应商的临时 gateway.json。
+    fn store_with(relay: RelayProfile) -> (tempfile::TempDir, crate::gateway::store::GatewayStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::gateway::store::GatewayStore::at(temp.path().join("gateway.json"));
+        let mut gateway = crate::gateway::store::GatewaySettings::default();
+        gateway
+            .providers
+            .push(crate::gateway::store::GatewayProvider {
+                enabled: true,
+                source: "login:test".to_string(),
+                price: None,
+                model_prices: Default::default(),
+                model_windows: Default::default(),
+                context_window: None,
+                proxy: String::new(),
+                key_rpm: None,
+                key_concurrency: None,
+                upstream_new: Vec::new(),
+                upstream_gone: Vec::new(),
+                models_checked_at_ms: 0,
+                newapi_access: None,
+            subscription_policy: None,
+                upstream_meta: Default::default(),
+                relay,
+                extra: Default::default(),
+            });
+        store.save(&gateway).unwrap();
+        (temp, store)
+    }
+
+    fn stored_auth(store: &crate::gateway::store::GatewayStore, id: &str) -> Value {
+        let gateway = store.load().unwrap();
+        serde_json::from_str(&gateway.provider(id).unwrap().relay.auth_contents).unwrap()
+    }
+
+    fn expired_chatgpt_api_relay() -> RelayProfile {
+        let mut relay = chatgpt_api_relay(
+            &SiwcAccount {
+                client_id: "app_123".to_string(),
+                host_id: "urn:uuid:h".to_string(),
+                subject: "user-1".to_string(),
+                email: "me@example.com".to_string(),
+                plan: "plus".to_string(),
+                access_token: "old-at".to_string(),
+                refresh_token: "old-rt".to_string(),
+                expires_at_ms: 0,
+            },
+            &["gpt-6.1-sol".to_string()],
+        );
+        relay.id = "chatgpt-api".to_string();
+        relay
+    }
+
+    #[test]
+    fn chatgpt_api_refresh_keeps_missing_fields_and_persists_before_checks() {
+        let relay = expired_chatgpt_api_relay();
+        let latest = account_kind(&relay).unwrap().1;
+
+        // 没返回 refresh_token / scope：沿用旧的，照常可用。
+        let (_temp, store) = store_with(relay.clone());
+        let ready = siwc_finish_refresh(
+            &store,
+            &relay,
+            &latest,
+            &json!({ "access_token": "at-2", "expires_in": 3600 }),
+        )
+        .unwrap();
+        assert_eq!(ready.api_key, "at-2");
+        let saved = stored_auth(&store, "chatgpt-api");
+        assert_eq!(saved["access_token"], "at-2");
+        assert_eq!(
+            saved["refresh_token"], "old-rt",
+            "没返回新的就沿用旧 refresh token"
+        );
+
+        // 有效期太短：这次失败，但轮换出来的 refresh token 已经存下。
+        let (_temp, store) = store_with(relay.clone());
+        let error = siwc_finish_refresh(
+            &store,
+            &relay,
+            &latest,
+            &json!({ "access_token": "at-3", "refresh_token": "rt-3", "expires_in": 1 }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("有效期太短"), "{error}");
+        assert_eq!(stored_auth(&store, "chatgpt-api")["refresh_token"], "rt-3");
+
+        // 没给有效期：读 access token 自带的 exp。
+        let (_temp, store) = store_with(relay.clone());
+        let exp = now_ms() / 1000 + 3600;
+        let ready = siwc_finish_refresh(
+            &store,
+            &relay,
+            &latest,
+            &json!({ "access_token": jwt(json!({ "exp": exp })), "refresh_token": "rt-4" }),
+        )
+        .unwrap();
+        assert!(!ready.api_key.is_empty());
+        assert_eq!(
+            stored_auth(&store, "chatgpt-api")["expires_at_ms"],
+            exp * 1000
+        );
+
+        // 授权范围里没有直连那一项：报清楚原因，新 refresh token 仍然存下，存下的 token 不拿来直接用。
+        let (_temp, store) = store_with(relay.clone());
+        let error = siwc_finish_refresh(
+            &store,
+            &relay,
+            &latest,
+            &json!({ "access_token": "at-5", "refresh_token": "rt-5", "expires_in": 3600, "scope": "openid email" }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("不符合条件"), "{error}");
+        let saved = stored_auth(&store, "chatgpt-api");
+        assert_eq!(saved["refresh_token"], "rt-5");
+        assert!(chatgpt_api_from_auth(&relay, &saved).is_none());
+
+        // 只返回了新 refresh token：也要存下。
+        let (_temp, store) = store_with(relay.clone());
+        assert!(
+            siwc_finish_refresh(&store, &relay, &latest, &json!({ "refresh_token": "rt-6" }))
+                .is_err()
+        );
+        assert_eq!(stored_auth(&store, "chatgpt-api")["refresh_token"], "rt-6");
+    }
+
+    #[test]
+    fn grok_refresh_persists_a_rotated_refresh_token_even_when_the_response_is_unusable() {
+        let mut relay = grok_relay(
+            &GrokTokens {
+                access_token: "old-at".to_string(),
+                refresh_token: "old-rt".to_string(),
+                expires_at_ms: 0,
+                email: "me@example.com".to_string(),
+            },
+            &[],
+        );
+        relay.id = "grok".to_string();
+        let latest = account_kind(&relay).unwrap().1;
+
+        let (_temp, store) = store_with(relay.clone());
+        assert!(
+            grok_finish_refresh(
+                &store,
+                &relay,
+                &latest,
+                &json!({ "refresh_token": "rt-2" }),
+                "old-rt"
+            )
+            .is_err()
+        );
+        assert_eq!(stored_auth(&store, "grok")["refresh_token"], "rt-2");
+
+        let (_temp, store) = store_with(relay.clone());
+        let ready = grok_finish_refresh(
+            &store,
+            &relay,
+            &latest,
+            &json!({ "access_token": "at-3" }),
+            "old-rt",
+        )
+        .unwrap();
+        assert_eq!(ready.api_key, "at-3");
+        let saved = stored_auth(&store, "grok");
+        assert_eq!(saved["access_token"], "at-3");
+        assert_eq!(saved["refresh_token"], "old-rt");
+    }
+
+    #[test]
+    fn workspace_members_sharing_an_account_id_are_different_logins() {
+        let login = |sub: &str, email: &str, account: &str| {
+            let mut claims = json!({ "email": email, "https://api.openai.com/auth": { "chatgpt_account_id": account } });
+            if !sub.is_empty() {
+                claims["sub"] = json!(sub);
+            }
+            account_from_tokens(
+                &json!({ "access_token": "at", "refresh_token": "rt", "id_token": jwt(claims) }),
+            )
+            .unwrap()
+            .auth_contents
+        };
+        let alice = login("user-a", "a@team.com", "ws-1");
+        assert!(same_chatgpt_login(
+            &alice,
+            &login("user-a", "a@team.com", "ws-1")
+        ));
+        assert!(
+            !same_chatgpt_login(&alice, &login("user-b", "b@team.com", "ws-1")),
+            "同一工作区的另一个成员"
+        );
+        assert!(!same_chatgpt_login(
+            &alice,
+            &login("user-a", "a@team.com", "ws-2")
+        ));
+        // 没有 sub 时只有同一代 access/refresh 会话才视为同一账号。
+        assert!(same_chatgpt_login(
+            &login("", "a@team.com", "ws-1"),
+            &login("", "a@team.com", "ws-1")
+        ));
+        assert!(!same_chatgpt_login(
+            &login("", "a@team.com", "ws-1"),
+            &login("", "b@team.com", "ws-1")
+        ));
+    }
+
+    #[tokio::test]
+    async fn callback_listener_skips_idle_sockets_and_stale_login_tabs() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let waiting = tokio::spawn(async move {
+            wait_for_callback_params(&listener, CALLBACK_PATH, "fresh").await
+        });
+        // 浏览器预连接、一直不发请求的空连接不能卡住后面的回调。
+        let _idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = |query: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {CALLBACK_PATH}?{query} HTTP/1.1\r\nhost: x\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut page = String::new();
+            stream.read_to_string(&mut page).await.unwrap();
+            page
+        };
+        // 之前放弃的登录页带着旧 state 回调：回一页说明，登录继续等。
+        let stale = request("code=old&state=stale").await;
+        assert!(stale.contains("已失效"), "{stale}");
+        assert!(!waiting.is_finished());
+        let fresh = request("code=c1&state=fresh").await;
+        assert!(fresh.contains("登录成功"), "{fresh}");
+        let params = waiting.await.unwrap().unwrap();
+        assert_eq!(params["code"], "c1");
     }
 }

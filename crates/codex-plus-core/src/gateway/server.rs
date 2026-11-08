@@ -8,17 +8,20 @@
 //! | `POST /gw/grok/v1/responses` | Grok | Responses，复用 Codex 代理的输出链路 |
 //! | `GET /gw/grok/v1/models` | Grok | 模型列表（OpenAI 格式） |
 //! | `POST /gw/codex/v1/responses` | Codex | Responses，同上（保留 ChatGPT 订阅后端的私有事件） |
+//! | `POST /gw/<agent>/v1/images/generations`、`/images/edits` | 任意 | 生图，发给这个 Agent 的「生图模型」（见 [`crate::gateway::images`]） |
 //!
 //! 身份靠路径，鉴权靠网关签发给该 Agent 的本地 token（`x-api-key` 或 `Authorization: Bearer`）。
 
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
+use crate::gateway::agents;
 use crate::gateway::anthropic_inbound;
 use crate::gateway::anthropic_outbound::{
     ResponsesSseToAnthropicSse, anthropic_error_body, anthropic_message_to_sse,
     responses_json_to_anthropic,
 };
+use crate::gateway::key_pool::{self, KeySlot};
 use crate::gateway::pipeline::{
     self, AnthropicPassthrough, GatewayRequest, GatewayUpstream, NativeAnthropicResponse,
 };
@@ -40,13 +43,26 @@ pub fn split_gateway_path(path: &str) -> Option<(ToolId, String)> {
     let rest = path.strip_prefix("/gw/")?;
     let (agent, tail) = rest.split_once('/').unwrap_or((rest, ""));
     let agent = ToolId::parse(agent);
-    if matches!(agent, ToolId::Unknown(_)) {
+    if matches!(agent, ToolId::Unknown(_)) && !crate::gateway::agents::is_generic(&agent) {
         return None;
     }
     let tail = format!("/{tail}");
-    let tail = tail.strip_prefix("/v1").unwrap_or(&tail);
+    // 只去掉完整的 `/v1` 段：Gemini 的 `/v1beta/...` 原样保留。
+    let tail = match tail.strip_prefix("/v1") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') => rest,
+        _ => &tail,
+    };
     let tail = if tail.is_empty() { "/" } else { tail };
     Some((agent, tail.trim_end_matches('/').to_string()))
+}
+
+/// 查询串里的参数（不解码，token 只有 URL 安全字符）。
+fn query_param(path: &str, name: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn client_token(headers: &str) -> Option<String> {
@@ -95,6 +111,9 @@ pub(crate) async fn handle(
     body: &[u8],
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
+    // `path` 带查询串：取出 Gemini 的 `?key=` 后去掉，后面的日志、路由都只用路径。
+    let query_key = query_param(path, "key");
+    let path = path.split('?').next().unwrap_or(path);
     let Some((agent, tail)) = split_gateway_path(path) else {
         return write_error(stream, &ToolId::Claude, 404, "未知的网关路径").await;
     };
@@ -103,7 +122,7 @@ pub(crate) async fn handle(
         stream.shutdown().await?;
         return Ok(());
     }
-    let gateway = GatewayStore::default().load().unwrap_or_default();
+    let gateway = GatewayStore::default().load().unwrap_or_default().with_extension_providers();
     let Some(binding) = gateway.active_binding(&agent) else {
         let message = format!(
             "Codex++ 网关模式没有为 {} 开启，请在 Codex++ 里打开网关模式或切回直连供应商",
@@ -111,8 +130,12 @@ pub(crate) async fn handle(
         );
         return write_error(stream, &agent, 503, &message).await;
     };
-    let provided = client_token(headers).unwrap_or_default();
-    if !token_matches(&binding.token, &provided) {
+    // Gemini 客户端把 Key 放在 `x-goog-api-key` 或查询串 `?key=` 里。
+    let provided = client_token(headers)
+        .or_else(|| header_value_from_headers(headers, "x-goog-api-key"))
+        .or(query_key)
+        .unwrap_or_default();
+    if !token_matches(&binding.token, provided.trim()) {
         log_helper_response(
             "gateway.unauthorized",
             method,
@@ -128,11 +151,34 @@ pub(crate) async fn handle(
         )
         .await;
     }
+    // 查询串（Gemini 的 `?alt=sse`、`?key=`）不参与路由。
+    let tail = tail.split('?').next().unwrap_or_default().to_string();
+    if matches!(agent, ToolId::Unknown(_))
+        && let Some((model, action)) = crate::gateway::gemini_inbound::parse_gemini_path(&tail)
+    {
+        return handle_gemini(
+            stream,
+            &gateway,
+            agent,
+            (model, action),
+            method,
+            path,
+            headers,
+            body,
+            remote_addr_text,
+        )
+        .await;
+    }
     match (&agent, method, tail.as_str()) {
-        (ToolId::Claude, "POST", "/messages") => {
+        (ToolId::Unknown(_), "POST", "/chat/completions") => {
             handle_claude_messages(
                 stream,
                 &gateway,
+                agent.clone(),
+                // 要不要单独的 usage 块按请求里的 stream_options 定，解析请求体后再改。
+                Dialect::Chat {
+                    include_usage: false,
+                },
                 method,
                 path,
                 headers,
@@ -141,11 +187,30 @@ pub(crate) async fn handle(
             )
             .await
         }
-        (ToolId::Claude, "POST", "/messages/count_tokens") => {
+        (ToolId::Unknown(_), "GET", "/v1beta/models") => {
+            handle_gemini_models(stream, &gateway, &agent).await
+        }
+        (ToolId::Claude | ToolId::Unknown(_), "POST", "/messages") => {
+            handle_claude_messages(
+                stream,
+                &gateway,
+                agent.clone(),
+                Dialect::Anthropic,
+                method,
+                path,
+                headers,
+                body,
+                remote_addr_text,
+            )
+            .await
+        }
+        (ToolId::Claude | ToolId::Unknown(_), "POST", "/messages/count_tokens") => {
             handle_claude_count_tokens(stream, &gateway, headers, body).await
         }
         (_, "GET", "/models") => handle_models(stream, &gateway, &agent).await,
-        (ToolId::Grok | ToolId::Codex, "POST", "/responses") => {
+        // 旧版 Codex 以 ChatGPT 身份接入时远程压缩发 `/responses/compact`，原路径一路带给上游。
+        (ToolId::Grok | ToolId::Codex | ToolId::Unknown(_), "POST", "/responses")
+        | (ToolId::Codex, "POST", "/responses/compact") => {
             let request_body = match decode_protocol_proxy_request_body(
                 body,
                 header_value_from_headers(headers, "content-encoding").as_deref(),
@@ -159,6 +224,8 @@ pub(crate) async fn handle(
             // Codex 带自己的会话头和实验特性头，照旧传给上游。
             let thread_id = header_value_from_headers(headers, "thread-id");
             let beta_features = header_value_from_headers(headers, "x-codex-beta-features");
+            // Codex 的客户端身份头（originator、x-codex-* 等）照原样带给上游（#2783）。
+            let client_identity = client_identity_headers(&agent, headers);
             handle_protocol_proxy_connection(
                 stream,
                 &request_body,
@@ -168,6 +235,7 @@ pub(crate) async fn handle(
                     session_id: session_id.as_deref(),
                     thread_id: thread_id.as_deref(),
                     opencode_session: None,
+                    client_identity: &client_identity,
                 },
                 method,
                 path,
@@ -176,22 +244,243 @@ pub(crate) async fn handle(
             )
             .await
         }
+        (_, "POST", "/images/generations" | "/images/edits") => {
+            let content_type =
+                header_value_from_headers(headers, "content-type").unwrap_or_default();
+            let user_agent = header_value_from_headers(headers, "user-agent");
+            handle_images(
+                stream,
+                &gateway,
+                &agent,
+                ImageRequest {
+                    edits: tail == "/images/edits",
+                    body,
+                    content_type: &content_type,
+                    user_agent: user_agent.as_deref(),
+                },
+                method,
+                path,
+                remote_addr_text,
+            )
+            .await
+        }
         _ => write_error(stream, &agent, 404, &format!("网关不支持 {method} {tail}")).await,
     }
 }
 
+/// 网关转发给上游的客户端身份头（#2783）：只有 Codex 的请求才带，
+/// 其它 Agent（Claude Code、Grok 等）按原有逻辑，一个都不透传。
+pub fn client_identity_headers(agent: &ToolId, raw_headers: &str) -> Vec<(String, String)> {
+    if *agent != ToolId::Codex {
+        return Vec::new();
+    }
+    crate::protocol_proxy::codex_client_identity_headers(raw_headers)
+}
+
+/// 一个生图请求：`/images/edits`（multipart）或 `/images/generations`（JSON）。
+pub(crate) struct ImageRequest<'a> {
+    pub edits: bool,
+    pub body: &'a [u8],
+    pub content_type: &'a str,
+    pub user_agent: Option<&'a str>,
+}
+
+/// Codex 以 ChatGPT 官方身份接入网关时，它的生图请求发到本地代理的 `/v1/images/...`
+/// （`openai_base_url`），不经过 `/gw/codex/...`。这时 Codex 的供应商是网关托管的那一个，
+/// 按直连模式转发会指回本地代理自己；改由网关按 Codex 的生图模型处理。
+pub(crate) async fn handle_codex_images_from_helper(
+    stream: &mut tokio::net::TcpStream,
+    request: ImageRequest<'_>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let gateway = GatewayStore::default().load().unwrap_or_default().with_extension_providers();
+    handle_images(
+        stream,
+        &gateway,
+        &ToolId::Codex,
+        request,
+        method,
+        path,
+        remote_addr_text,
+    )
+    .await
+}
+
+/// 生图：按「生图模型」排出上游依次试，鉴权失败、限流、上游出错时换下一家；最后一家的答复原样返回。
+async fn handle_images(
+    stream: &mut tokio::net::TcpStream,
+    gateway: &GatewaySettings,
+    agent: &ToolId,
+    request: ImageRequest<'_>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let ImageRequest {
+        edits,
+        body,
+        content_type,
+        user_agent,
+    } = request;
+    let requested = crate::gateway::images::requested_model(body, content_type);
+    // 每次生图记一条请求日志（用量也从这里汇总）：类型记成 imageGenerations / imageEdits。
+    let mut log = ProxyRequestLog::begin(method, path, None, None);
+    log.set_agent(agent);
+    log.entry.model = requested.clone().unwrap_or_default();
+    log.entry.wire_api = if edits {
+        "imageEdits"
+    } else {
+        "imageGenerations"
+    }
+    .to_string();
+    let targets = match crate::gateway::images::targets(gateway, agent, requested.as_deref()) {
+        Ok(targets) => targets,
+        Err(message) => {
+            log.record_error("400", message.clone());
+            return write_error(stream, agent, 400, &message).await;
+        }
+    };
+    let count = targets.len();
+    let mut last_error = String::new();
+    for (index, target) in targets.into_iter().enumerate() {
+        let has_more = index + 1 < count;
+        let (keys, _) = crate::gateway::key_pool::order_keys_with(
+            &target.relay,
+            gateway.key_policy.mode,
+            None,
+            std::time::Instant::now(),
+            true,
+        );
+        // 主动限速：跳过名额满了的 Key（不排队），占到的名额持有到这一家的答复读完。
+        let limits = gateway
+            .provider(&target.relay.id)
+            .map(crate::gateway::store::GatewayProvider::key_limits)
+            .unwrap_or_default();
+        let Some((key, _slot)) = keys.into_iter().find_map(|key| {
+            key_pool::try_acquire(&key.key, limits, std::time::Instant::now())
+                .map(|slot| (key, slot))
+        }) else {
+            last_error = format!(
+                "{} 的 Key 都在冷却、熔断中或达到了 Codex++ 本地限速上限",
+                target.relay.name
+            );
+            continue;
+        };
+        let relay = match crate::gateway::accounts::prepare_relay(&key.relay).await {
+            Ok(relay) => relay,
+            Err(error) => {
+                last_error = format!("{}：{error:#}", target.relay.name);
+                continue;
+            }
+        };
+        let request = match &target.model {
+            Some(model) => crate::gateway::images::rewrite_model(body, content_type, model),
+            None => body.to_vec(),
+        };
+        log.entry.attempts += 1;
+        log.entry.relay_id = target.relay.id.clone();
+        log.entry.relay_name = target.relay.name.clone();
+        log.entry.upstream_model = target
+            .model
+            .clone()
+            .or_else(|| requested.clone())
+            .unwrap_or_default();
+        let mut upstream = match crate::protocol_proxy::open_gateway_image_request(
+            &relay,
+            edits,
+            &request,
+            content_type,
+            user_agent,
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                last_error = format!("{}：{error:#}", target.relay.name);
+                continue;
+            }
+        };
+        if has_more && crate::gateway::images::should_try_next(upstream.status_code) {
+            last_error = format!("{} 返回 {}", target.relay.name, upstream.status_code);
+            continue;
+        }
+        let status = upstream.status();
+        let content_type = if upstream.content_type.is_empty() {
+            JSON.to_string()
+        } else {
+            upstream.content_type.clone()
+        };
+        let mut answer = match upstream.read_body().await {
+            Ok(answer) => answer,
+            // 读答复时断了：和连不上一样，换下一家。
+            Err(error) => {
+                last_error = format!("{}：{error:#}", target.relay.name);
+                continue;
+            }
+        };
+        if upstream.is_success() && gateway.inline_image_urls_for(agent) {
+            // 只给了图片链接的，下载下来补成 b64_json（Codex 只认它）；走这家自己的代理。
+            if let Ok(client) =
+                crate::http_client::proxied_client_for_relay(&relay.user_agent, &relay)
+            {
+                answer = crate::gateway::images::inline_image_urls(answer, &client).await;
+            }
+        }
+        log.entry.status_code = upstream.status_code;
+        log.entry.success = upstream.is_success();
+        if upstream.is_success() {
+            log.record_usage_json(&answer);
+        } else {
+            log.entry.error = Some(String::from_utf8_lossy(&answer).chars().take(500).collect());
+        }
+        write_http_response(stream, &status, &content_type, &answer).await?;
+        log_helper_response(
+            if upstream.is_success() {
+                "gateway.image_ok"
+            } else {
+                "gateway.image_upstream_error"
+            },
+            method,
+            path,
+            &status,
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    let message = format!("生图失败：{last_error}");
+    log.record_error("502", message.clone());
+    write_error(stream, agent, 502, &message).await
+}
+
 /// Grok 等 Responses 客户端：按 Agent 绑定选上游，返回值交给 Codex 代理的输出链路。
+///
+/// 第二项是成功时占着的限速名额：调用方要持有到响应转发完（流式读完、出错或客户端断开）再放掉。
 pub(crate) async fn open_responses_for_agent(
     agent: &ToolId,
+    request_path: &str,
     request_body: &str,
     user_agent: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     live_request_id: Option<&str>,
-) -> anyhow::Result<UpstreamProxyResponse> {
+    client: Option<&tokio::net::TcpStream>,
+) -> anyhow::Result<(UpstreamProxyResponse, Option<KeySlot>)> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    let gateway = GatewayStore::default().load().unwrap_or_default();
-    let request: Value = serde_json::from_str(request_body)?;
-    let model = request.get("model").and_then(Value::as_str).unwrap_or("");
+    let gateway = GatewayStore::default().load().unwrap_or_default().with_extension_providers();
+    let mut request: Value = serde_json::from_str(request_body)?;
+    // 起名模型：Codex 给会话起名的请求改发到绑定指定的模型，不落到订阅额度上。
+    let title_model = route::title_model_override(&gateway, agent, &request);
+    if title_model.is_none()
+        && !route::is_codex_title_request(&request)
+        && request["model"] != crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL
+    {
+        super::subagent_models::prepare(&gateway, agent, &mut request, session_headers).await?;
+    }
+    let model = title_model
+        .as_deref()
+        .unwrap_or_else(|| request.get("model").and_then(Value::as_str).unwrap_or(""));
     let conversation = session_headers.session_id.map(str::to_string).or_else(|| {
         request
             .get("prompt_cache_key")
@@ -210,10 +499,18 @@ pub(crate) async fn open_responses_for_agent(
             live_request_id,
             auto_retry: true,
             is_stream: false,
+            upstream_path: if request_path.ends_with("/responses/compact") {
+                "/responses/compact"
+            } else {
+                "/responses"
+            },
+            client,
+            queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,
         },
     )
     .await?;
     let trace = outcome.trace;
+    let slot = outcome.slot;
     match outcome.upstream {
         GatewayUpstream::Pipeline(mut response) => {
             let mut merged = response.request_trace.take().unwrap_or_default();
@@ -225,9 +522,9 @@ pub(crate) async fn open_responses_for_agent(
                 merged.upstream_model = trace.upstream_model;
             }
             response.request_trace = Some(merged);
-            Ok(response)
+            Ok((response, slot))
         }
-        GatewayUpstream::Cooling(wait) => Ok(cooling_response(wait)),
+        GatewayUpstream::Cooling(wait) => Ok((cooling_response(wait), None)),
         GatewayUpstream::Native(_) => anyhow::bail!("Responses 客户端不会走 Anthropic 原样转发"),
     }
 }
@@ -262,13 +559,148 @@ fn cooling_response(wait: std::time::Duration) -> UpstreamProxyResponse {
     }
 }
 
-/// 写出 Anthropic SSE：Responses SSE 先过转换器，再落到 TCP 连接。
-struct AnthropicSink<'a> {
-    inner: &'a mut tokio::net::TcpStream,
-    converter: ResponsesSseToAnthropicSse,
+/// 入站协议：Anthropic Messages（Claude Code 等）、OpenAI Chat Completions、Gemini generateContent。
+/// 三种都先转成 Responses 走同一条管道，回来时再转回客户端的格式。
+#[derive(Debug, Clone)]
+enum Dialect {
+    Anthropic,
+    Chat { include_usage: bool },
+    Gemini { model: String, stream: bool },
 }
 
-impl SseSink for AnthropicSink<'_> {
+impl Dialect {
+    fn error_body(&self, status: u16, message: &str) -> Value {
+        match self {
+            Dialect::Anthropic => anthropic_error_body(status, message),
+            Dialect::Chat { .. } => crate::gateway::chat_outbound::chat_error_body(status, message),
+            Dialect::Gemini { .. } => {
+                crate::gateway::gemini_outbound::gemini_error_body(status, message)
+            }
+        }
+    }
+
+    fn to_responses(&self, request: &Value) -> anyhow::Result<Value> {
+        match self {
+            Dialect::Anthropic => anthropic_inbound::anthropic_to_responses(request),
+            Dialect::Chat { .. } => crate::gateway::chat_inbound::chat_to_responses(request),
+            Dialect::Gemini { model, stream } => {
+                crate::gateway::gemini_inbound::gemini_to_responses(model, request, *stream)
+            }
+        }
+    }
+
+    fn estimate_input_tokens(&self, request: &Value) -> u64 {
+        match self {
+            Dialect::Anthropic => anthropic_inbound::estimate_input_tokens(request),
+            Dialect::Chat { .. } => crate::gateway::chat_inbound::estimate_input_tokens(request),
+            Dialect::Gemini { .. } => {
+                crate::gateway::gemini_inbound::estimate_input_tokens(request)
+            }
+        }
+    }
+
+    /// 完整的 Responses 答复 → 客户端格式的完整答复。
+    fn json_reply(&self, responses_json: &Value, model: &str) -> Value {
+        match self {
+            Dialect::Anthropic => responses_json_to_anthropic(responses_json, model),
+            Dialect::Chat { .. } => {
+                crate::gateway::chat_outbound::responses_json_to_chat(responses_json, model)
+            }
+            Dialect::Gemini { .. } => {
+                crate::gateway::gemini_outbound::responses_json_to_gemini(responses_json, model)
+            }
+        }
+    }
+
+    /// 客户端要流式、上游给了整段：把完整答复拆成客户端格式的事件流。
+    fn reply_to_sse(&self, reply: &Value) -> Vec<u8> {
+        match self {
+            Dialect::Anthropic => anthropic_message_to_sse(reply),
+            Dialect::Chat { .. } => crate::gateway::chat_outbound::chat_completion_to_sse(reply),
+            Dialect::Gemini { .. } => crate::gateway::gemini_outbound::gemini_response_to_sse(reply),
+        }
+    }
+
+    fn converter(&self, model: &str, input_estimate: u64) -> StreamConverter {
+        match self {
+            Dialect::Anthropic => {
+                StreamConverter::Anthropic(ResponsesSseToAnthropicSse::new(model, input_estimate))
+            }
+            Dialect::Chat { include_usage } => StreamConverter::Chat(
+                crate::gateway::chat_outbound::ResponsesSseToChatSse::new(model, *include_usage),
+            ),
+            Dialect::Gemini { .. } => StreamConverter::Gemini(
+                crate::gateway::gemini_outbound::ResponsesSseToGeminiSse::new(model),
+            ),
+        }
+    }
+}
+
+/// Responses SSE → 客户端格式的增量转换器。
+enum StreamConverter {
+    Anthropic(ResponsesSseToAnthropicSse),
+    Chat(crate::gateway::chat_outbound::ResponsesSseToChatSse),
+    Gemini(crate::gateway::gemini_outbound::ResponsesSseToGeminiSse),
+}
+
+impl StreamConverter {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            StreamConverter::Anthropic(inner) => inner.push_bytes(bytes),
+            StreamConverter::Chat(inner) => inner.push_bytes(bytes),
+            StreamConverter::Gemini(inner) => inner.push_bytes(bytes),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        match self {
+            StreamConverter::Anthropic(inner) => inner.finish(),
+            StreamConverter::Chat(inner) => inner.finish(),
+            StreamConverter::Gemini(inner) => inner.finish(),
+        }
+    }
+
+    fn failure(&self) -> Option<&str> {
+        match self {
+            StreamConverter::Anthropic(inner) => inner.failure(),
+            StreamConverter::Chat(inner) => inner.failure(),
+            StreamConverter::Gemini(inner) => inner.failure(),
+        }
+    }
+
+    fn usage(&self) -> Option<crate::request_log::RequestUsage> {
+        match self {
+            StreamConverter::Anthropic(inner) => inner.usage(),
+            StreamConverter::Chat(inner) => inner.usage(),
+            StreamConverter::Gemini(inner) => inner.usage(),
+        }
+    }
+}
+
+async fn write_dialect_error(
+    stream: &mut tokio::net::TcpStream,
+    dialect: &Dialect,
+    status: u16,
+    message: &str,
+) -> anyhow::Result<()> {
+    write_http_response(
+        stream,
+        &crate::protocol_proxy::http_status_line(status),
+        JSON,
+        &serde_json::to_vec(&dialect.error_body(status, message))?,
+    )
+    .await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// 写出客户端格式的 SSE：Responses SSE 先过转换器，再落到 TCP 连接。
+struct DialectSink<'a> {
+    inner: &'a mut tokio::net::TcpStream,
+    converter: StreamConverter,
+}
+
+impl SseSink for DialectSink<'_> {
     async fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let converted = self.converter.push_bytes(bytes);
         if converted.is_empty() {
@@ -305,45 +737,132 @@ async fn write_with_retry_after(
     Ok(())
 }
 
-async fn handle_claude_messages(
+/// Gemini 入口：`/v1beta/models/<模型>:generateContent`、`:streamGenerateContent`、`:countTokens`。
+#[allow(clippy::too_many_arguments)]
+async fn handle_gemini(
     stream: &mut tokio::net::TcpStream,
     gateway: &GatewaySettings,
+    agent: ToolId,
+    (model, action): (String, crate::gateway::gemini_inbound::GeminiAction),
     method: &str,
     path: &str,
     headers: &str,
     body: &[u8],
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let agent = ToolId::Claude;
+    use crate::gateway::gemini_inbound::GeminiAction;
+    let dialect = Dialect::Gemini {
+        model: model.clone(),
+        stream: matches!(action, GeminiAction::StreamGenerate),
+    };
+    if method != "POST" {
+        return write_dialect_error(stream, &dialect, 405, "只支持 POST").await;
+    }
+    if matches!(action, GeminiAction::CountTokens) {
+        // 本地粗估，不发上游。
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let total = crate::gateway::gemini_inbound::estimate_input_tokens(&request);
+        let reply = json!({ "totalTokens": total });
+        write_http_response(stream, "200 OK", JSON, &serde_json::to_vec(&reply)?).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    handle_claude_messages(
+        stream,
+        gateway,
+        agent,
+        dialect,
+        method,
+        path,
+        headers,
+        body,
+        remote_addr_text,
+    )
+    .await
+}
+
+/// Gemini 格式的模型列表。
+async fn handle_gemini_models(
+    stream: &mut tokio::net::TcpStream,
+    gateway: &GatewaySettings,
+    agent: &ToolId,
+) -> anyhow::Result<()> {
+    let models = exposed_models(gateway, agent);
+    let body = json!({
+        "models": models.iter().map(|model| json!({
+            "name": format!("models/{model}"),
+            "displayName": model,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
+        })).collect::<Vec<_>>(),
+    });
+    write_http_response(stream, "200 OK", JSON, &serde_json::to_vec(&body)?).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// 对话入口：Claude Code 与通用 Agent 的 Anthropic Messages、通用 Agent 的 Chat Completions 和 Gemini。
+#[allow(clippy::too_many_arguments)]
+async fn handle_claude_messages(
+    stream: &mut tokio::net::TcpStream,
+    gateway: &GatewaySettings,
+    agent: ToolId,
+    dialect: Dialect,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
     let request_text = match decode_protocol_proxy_request_body(
         body,
         header_value_from_headers(headers, "content-encoding").as_deref(),
     ) {
         Ok(text) => text,
-        Err(error) => return write_error(stream, &agent, 400, &error.to_string()).await,
+        Err(error) => return write_dialect_error(stream, &dialect, 400, &error.to_string()).await,
     };
     let request: Value = match serde_json::from_str(&request_text) {
         Ok(value) => value,
         Err(error) => {
-            return write_error(
+            return write_dialect_error(
                 stream,
-                &agent,
+                &dialect,
                 400,
                 &format!("请求体不是有效的 JSON：{error}"),
             )
             .await;
         }
     };
-    let client_model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let wants_stream = request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let session = header_value_from_headers(headers, "x-claude-code-session-id");
+    // Gemini 的模型名和是否流式在路径里，不在请求体里。
+    let (client_model, wants_stream) = match &dialect {
+        Dialect::Gemini { model, stream } => (model.clone(), *stream),
+        _ => (
+            request
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            request
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    };
+    let mut dialect = dialect;
+    if let Dialect::Chat { include_usage } = &mut dialect {
+        *include_usage = request
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    let session = header_value_from_headers(headers, "x-claude-code-session-id")
+        .or_else(|| header_value_from_headers(headers, "session_id"))
+        .or_else(|| header_value_from_headers(headers, "x-session-id"))
+        .or_else(|| {
+            request
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     let user_agent = header_value_from_headers(headers, "user-agent");
     let beta = header_value_from_headers(headers, "anthropic-beta");
     let settings = SettingsStore::default().load().unwrap_or_default();
@@ -362,24 +881,25 @@ async fn handle_claude_messages(
         Err(error) => {
             let message = crate::protocol_proxy::error_chain(&error);
             request_log.record_error("503 Service Unavailable", message.clone());
-            return write_error(stream, &agent, 503, &message).await;
+            return write_dialect_error(stream, &dialect, 503, &message).await;
         }
     };
-    let responses_body = match anthropic_inbound::anthropic_to_responses(&request) {
+    let responses_body = match dialect.to_responses(&request) {
         Ok(body) => body,
         Err(error) => {
             let message = error.to_string();
             request_log.record_error("400 Bad Request", message.clone());
-            return write_error(stream, &agent, 400, &message).await;
+            return write_dialect_error(stream, &dialect, 400, &message).await;
         }
     };
-    let input_estimate = anthropic_inbound::estimate_input_tokens(&request);
+    let input_estimate = dialect.estimate_input_tokens(&request);
     let outcome = pipeline::open(
         &settings,
         &plan,
         GatewayRequest {
             responses_body: responses_body.clone(),
-            anthropic: Some(AnthropicPassthrough {
+            // 只有 Anthropic 入站能原样转发给 Anthropic 上游。
+            anthropic: matches!(dialect, Dialect::Anthropic).then_some(AnthropicPassthrough {
                 body: &request,
                 beta: beta.as_deref(),
             }),
@@ -388,11 +908,15 @@ async fn handle_claude_messages(
                 session_id: session.as_deref(),
                 thread_id: None,
                 opencode_session: None,
+                client_identity: &[],
             },
             live_request_id: Some(live_request_id.as_str()),
             // 「请求避震」对新旧两套同时生效（只在用户打开时起作用）。
             auto_retry: true,
             is_stream: wants_stream,
+            upstream_path: "/responses",
+            client: Some(&*stream),
+            queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,
         },
     )
     .await;
@@ -402,6 +926,9 @@ async fn handle_claude_messages(
             let message = crate::protocol_proxy::error_chain(&error);
             let status = if is_client_rejection(&error) {
                 400
+            } else if error.downcast_ref::<pipeline::LocalRateLimited>().is_some() {
+                // 本地限速排队超时：不是上游坏了，按限流回给客户端。
+                429
             } else {
                 502
             };
@@ -416,17 +943,19 @@ async fn handle_claude_messages(
                 &status.to_string(),
                 remote_addr_text,
             );
-            return write_error(stream, &agent, status, &message).await;
+            return write_dialect_error(stream, &dialect, status, &message).await;
         }
     };
     let trace = outcome.trace;
     // 持有到响应转发完：路由页据此显示「正在回答」。
     let _busy = outcome.busy;
+    // 限速名额同样持有到响应转发完（流式读完、出错或客户端断开时随函数返回释放）。
+    let _slot = outcome.slot;
     match outcome.upstream {
         GatewayUpstream::Cooling(wait) => {
             request_log.record_trace(&trace, 429, false);
             request_log.record_error("429 Too Many Requests", cooling_message(wait));
-            let body = serde_json::to_vec(&anthropic_error_body(429, &cooling_message(wait)))?;
+            let body = serde_json::to_vec(&dialect.error_body(429, &cooling_message(wait)))?;
             write_with_retry_after(
                 stream,
                 429,
@@ -439,7 +968,7 @@ async fn handle_claude_messages(
             Ok(())
         }
         GatewayUpstream::Native(response) => {
-            write_native(stream, &mut request_log, &trace, response).await
+            write_native(stream, &mut request_log, &trace, response, wants_stream).await
         }
         GatewayUpstream::Pipeline(mut response) => {
             request_log.record_trace(&trace, response.status_code, wants_stream);
@@ -452,8 +981,7 @@ async fn handle_claude_messages(
                     &body,
                 );
                 request_log.record_error(&response.status(), message.clone());
-                let body =
-                    serde_json::to_vec(&anthropic_error_body(response.status_code, &message))?;
+                let body = serde_json::to_vec(&dialect.error_body(response.status_code, &message))?;
                 write_http_response(stream, &response.status(), JSON, &body).await?;
                 stream.shutdown().await?;
                 return Ok(());
@@ -461,43 +989,49 @@ async fn handle_claude_messages(
             let upstream_json = response.content_type.to_ascii_lowercase().contains("json");
             if wants_stream && upstream_json {
                 // 上游没理会 stream:true、回了整段 JSON：转成完整消息后再拆成事件流。
-                let body = response.read_body().await?;
-                let responses_json =
-                    non_stream_body_to_responses(response.wire_api, &body, Some(&responses_body))?;
+                let responses_json = match read_pipeline_json(&mut response, &responses_body).await {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return write_bad_upstream(stream, &dialect, &mut request_log, &error).await;
+                    }
+                };
                 request_log.record_usage_json(&serde_json::to_vec(&responses_json)?);
                 request_log.record_stream(None, None, None);
-                let message = responses_json_to_anthropic(&responses_json, &client_model);
+                let message = dialect.json_reply(&responses_json, &client_model);
                 write_stream_headers(stream).await?;
-                stream
-                    .write_all(&anthropic_message_to_sse(&message))
-                    .await?;
+                stream.write_all(&dialect.reply_to_sse(&message)).await?;
                 stream.shutdown().await?;
                 return Ok(());
             }
             if wants_stream {
                 write_stream_headers(stream).await?;
-                let mut sink = AnthropicSink {
+                let mut sink = DialectSink {
                     inner: stream,
-                    converter: ResponsesSseToAnthropicSse::new(&client_model, input_estimate),
+                    converter: dialect.converter(&client_model, input_estimate),
                 };
-                if let Some(body) = response.buffered_body.take() {
-                    sink.send(&body).await?;
-                } else {
-                    let prefix = std::mem::take(&mut response.stream_prefix);
-                    let wire_api = response.wire_api;
-                    let (_failure, _usage, _detail, first_output_at_ms) =
-                        forward_protocol_proxy_stream(
-                            &mut sink,
-                            &prefix,
-                            response.take_response()?,
-                            wire_api,
-                            Some(&responses_body),
-                            session.as_deref(),
-                        )
-                        .await?;
-                    if let Some(first_output_at_ms) = first_output_at_ms {
-                        request_log.mark_first_token_at(first_output_at_ms);
+                {
+                    // 拓展的网关响应流中间件看到的是 Responses 事件，转换成客户端格式之前生效。
+                    let mut filtered = crate::launcher::ExtensionResponseSink::new(&mut sink, "/responses", Some(&responses_body)).await;
+                    if let Some(body) = response.buffered_body.take() {
+                        filtered.send(&body).await?;
+                    } else {
+                        let prefix = std::mem::take(&mut response.stream_prefix);
+                        let wire_api = response.wire_api;
+                        let (_failure, _usage, _detail, first_output_at_ms) =
+                            forward_protocol_proxy_stream(
+                                &mut filtered,
+                                &prefix,
+                                response.take_response()?,
+                                wire_api,
+                                Some(&responses_body),
+                                session.as_deref(),
+                            )
+                            .await?;
+                        if let Some(first_output_at_ms) = first_output_at_ms {
+                            request_log.mark_first_token_at(first_output_at_ms);
+                        }
                     }
+                    filtered.finish().await?;
                 }
                 let tail = sink.converter.finish();
                 if !tail.is_empty() {
@@ -512,17 +1046,45 @@ async fn handle_claude_messages(
                 stream.shutdown().await?;
                 return Ok(());
             }
-            let body = response.read_body().await?;
-            let responses_json =
-                non_stream_body_to_responses(response.wire_api, &body, Some(&responses_body))?;
+            let responses_json = match read_pipeline_json(&mut response, &responses_body).await {
+                Ok(json) => json,
+                Err(error) => {
+                    return write_bad_upstream(stream, &dialect, &mut request_log, &error).await;
+                }
+            };
             request_log.record_usage_json(&serde_json::to_vec(&responses_json)?);
             request_log.record_stream(None, None, None);
-            let message = responses_json_to_anthropic(&responses_json, &client_model);
+            let message = dialect.json_reply(&responses_json, &client_model);
             write_http_response(stream, "200 OK", JSON, &serde_json::to_vec(&message)?).await?;
             stream.shutdown().await?;
             Ok(())
         }
     }
+}
+
+/// 读完上游的整段答复并转成 Responses JSON。
+async fn read_pipeline_json(
+    response: &mut crate::protocol_proxy::UpstreamProxyResponse,
+    responses_body: &Value,
+) -> anyhow::Result<Value> {
+    let body = response.read_body().await?;
+    non_stream_body_to_responses(response.wire_api, &body, Some(responses_body))
+}
+
+/// 上游答了 200 但读不出来或不是预期的格式（例如一段 HTML）：给客户端回 502 和原因，
+/// 请求日志记成失败，而不是直接断开连接、日志里还是 200。
+async fn write_bad_upstream(
+    stream: &mut tokio::net::TcpStream,
+    dialect: &Dialect,
+    request_log: &mut ProxyRequestLog,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let message = format!("上游答复无法解析：{error:#}");
+    request_log.record_error("502 Bad Gateway", message.clone());
+    let body = serde_json::to_vec(&dialect.error_body(502, &message))?;
+    write_http_response(stream, "502 Bad Gateway", JSON, &body).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn is_client_rejection(error: &anyhow::Error) -> bool {
@@ -543,6 +1105,7 @@ async fn write_native(
     request_log: &mut ProxyRequestLog,
     trace: &crate::request_log::RequestTrace,
     mut response: NativeAnthropicResponse,
+    wants_stream: bool,
 ) -> anyhow::Result<()> {
     request_log.record_trace(trace, response.status_code, response.is_stream);
     if let Some(body) = response.buffered_body.take() {
@@ -575,6 +1138,16 @@ async fn write_native(
         let body = upstream.bytes().await?;
         request_log.record_usage_json(&body);
         request_log.record_stream(None, anthropic_usage(&body), None);
+        // 客户端要流式、上游没理会 stream:true 回了整段 JSON：拆成事件流再给，Claude Code 只认流。
+        if wants_stream
+            && let Ok(message) = serde_json::from_slice::<Value>(&body)
+            && message.get("type").and_then(Value::as_str) == Some("message")
+        {
+            write_stream_headers(stream).await?;
+            stream.write_all(&anthropic_message_to_sse(&message)).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
         write_http_response(stream, "200 OK", &response.content_type, &body).await?;
         stream.shutdown().await?;
         return Ok(());
@@ -638,6 +1211,10 @@ struct AnthropicSseObserver {
 impl AnthropicSseObserver {
     fn push(&mut self, bytes: &[u8]) {
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        // 有的上游用 CRLF 分隔事件；缓冲里只留着没切完的尾巴，统一换成 LF 再切。
+        if self.buffer.contains('\r') {
+            self.buffer = self.buffer.replace("\r\n", "\n");
+        }
         while let Some(index) = self.buffer.find("\n\n") {
             let block = self.buffer[..index].to_string();
             self.buffer.drain(..index + 2);
@@ -710,7 +1287,8 @@ async fn handle_claude_count_tokens(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if let Ok(plan) = route::resolve_plan(gateway, &agent, &model, None)
+    // 只是数 token，不真正发请求：用预览，别推进模型组轮换和 Key 轮询的进度。
+    if let Ok(plan) = route::preview_plan(gateway, &agent, &model, None)
         && let Some(candidate) = plan.candidates.first()
         && candidate.relay.protocol == crate::settings::RelayProtocol::AnthropicMessages
     {
@@ -763,6 +1341,56 @@ async fn handle_models(
             "first_id": models.first(),
             "last_id": models.last()
         }),
+        // Claude Desktop 只列 Claude 名字的模型：非 Claude 模型换成数字别名，真实名字放进 display_name。
+        // 有思考档位的用 mythos-gw- 别名，Desktop 才给它出思考等级菜单。
+        ToolId::Unknown(id) if id == agents::catalog_apps::CLAUDE_DESKTOP.id => {
+            let binding = gateway.binding(agent);
+            let rows: Vec<Value> = models
+                .iter()
+                .map(|model| {
+                    let has_effort = binding.is_some_and(|binding| {
+                        !route::model_entry_reasoning_levels(gateway, binding, model).is_empty()
+                    });
+                    let id = route::claude_desktop_alias(model, has_effort);
+                    let mut row = json!({
+                        "id": id,
+                        "object": "model",
+                        "type": "model",
+                        "display_name": model,
+                        "created": 0,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "owned_by": "codex-plus"
+                    });
+                    if id != *model {
+                        row["description"] = json!("经 Codex++ 网关转发");
+                    }
+                    row
+                })
+                .collect();
+            json!({
+                "object": "list",
+                "first_id": rows.first().map(|row| row["id"].clone()),
+                "last_id": rows.last().map(|row| row["id"].clone()),
+                "data": rows,
+                "has_more": false
+            })
+        }
+        // 通用 Agent 不知道用哪种协议来问：一份同时符合 OpenAI 与 Anthropic 格式的列表。
+        ToolId::Unknown(_) => json!({
+            "object": "list",
+            "data": models.iter().map(|model| json!({
+                "id": model,
+                "object": "model",
+                "type": "model",
+                "display_name": model,
+                "created": 0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "owned_by": "codex-plus"
+            })).collect::<Vec<_>>(),
+            "has_more": false,
+            "first_id": models.first(),
+            "last_id": models.last()
+        }),
         _ => json!({
             "object": "list",
             "data": models.iter().map(|model| json!({
@@ -780,21 +1408,10 @@ async fn handle_models(
 
 /// 暴露给 Agent 的模型：默认模型在前，然后是池里所有能用的模型和路由组，以及绑定里声明的模型。
 pub fn exposed_models(gateway: &GatewaySettings, agent: &ToolId) -> Vec<String> {
-    let Some(binding) = gateway.binding(agent) else {
-        return Vec::new();
-    };
-    let mut models = Vec::new();
-    let default = route::binding_default_model(gateway, binding);
-    if !default.is_empty() {
-        models.push(default);
-    }
-    let pool_models = route::pool_models(gateway, binding);
-    for model in pool_models.into_iter().chain(binding.declared_models()) {
-        if !models.contains(&model) {
-            models.push(model);
-        }
-    }
-    models
+    gateway
+        .binding(agent)
+        .map(|binding| route::binding_exposed_models(gateway, binding))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -824,6 +1441,20 @@ mod tests {
             Some((ToolId::Codex, "/responses".to_string()))
         );
         assert_eq!(split_gateway_path("/gw/other/x"), None);
+        assert_eq!(
+            split_gateway_path("/gw/opencode/v1/chat/completions"),
+            Some((
+                ToolId::Unknown("opencode".to_string()),
+                "/chat/completions".to_string()
+            ))
+        );
+        assert_eq!(
+            split_gateway_path("/gw/opencode/v1beta/models/m:generateContent"),
+            Some((
+                ToolId::Unknown("opencode".to_string()),
+                "/v1beta/models/m:generateContent".to_string()
+            ))
+        );
         assert_eq!(split_gateway_path("/v1/messages"), None);
     }
 

@@ -19,6 +19,7 @@ const USAGE_FILE: &str = "gateway-usage.json";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCounts {
+    #[serde(default)]
     pub calls: u64,
     #[serde(default)]
     pub errors: u64,
@@ -32,6 +33,18 @@ pub struct UsageCounts {
     /// 推理 token（已包含在 `output_tokens` 里）。
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// 记了耗时的请求的总耗时（毫秒）；旧数据没有，平均耗时只按 `timed_calls` 算。
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub timed_calls: u64,
+    /// 其中成功的生图请求（生图一般不返回 token，只能按次数看）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub images: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl UsageCounts {
@@ -42,6 +55,9 @@ impl UsageCounts {
         self.output_tokens += other.output_tokens;
         self.cached_tokens += other.cached_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
+        self.duration_ms += other.duration_ms;
+        self.timed_calls += other.timed_calls;
+        self.images += other.images;
     }
 }
 
@@ -55,6 +71,9 @@ pub struct UsageRow {
     pub model: String,
     #[serde(flatten)]
     pub counts: UsageCounts,
+    /// 不认识的字段（更新版本加的统计项）原样保留：回滚后这一版继续累加时不把它们丢掉。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +84,9 @@ struct UsageFile {
     /// `YYYY-MM-DD`（本地日期）→ 当天各组合的累计。
     #[serde(default)]
     days: BTreeMap<String, Vec<UsageRow>>,
+    /// 不认识的顶层字段原样保留。
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,18 +181,31 @@ impl UsageStore {
             for row in &rows {
                 counts.add(&row.counts);
                 summary.totals.add(&row.counts);
-                add_group(&mut summary.by_agent, &row.agent, &row.agent, &row.counts);
+                let price = gateway
+                    .provider(&row.provider_id)
+                    .and_then(|provider| provider.price_for(&row.model));
+                add_group(
+                    &mut summary.by_agent,
+                    &row.agent,
+                    &row.agent,
+                    &row.counts,
+                    price,
+                );
                 add_group(
                     &mut summary.by_provider,
                     &row.provider_id,
                     &row.provider,
                     &row.counts,
+                    price,
                 );
-                add_group(&mut summary.by_model, &row.model, &row.model, &row.counts);
-                if let Some(price) = gateway
-                    .provider(&row.provider_id)
-                    .and_then(|provider| provider.price.as_ref())
-                {
+                add_group(
+                    &mut summary.by_model,
+                    &row.model,
+                    &row.model,
+                    &row.counts,
+                    price,
+                );
+                if let Some(price) = price {
                     add_cost(&mut summary.costs, price, &row.counts);
                 }
             }
@@ -201,15 +236,49 @@ fn write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(Mutex::default)
 }
 
-fn add_group(groups: &mut Vec<UsageGroup>, key: &str, label: &str, counts: &UsageCounts) {
-    match groups.iter_mut().find(|group| group.key == key) {
-        Some(group) => group.counts.add(counts),
-        None => groups.push(UsageGroup {
-            key: key.to_string(),
-            label: label.to_string(),
-            counts: *counts,
-        }),
+fn add_group(
+    groups: &mut Vec<UsageGroup>,
+    key: &str,
+    label: &str,
+    counts: &UsageCounts,
+    price: Option<&ProviderPrice>,
+) {
+    let index = match groups.iter().position(|group| group.key == key) {
+        Some(index) => index,
+        None => {
+            groups.push(UsageGroup {
+                key: key.to_string(),
+                label: label.to_string(),
+                ..UsageGroup::default()
+            });
+            groups.len() - 1
+        }
+    };
+    let group = &mut groups[index];
+    group.counts.add(counts);
+    if let Some(price) = price {
+        add_cost(&mut group.costs, price, counts);
     }
+}
+
+/// 一条请求按供应商里填的价格估算的费用；没填价格或没有 token 时为空。
+pub fn entry_cost(entry: &RequestLogEntry, gateway: &GatewaySettings) -> Option<UsageCost> {
+    let usage = entry.usage.as_ref()?;
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return None;
+    }
+    let price = gateway
+        .provider(&entry.relay_id)?
+        .price_for(entry.usage_model())?;
+    let counts = UsageCounts {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
+        ..UsageCounts::default()
+    };
+    let mut costs = Vec::new();
+    add_cost(&mut costs, price, &counts);
+    costs.pop()
 }
 
 /// 按每百万 token 的价格估算费用：未命中缓存的输入、命中缓存的输入、输出分别计价。
@@ -245,6 +314,9 @@ pub struct UsageGroup {
     pub label: String,
     #[serde(flatten)]
     pub counts: UsageCounts,
+    /// 这一组里填了价格的部分估算出的费用。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub costs: Vec<UsageCost>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -293,8 +365,12 @@ pub fn shift_day(day: &str, delta: i64) -> String {
 }
 
 /// 请求结束时记一笔（从请求日志条目取数）。失败不影响请求本身。
+/// 在后台线程里记：请求结束时在本地服务的单线程运行时里调用，整份文件重写加 fsync 会卡住别的流。
 pub fn record_entry(entry: &RequestLogEntry) {
-    let _ = record_entry_in(&UsageStore::default(), entry);
+    let entry = entry.clone();
+    std::thread::spawn(move || {
+        let _ = record_entry_in(&UsageStore::default(), &entry);
+    });
 }
 
 pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::Result<()> {
@@ -302,20 +378,11 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
         return Ok(());
     }
     let usage = entry.usage.clone().unwrap_or_default();
-    let model = if entry.upstream_model.trim().is_empty() {
-        entry.model.trim()
-    } else {
-        entry.upstream_model.trim()
-    };
     let row = UsageRow {
-        agent: entry
-            .agent
-            .clone()
-            .filter(|agent| !agent.trim().is_empty())
-            .unwrap_or_else(|| "codex".to_string()),
+        agent: entry.agent_id().to_string(),
         provider_id: entry.relay_id.clone(),
         provider: entry.relay_name.clone(),
-        model: model.to_string(),
+        model: entry.usage_model().to_string(),
         counts: UsageCounts {
             calls: 1,
             errors: u64::from(!entry.success),
@@ -323,7 +390,11 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
             output_tokens: usage.output_tokens,
             cached_tokens: usage.cached_tokens,
             reasoning_tokens: usage.reasoning_tokens,
+            duration_ms: entry.duration_ms,
+            timed_calls: u64::from(entry.duration_ms > 0),
+            images: u64::from(entry.success && entry.is_image()),
         },
+        extra: Default::default(),
     };
     let timestamp = if entry.timestamp_ms > 0 {
         entry.timestamp_ms
@@ -351,7 +422,7 @@ mod tests {
             id: "id".to_string(),
             timestamp_ms: 1_790_000_000_000,
             started_at_ms: 0,
-            duration_ms: 0,
+            duration_ms: 1200,
             method: "POST".to_string(),
             path: "/v1/messages".to_string(),
             status_code: 200,
@@ -380,6 +451,7 @@ mod tests {
                 reasoning_tokens: 1,
             }),
             cache_hit_ratio: None,
+            final_response_evidence: None,
             agent: agent.map(str::to_string),
         }
     }
@@ -406,29 +478,46 @@ mod tests {
         failed.success = false;
         failed.usage = None;
         record_entry_in(&store, &failed).unwrap();
+        let mut image = entry(None, "img", 0, 0, 0);
+        image.wire_api = "imageGenerations".to_string();
+        image.usage = None;
+        record_entry_in(&store, &image).unwrap();
 
         let day = local_day(1_790_000_000_000);
         let mut gateway = GatewaySettings::default();
         gateway.providers.push(GatewayProvider {
             enabled: true,
             source: String::new(),
+            model_prices: Default::default(),
+            model_windows: Default::default(),
+            context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),
                 input: 2.0,
                 cached_input: 0.5,
                 output: 8.0,
             }),
+            upstream_new: Vec::new(),
+            upstream_gone: Vec::new(),
+            models_checked_at_ms: 0,
+            newapi_access: None,
+            subscription_policy: None,
+            upstream_meta: Default::default(),
             relay: RelayProfile {
                 id: "ds".to_string(),
                 ..RelayProfile::default()
             },
+            extra: Default::default(),
         });
         let summary = store.summary(&day, Some(7), &gateway).unwrap();
         assert_eq!(summary.days.len(), 7);
         assert_eq!(summary.days.last().unwrap().date, day);
-        assert_eq!(summary.totals.calls, 4);
+        assert_eq!(summary.totals.calls, 5);
         assert_eq!(summary.totals.errors, 1);
+        assert_eq!(summary.totals.images, 1, "成功的生图按次数记");
         assert_eq!(summary.totals.input_tokens, 2_000_010);
         assert_eq!(summary.totals.cached_tokens, 400_000);
         let agents = summary
@@ -436,15 +525,65 @@ mod tests {
             .iter()
             .map(|group| (group.key.as_str(), group.counts.calls))
             .collect::<Vec<_>>();
-        assert_eq!(agents, vec![("claude", 2), ("codex", 1), ("grok", 1)]);
+        assert_eq!(agents, vec![("claude", 2), ("codex", 2), ("grok", 1)]);
         // (2M - 0.4M) × 2 + 0.4M × 0.5 + 0.2M × 8 = 3.2 + 0.2 + 1.6 = 5.0 元
         assert_eq!(summary.costs.len(), 1);
         assert_eq!(summary.costs[0].currency, "CNY");
         assert!((summary.costs[0].amount - 5.0).abs() < 1e-9);
+        let ds = summary
+            .by_provider
+            .iter()
+            .find(|group| group.key == "ds")
+            .unwrap();
+        assert!((ds.costs[0].amount - 5.0).abs() < 1e-9, "每组也算出费用");
+        assert!(
+            summary
+                .by_provider
+                .iter()
+                .find(|group| group.key == "codex-relay")
+                .unwrap()
+                .costs
+                .is_empty()
+        );
+        assert_eq!(summary.totals.timed_calls, 5);
+        assert_eq!(summary.totals.duration_ms, 5 * 1200);
+
+        // 每条请求的费用按同样的价格算：1M 输入（无缓存）× 2 = 2 元。
+        let cost = entry_cost(&entry(Some("claude"), "ds", 1_000_000, 0, 0), &gateway).unwrap();
+        assert_eq!(cost.currency, "CNY");
+        assert!((cost.amount - 2.0).abs() < 1e-9);
+        assert!(
+            entry_cost(&entry(None, "codex-relay", 10, 5, 0), &gateway).is_none(),
+            "没填价格不算"
+        );
 
         let all = store.summary(&day, None, &gateway).unwrap();
         assert_eq!(all.days.len(), 1);
         store.clear().unwrap();
         assert_eq!(store.summary(&day, None, &gateway).unwrap().totals.calls, 0);
+    }
+
+    /// 更新版本加的统计项、顶层字段：这一版继续记账时原样保留。
+    #[test]
+    fn unknown_fields_survive_recording() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::at(temp.path().join("gateway-usage.json"));
+        let day = local_day(1_790_000_000_000);
+        let text = serde_json::json!({
+            "version": 9,
+            "futureTop": "keep",
+            "days": { day.clone(): [{
+                "agent": "claude", "providerId": "ds", "provider": "DS",
+                "model": "deepseek-v4-pro", "calls": 2, "cacheWriteTokens": 77
+            }]}
+        });
+        std::fs::write(&store.path, text.to_string()).unwrap();
+        record_entry_in(&store, &entry(Some("claude"), "ds", 10, 5, 0)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["futureTop"], "keep");
+        let row = &saved["days"][&day][0];
+        assert_eq!(row["calls"], 3);
+        assert_eq!(row["cacheWriteTokens"], 77);
     }
 }

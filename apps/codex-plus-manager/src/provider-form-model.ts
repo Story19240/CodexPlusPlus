@@ -1,5 +1,5 @@
 /** 「添加 / 编辑供应商」弹窗的草稿操作：模型列表与默认模型、多个 Key、自动价格。 */
-import { splitModels, type ProviderDraft } from "./gateway-model.ts";
+import { splitModels, type ProviderDraft, type ProviderPrice } from "./gateway-model.ts";
 
 /** 公开价格表的一次匹配（每百万 token，美元），与后端 PriceMatch 对应。 */
 export type PriceMatch = {
@@ -39,9 +39,6 @@ export function removeModel(draft: ProviderDraft, model: string): ProviderDraft 
   return withModels(draft, draftModels(draft).filter((item) => item !== model));
 }
 
-/** 上游返回的模型太多（聚合站常有几百个）时让用户挑；少的直接替换。 */
-export const FETCHED_DIRECT_LIMIT = 40;
-
 export function draftKeys(draft: ProviderDraft): string[] {
   const keys = draft.keys.split(/\r?\n/);
   return keys.length ? keys : [""];
@@ -69,4 +66,42 @@ export function draftWithPrice(draft: ProviderDraft, match: PriceMatch): Provide
 
 export function hasPrice(draft: ProviderDraft): boolean {
   return [draft.priceInput, draft.priceCached, draft.priceOutput].some((value) => Number(value) > 0);
+}
+
+/** 价格表里一行的输入框文字（每百万 token）。 */
+export type PriceRow = { input: string; cached: string; output: string };
+
+export const EMPTY_PRICE_ROW: PriceRow = { input: "", cached: "", output: "" };
+
+export function priceRowFrom(price: ProviderPrice | null | undefined): PriceRow {
+  return price ? { input: String(price.input), cached: String(price.cachedInput), output: String(price.output) } : EMPTY_PRICE_ROW;
+}
+
+export function priceRowFromMatch(match: PriceMatch): PriceRow {
+  return { input: formatPrice(match.input), cached: formatPrice(match.cachedInput), output: formatPrice(match.output) };
+}
+
+function priceValue(text: string): number {
+  const value = Number(text.trim());
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** 一行都没填（或都是 0）时返回 null，表示这个模型不单独计价。 */
+export function priceFromRow(row: PriceRow, currency: string): ProviderPrice | null {
+  const price = { currency: currency || "USD", input: priceValue(row.input), cachedInput: priceValue(row.cached), output: priceValue(row.output) };
+  return price.input || price.cachedInput || price.output ? price : null;
+}
+
+export function priceFromMatch(match: PriceMatch): ProviderPrice {
+  return { currency: match.currency || "USD", input: match.input, cachedInput: match.cachedInput, output: match.output };
+}
+
+/** 各模型的价格表 → 提交给后端的 `modelPrices`（只留填了的）。 */
+export function modelPricesFromRows(rows: Record<string, PriceRow>, currency: string): Record<string, ProviderPrice> {
+  const prices: Record<string, ProviderPrice> = {};
+  for (const [model, row] of Object.entries(rows)) {
+    const price = priceFromRow(row, currency);
+    if (price) prices[model] = price;
+  }
+  return prices;
 }

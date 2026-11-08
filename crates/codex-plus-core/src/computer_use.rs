@@ -44,6 +44,14 @@ pub const BROWSER_SERVER_ID: &str = "codex-plus-browser";
 pub const CODEX_SERVER_ID: &str = "codex_plus_cu";
 const CODEX_NOT_INSTALLABLE: &str =
     "Codex 自带 Computer Use，不接入 Codex++ 的：同时存在会出现两套电脑控制工具";
+/// 非 macOS 平台的明确提示：运行时只随 macOS 版 ChatGPT.app 提供，别的平台不是「没装」而是「不支持」。
+pub const UNSUPPORTED_PLATFORM: &str =
+    "Computer Use 接入目前只支持 macOS，暂不支持 Windows：它依赖 macOS 版 ChatGPT.app 自带的 Computer Use 服务";
+
+/// 当前平台能否接入 Computer Use。
+pub fn platform_supported() -> bool {
+    cfg!(target_os = "macos")
+}
 
 const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BACKUPS: usize = 5;
@@ -74,16 +82,19 @@ pub enum Target {
     Zcode,
     /// WorkBuddy AI：`~/.workbuddy-ai/mcp.json` 的 `mcpServers`（旧版是 `~/.workbuddy`）。
     WorkBuddy,
+    /// Devin（CLI / Desktop）：`~/.config/devin/mcp_config.json` 的 `mcpServers`。
+    Devin,
 }
 
 impl Target {
-    pub const ALL: [Target; 6] = [
+    pub const ALL: [Target; 7] = [
         Self::ClaudeCode,
         Self::ClaudeDesktop,
         Self::Codex,
         Self::Dsh,
         Self::Zcode,
         Self::WorkBuddy,
+        Self::Devin,
     ];
 
     pub fn parse(value: &str) -> anyhow::Result<Self> {
@@ -101,6 +112,7 @@ impl Target {
             Self::Dsh => "dsh",
             Self::Zcode => "zcode",
             Self::WorkBuddy => "workBuddy",
+            Self::Devin => "devin",
         }
     }
 
@@ -112,13 +124,16 @@ impl Target {
             Self::Dsh => "DeepSeek Harness",
             Self::Zcode => "ZCode",
             Self::WorkBuddy => "WorkBuddy AI",
+            Self::Devin => "Devin",
         }
     }
 
     /// JSON 目标里 server 表所在的键路径。非 JSON 目标返回 `None`。
     fn json_key_path(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::ClaudeCode | Self::ClaudeDesktop | Self::WorkBuddy => Some(&["mcpServers"]),
+            Self::ClaudeCode | Self::ClaudeDesktop | Self::WorkBuddy | Self::Devin => {
+                Some(&["mcpServers"])
+            }
             // ZCode 优先读 `mcp.servers`（嵌套），为空才退回 `~/.agents/mcp.json`。
             Self::Zcode => Some(&["mcp", "servers"]),
             Self::Codex | Self::Dsh => None,
@@ -133,6 +148,7 @@ impl Target {
             Self::Zcode => (home.join(".zcode"), "ZCode"),
             // 新版 WorkBuddy 的数据目录是 `.workbuddy-ai`，但保留旧版目录的探测。
             Self::WorkBuddy => (workbuddy_config_dir(), "WorkBuddy AI"),
+            Self::Devin => (devin_config_dir(), "Devin"),
             Self::ClaudeCode | Self::ClaudeDesktop | Self::Codex => return None,
         };
         (!dir.is_dir()).then(|| format!("没检测到 {name}（{} 不存在），先打开一次该应用", dir.display()))
@@ -478,6 +494,8 @@ pub struct TargetStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusReport {
+    /// 非 macOS 为 false，前端据此显示「暂不支持」而不是「找不到 ChatGPT」。
+    pub platform_supported: bool,
     pub runtime_found: bool,
     /// Claude Desktop 运行中会重写自己的配置，这时改 `mcpServers` 容易在它退出时被覆盖。
     pub claude_desktop_running: bool,
@@ -702,6 +720,12 @@ fn codex_config_path() -> PathBuf {
     crate::codex_home::default_codex_home_dir().join("config.toml")
 }
 
+/// Devin 的用户级配置目录。macOS 下就是字面量 `~/.config/devin`
+/// （不是 `~/Library/Application Support`，所以不用 `BaseDirs::config_dir()`）。
+pub fn devin_config_dir() -> PathBuf {
+    home_dir().join(".config/devin")
+}
+
 /// DSH 桌面版 profile 的用户补丁层。`cordis.yml` 本身由 DSH 生成、注释里明确写着
 /// 「Edit cordis.patch.yml, not this file」。
 fn dsh_config_path() -> PathBuf {
@@ -716,6 +740,7 @@ fn config_paths(target: Target) -> Vec<PathBuf> {
         Target::Dsh => vec![dsh_config_path()],
         Target::Zcode => vec![home_dir().join(".zcode/cli/config.json")],
         Target::WorkBuddy => vec![workbuddy_config_dir().join("mcp.json")],
+        Target::Devin => vec![devin_config_dir().join("mcp_config.json")],
     }
 }
 
@@ -769,6 +794,7 @@ impl Target {
             Self::Dsh => "cordis.patch.yml",
             Self::Zcode => "config.json",
             Self::WorkBuddy => "mcp.json",
+            Self::Devin => "mcp_config.json",
         }
     }
 }
@@ -971,6 +997,7 @@ pub fn remove_custom_target(id: &str) -> anyhow::Result<StatusReport> {
 
 pub fn install_custom(id: &str) -> anyhow::Result<InstallReceipt> {
     let target = custom_target(id)?;
+    ensure!(platform_supported(), "{UNSUPPORTED_PLATFORM}");
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
     let file = target.config_path();
@@ -1013,6 +1040,7 @@ pub fn status() -> anyhow::Result<StatusReport> {
         .map(|custom| custom_status(custom, runtime.as_ref()))
         .collect();
     Ok(StatusReport {
+        platform_supported: platform_supported(),
         runtime_found: runtime.is_some(),
         claude_desktop_running: claude_desktop_running(),
         app_path: runtime.as_ref().map(|item| item.app_path.clone()),
@@ -1021,7 +1049,11 @@ pub fn status() -> anyhow::Result<StatusReport> {
             .and_then(|item| item.package_version.clone()),
         service_path: runtime.as_ref().and_then(|item| item.service_path.clone()),
         config_hint: runtime.is_none().then(|| {
-            "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
+            if platform_supported() {
+                "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
+            } else {
+                UNSUPPORTED_PLATFORM.to_string()
+            }
         }),
         targets,
         custom_targets,
@@ -1029,7 +1061,7 @@ pub fn status() -> anyhow::Result<StatusReport> {
 }
 
 /// Claude Desktop 是否在运行。只在 macOS/Windows 上探测，失败一律当作没运行。
-fn claude_desktop_running() -> bool {
+pub fn claude_desktop_running() -> bool {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/bin/pgrep")
@@ -1041,16 +1073,13 @@ fn claude_desktop_running() -> bool {
     }
     #[cfg(windows)]
     {
-        // Windows 上进程名即 Claude.exe；用 tasklist 过滤，避免引入额外依赖。
-        let output = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Claude.exe", "/NH"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        return match output {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).contains("Claude.exe"),
-            Err(_) => false,
-        };
+        // Windows 上进程名即 Claude.exe。直接枚举进程快照，不再起 tasklist：
+        // 管理器是 GUI 子系统，起控制台程序不加 CREATE_NO_WINDOW 就会闪黑色终端，
+        // 而 Agent 页每次切到 Claude Code 都会查这里（issue #2778）。
+        // 区分大小写：小写的 claude.exe 是 Claude Code 命令行，不是桌面端（与原 tasklist 判断一致）。
+        return crate::windows_enumerate_processes()
+            .iter()
+            .any(|process| process.exe_file == "Claude.exe");
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -1107,7 +1136,11 @@ fn status_at(
         return unsupported(message);
     }
     let outcome = match target {
-        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+        Target::ClaudeCode
+        | Target::ClaudeDesktop
+        | Target::Zcode
+        | Target::WorkBuddy
+        | Target::Devin => {
             let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             // 每个 (配置文件, server) 组合算一项：CU 与浏览器任一缺失都要提示更新。
             let mut registered = 0usize;
@@ -1193,13 +1226,24 @@ fn status_at(
             Err(error) => (false, "foreign", error.to_string()),
         },
     };
+    let (registered, state, mut message) = outcome;
+    // Devin 默认导入 ~/.claude.json 的 mcpServers：Claude Code 也接入时，同名条目会两边都出现。
+    // 只提示不去重——Devin 仍要读自己的 mcp_config.json。读失败忽略。
+    if target == Target::Devin
+        && matches!(state, "registered" | "needs_update")
+        && let Ok(Some(existing)) =
+            read_json_entry(&claude_code_config_path(), &["mcpServers"], SERVER_ID)
+        && looks_like_ours(&existing, runtime)
+    {
+        message.push_str("；Claude Code 也已接入，Devin 会同时导入 ~/.claude.json 里的同名条目");
+    }
     TargetStatus {
         id: target.id().into(),
         label: target.label().into(),
         config_path: path_text,
-        registered: outcome.0,
-        state: outcome.1.into(),
-        message: outcome.2,
+        registered,
+        state: state.into(),
+        message,
     }
 }
 
@@ -1209,6 +1253,7 @@ fn status_at(
 
 pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
     ensure!(target != Target::Codex, "{CODEX_NOT_INSTALLABLE}");
+    ensure!(platform_supported(), "{UNSUPPORTED_PLATFORM}");
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
     if let Some(message) = target.tool_home_missing() {
@@ -1224,7 +1269,11 @@ fn install_at(
     config_paths: &[PathBuf],
 ) -> anyhow::Result<InstallReceipt> {
     with_lock(|| match target {
-        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+        Target::ClaudeCode
+        | Target::ClaudeDesktop
+        | Target::Zcode
+        | Target::WorkBuddy
+        | Target::Devin => {
             let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
@@ -1259,7 +1308,11 @@ pub fn uninstall(target: Target) -> anyhow::Result<InstallReceipt> {
 /// 从给定的配置文件里撤掉本功能写入的条目。内置目标与自定义目标共用。
 fn uninstall_at(target: Target, config_paths: &[PathBuf]) -> anyhow::Result<InstallReceipt> {
     with_lock(|| match target {
-        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+        Target::ClaudeCode
+        | Target::ClaudeDesktop
+        | Target::Zcode
+        | Target::WorkBuddy
+        | Target::Devin => {
             let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
@@ -1424,6 +1477,9 @@ fn receipt(
 
 pub fn check() -> HealthReport {
     let started = Instant::now();
+    if !platform_supported() {
+        return unsupported_platform_report(elapsed_ms(started));
+    }
     let runtime = match locate_runtime() {
         Ok(Some(runtime)) => runtime,
         Ok(None) => {
@@ -1455,6 +1511,20 @@ pub fn check() -> HealthReport {
     HealthReport {
         duration_ms: elapsed_ms(started),
         ..outcome
+    }
+}
+
+/// 非 macOS 的自检结果：直接报「不支持」，不去找运行时，也不报成「未找到」。
+fn unsupported_platform_report(duration_ms: u64) -> HealthReport {
+    HealthReport {
+        ok: false,
+        target: "unknown".into(),
+        app_count: None,
+        browser_count: None,
+        sample_apps: vec![],
+        duration_ms,
+        failure_kind: Some("unsupported_platform".into()),
+        failure_detail: Some(UNSUPPORTED_PLATFORM.into()),
     }
 }
 
@@ -1865,6 +1935,8 @@ pub(crate) fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 pub(crate) fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Value>> {
+    // Windows 上的工具写出的 JSON 可能带 UTF-8 BOM（#2728），JSON 解析器不认，先去掉。
+    let text = text.trim_start_matches('\u{feff}');
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -1907,6 +1979,10 @@ fn backup(path: &Path, contents: &str) -> anyhow::Result<PathBuf> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
     let backup_path = path.with_file_name(format!("{file_name}.codex-plus-backup-{stamp}"));
+    // 同一秒里连着保存两次：留第一份（改动前的原样）。直接覆盖写又不截断，会留下旧内容的尾巴。
+    if backup_path.exists() {
+        return Ok(backup_path);
+    }
     let mut file = open_private(&backup_path)?;
     file.write_all(contents.as_bytes())?;
     prune_backups(path);
@@ -2054,6 +2130,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn non_macos_reports_unsupported_instead_of_missing_runtime() {
+        assert_eq!(platform_supported(), cfg!(target_os = "macos"));
+        let report = unsupported_platform_report(0);
+        assert!(!report.ok);
+        assert_eq!(report.failure_kind.as_deref(), Some("unsupported_platform"));
+        assert!(UNSUPPORTED_PLATFORM.contains("暂不支持 Windows"));
+        if !platform_supported() {
+            // 非 macOS：接入直接给出「不支持」，不再落到「未找到 ChatGPT.app」。
+            let error = install(Target::ClaudeCode).unwrap_err().to_string();
+            assert_eq!(error, UNSUPPORTED_PLATFORM);
+            assert_eq!(check().failure_kind.as_deref(), Some("unsupported_platform"));
+        }
+    }
+
     fn sample_runtime(root: &Path) -> RuntimeLocation {
         RuntimeLocation {
             app_path: "/Applications/ChatGPT.app".into(),
@@ -2068,6 +2159,12 @@ mod tests {
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
         }
+    }
+
+    #[test]
+    fn json_object_with_utf8_bom_parses() {
+        let map = parse_json_object("\u{feff}{\"mcpServers\":{}}", Path::new("claude_desktop_config.json")).unwrap();
+        assert!(map.contains_key("mcpServers"));
     }
 
     #[test]
@@ -2197,6 +2294,34 @@ mod tests {
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(value["mcp"]["servers"].get(SERVER_ID).is_none());
         assert_eq!(value["plugins"]["a"], true);
+    }
+
+    #[test]
+    fn devin_servers_live_under_mcp_servers() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("mcp_config.json");
+        // Devin 自己的 mcp_config.json 里已有的 server 不能被冲掉。
+        fs::write(&path, "{\n  \"mcpServers\": {\"other\": {\"command\": \"x\"}}\n}\n").unwrap();
+        let runtime = sample_runtime(temp.path());
+        let key_path = Target::Devin.json_key_path().unwrap();
+        assert_eq!(key_path, &["mcpServers"]);
+        assert!(install_json_entry(&path, key_path, &runtime, Target::Devin).unwrap().changed);
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["other"]["command"], "x");
+        assert_eq!(value["mcpServers"][SERVER_ID]["args"][0], "--codex-plus-cu-mcp");
+        assert_eq!(
+            value["mcpServers"][BROWSER_SERVER_ID]["args"][0],
+            "--codex-plus-browser-mcp"
+        );
+
+        let second = install_json_entry(&path, key_path, &runtime, Target::Devin).unwrap();
+        assert!(!second.changed, "重复安装不应该重写文件");
+
+        assert!(uninstall_json_entry(&path, key_path, Target::Devin).unwrap().changed);
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value["mcpServers"].get(SERVER_ID).is_none());
+        assert!(value["mcpServers"].get(BROWSER_SERVER_ID).is_none());
+        assert_eq!(value["mcpServers"]["other"]["command"], "x");
     }
 
     #[test]

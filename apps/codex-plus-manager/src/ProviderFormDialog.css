@@ -431,3 +431,508 @@
   color: hsl(var(--status-error));
   font-size: 12px;
 }
+
+/* 按模型的价格表：模型名 + 输入 / 缓存命中 / 输出，最后一行是「其它模型」的默认价。 */
+.gw-portal .pf-price-table {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+}
+
+.gw-portal .pf-price-rows {
+  max-height: 264px;
+  overflow-y: auto;
+}
+
+.gw-portal .pf-price-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr));
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+}
+
+.gw-portal .pf-price-row + .pf-price-row {
+  border-top: 1px solid hsl(var(--border) / 0.6);
+}
+
+.gw-portal .pf-price-head {
+  background: hsl(var(--surface-sunken));
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.gw-portal .pf-price-row code {
+  overflow: hidden;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-price-row input {
+  height: 28px;
+  font-size: 12.5px;
+}
+
+/* 上下文窗口：模型一列、窗口一列 */
+.gw-portal .pf-price-row.pf-window-row {
+  grid-template-columns: minmax(0, 1fr) 140px;
+}
+
+.gw-portal .pf-window-row[data-invalid="true"] input {
+  border-color: hsl(var(--status-error));
+}
+
+.gw-portal .pf-price-fallback {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.gw-portal .pf-section h4 {
+  white-space: nowrap;
+}
+
+.gw-portal .pf-section h4 .pf-currency {
+  flex: none;
+  width: 96px;
+  margin-left: auto;
+}
+
+.gw-portal .pf-section h4 .pf-currency + .pf-action {
+  margin-left: 0;
+}
+
+/* 模型列表弹窗：上游新增 / 已下架 */
+.gw-portal .pf-model-diff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 8px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.gw-portal .pf-model-diff > span {
+  margin-right: 4px;
+}
+
+.gw-portal .pf-chip-new {
+  gap: 3px;
+  padding: 0 7px 0 4px;
+  border-style: dashed;
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.gw-portal .pf-chip-new svg {
+  width: 11px;
+  height: 11px;
+}
+
+.gw-portal .pf-text-action {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--primary));
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.gw-portal .pf-chip[data-gone="true"] > span {
+  color: hsl(var(--muted-foreground));
+  text-decoration: line-through;
+}
+
+/* 思考等级：每个模型一块，上面是名字和默认档、思考参数，下面一排档位开关。 */
+.gw-portal .pf-reasoning-modal {
+  width: min(680px, calc(100vw - 32px));
+}
+
+.gw-portal .pf-reasoning-list {
+  display: grid;
+  overflow-y: auto;
+  max-height: 420px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+}
+
+.gw-portal .pf-reasoning-row {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.gw-portal .pf-reasoning-row + .pf-reasoning-row {
+  border-top: 1px solid hsl(var(--border) / 0.6);
+}
+
+.gw-portal .pf-reasoning-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 130px 150px;
+  align-items: center;
+  gap: 8px;
+}
+
+.gw-portal .pf-reasoning-head code {
+  overflow: hidden;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-reasoning-tag {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.gw-portal .pf-reasoning-reset {
+  border: 0;
+  background: none;
+  color: hsl(var(--primary));
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.gw-portal .pf-reasoning-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.gw-portal .pf-reasoning-levels button {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.gw-portal .pf-reasoning-levels button[aria-pressed="true"] {
+  border-color: hsl(var(--primary) / 0.5);
+  background: hsl(var(--primary) / 0.12);
+  color: hsl(var(--primary));
+}
+
+/* 没改过：档位来自内置资料，颜色淡一点。 */
+.gw-portal .pf-reasoning-row[data-overridden="false"] .pf-reasoning-levels button[aria-pressed="true"] {
+  border-style: dashed;
+}
+
+.gw-portal .pf-reasoning-levels[data-disabled="true"] {
+  opacity: 0.45;
+}
+
+/* 兼容开关（#228）：弹窗挂在 body 上，规则带 .gw-portal 前缀 */
+.gw-portal .pf-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.gw-portal .pf-switch input {
+  flex: none;
+  margin-top: 2px;
+}
+
+.gw-portal .pf-switch span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gw-portal .pf-switch strong {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.gw-portal .pf-switch small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* 供应商池的「测试」弹窗：结果卡片（状态、耗时、回复 / 错误原文与排查提示）。
+   弹窗经 portal 挂在 body 下、不在 .shell 里，统一用 .gw-portal 前缀加权重，
+   正式版 styles.css 后加载时也不会被通用规则盖掉。 */
+.gw-portal .pt-result {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--muted) / 0.35);
+}
+
+.gw-portal .pt-result[data-state="ok"] {
+  border-color: hsl(var(--status-success) / 0.45);
+}
+
+.gw-portal .pt-result[data-state="failed"] {
+  border-color: hsl(var(--status-error) / 0.45);
+}
+
+.gw-portal .pt-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.gw-portal .pt-status > svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: hsl(var(--muted-foreground));
+}
+
+.gw-portal .pt-result[data-state="ok"] .pt-status > svg,
+.gw-portal .pt-result[data-state="ok"] .pt-status > strong {
+  color: hsl(var(--status-success));
+}
+
+.gw-portal .pt-result[data-state="failed"] .pt-status > svg,
+.gw-portal .pt-result[data-state="failed"] .pt-status > strong {
+  color: hsl(var(--status-error));
+}
+
+.gw-portal .pt-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: hsl(var(--background));
+  color: hsl(var(--muted-foreground));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+
+.gw-portal .pt-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.gw-portal .pt-metrics > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gw-portal .pt-metrics dt {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.gw-portal .pt-metrics dd {
+  overflow: hidden;
+  margin: 0;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pt-mono {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.gw-portal .pt-block {
+  display: grid;
+  gap: 4px;
+}
+
+.gw-portal .pt-block > span {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.gw-portal .pt-text {
+  max-height: 160px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: hsl(var(--background));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.gw-portal .pt-text.pt-error {
+  color: hsl(var(--status-error));
+}
+
+.gw-portal .pt-hints {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.5;
+  list-style: disc;
+}
+
+/* 从上游同步 / 获取的勾选列表（#2785）：模型名占满一行，右侧小标签标出「将移除」「将加入」「上游没有」。
+ * 弹窗挂在 body 上（portal），规则带 .gw-portal 前缀，正式版里不会被 styles.css 的通用规则盖掉。 */
+.gw-portal .pf-picker-list label > span:first-of-type {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-picker-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 99px;
+  background: hsl(var(--muted));
+  color: hsl(var(--muted-foreground));
+  font-family: var(--font-sans, inherit);
+  font-size: 10.5px;
+  line-height: 16px;
+}
+
+.gw-portal .pf-picker-tag[data-tone="remove"] {
+  background: hsl(var(--status-error) / 0.14);
+  color: hsl(var(--status-error));
+}
+
+.gw-portal .pf-picker-tag[data-tone="add"] {
+  background: hsl(var(--status-success) / 0.14);
+  color: hsl(var(--status-success));
+}
+
+.gw-portal .pf-picker-tag[data-tone="gone"] {
+  background: hsl(var(--status-warning) / 0.14);
+  color: hsl(var(--status-warning));
+}
+
+.gw-portal .pf-picker-empty {
+  padding: 6px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.gw-portal .pf-picker-head .pf-link {
+  flex: none;
+  font-size: 11.5px;
+}
+
+.gw-portal .pf-link:disabled {
+  color: hsl(var(--muted-foreground));
+  cursor: default;
+  opacity: 0.6;
+}
+
+.gw-portal .pf-sync-summary {
+  margin-right: auto;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+/* 同步预览弹窗：列表区稍高一些，几百个新增模型也好挑。 */
+.gw-portal .pf-sync-modal .pf-picker-list {
+  max-height: 240px;
+}
+
+/* 从上游同步上下文窗口 / 思考等级（#2807）：一行是「模型 旧值 → 新值 来源 字段」，窄时换行。 */
+.gw-portal .pf-meta-sync-modal .pf-picker-list {
+  max-height: 320px;
+}
+
+.gw-portal .pf-meta-sync-list label {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.gw-portal .pf-meta-sync-list label > .pf-meta-sync-model {
+  flex: 1 1 160px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-meta-sync-values {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+
+.gw-portal .pf-meta-sync-values s {
+  color: hsl(var(--muted-foreground));
+}
+
+.gw-portal .pf-meta-sync-values b {
+  font-weight: 600;
+}
+
+.gw-portal .pf-meta-sync-source,
+.gw-portal .pf-meta-sync-options,
+.gw-portal .pf-meta-sync-count {
+  flex: none;
+  color: hsl(var(--muted-foreground));
+  font-size: 10.5px;
+}
+
+.gw-portal .pf-meta-sync-count {
+  margin-right: auto;
+  font-size: 11.5px;
+}
+
+.gw-portal .pf-meta-sync-ignored {
+  display: grid;
+  gap: 2px;
+  max-height: 140px;
+  margin: 0;
+  padding-left: 18px;
+  overflow-y: auto;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  list-style: disc;
+}
+
+/* 编辑弹窗里的「上下文窗口」一行 */
+.gw-portal .pf-windows-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.gw-portal .pf-windows-entry > span:first-child {
+  flex: none;
+  color: hsl(var(--muted-foreground));
+}
+
+.gw-portal .pf-windows-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-windows-entry .pf-link {
+  flex: none;
+}

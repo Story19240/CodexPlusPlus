@@ -3,7 +3,7 @@
 两种模式完全独立、可以随时切换：
 
 - **直连模式**（原来的方式）：每个 Agent 有自己的供应商列表（Codex、Claude、Grok 各管各的），切换时直接改写 Agent 的配置文件。
-- **网关模式**：网关有自己的一份供应商池和路由组，所有接入的 Agent 共用整个池。Agent 的配置指向 Codex++ 本地 helper，
+- **网关模式**：网关有自己的一份供应商池和组，所有接入的 Agent 共用整个池。Agent 的配置指向 Codex++ 本地 helper，
   请求在网关里按模型名选供应商。
 
 网关的数据只存在 `<状态目录>/gateway.json`，不读也不写 `settings.json` 里直连模式的供应商；
@@ -15,14 +15,42 @@
   或从直连模式的 Codex / Claude / Grok 供应商复制。官方登录账号不能复制：refresh token 每用一次就换新，
   刷新结果只写回原来那一条，复制会让两边互相把对方刷失效，订阅账号需要在网关里单独登录（待做）。
 - **按模型名路由**：裸模型名发给池里提供它的供应商，多家时按池顺序依次尝试；`<供应商 id>/<模型>` 只发给那一家；
-  `group/<组 id>` 按路由组展开。
+  `group/<组 id>` 按组展开；多家都有的裸模型名按它的自动组展开。
 - **Claude Code 用任意协议的上游**：Anthropic Messages 请求在网关里转成 Responses，
   再复用现有代理链路发往 Chat / Responses / Anthropic 上游；上游本身是 Anthropic 协议时原样转发。
 - **多 Key 轮换**：供应商填多个 Key（每行一个）时逐个展开成候选。429 冷却该 Key（按 Retry-After），
   额度耗尽冷却更久，401 停用到 Key 被改掉，连续 5xx 熔断供应商 60 秒；400/413/422 不切换。
   默认「会话粘性」，同一会话固定一个 Key，保护上游 prompt cache。
-- **路由组**：网关自己的组，在「路由」页新建。成员是池里的模型（`<供应商 id>/<模型>` 或裸模型名）或别的组（可嵌套，
-  出现环会跳过）。模式：依次、轮换、按权重。Agent 把组当一个模型来选。
+- **组**：网关自己的组，在「路由」页新建（Agent 里以 `group/<id>` 选）。成员是池里的模型（`<供应商 id>/<模型>` 或裸模型名）、别的组（可嵌套，
+  出现环会跳过），或带 `*` 的通配符（按 `<供应商 id>/<模型>` 或模型名匹配池里现有的模型，上游新增的自动算进来）。
+  Agent 把组当一个模型来选。
+  - 模式：依次、轮换、按权重、额度优先（订阅账号剩余额度多的先试，没有数据的其次，用完的最后）、
+    速度优先（按最近成功请求的平均首包耗时，没测过的先试一次）、手动（只发给选中的那个成员，失败也不换）。
+  - 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里，只能通过组来选（直接写名字仍能用）。
+- **自动组**：池里多家都有的模型自动成一个组（`route::auto_groups`，默认开，「自动建组」总开关）。成员是每家固定的那份
+  `<供应商 id>/<模型>`，按池顺序；Agent 选不带供应商的模型名时走它。改过的设置（模式、会话固定、隐藏成员、手动选中、
+  隐藏整个自动组）存在 gateway.json 的 `autoGroups`（键是小写模型名），没改过的不落盘、跟着池子变。
+  - 会话固定：记住每个会话上次是哪个上游回答的，下次先试它，保住上游提示词缓存。缓存期内固定（默认，10 分钟）、
+    整个会话固定、不固定。记录只在内存（`route::remember_answer`）。
+- **从直连模式迁移**：供应商池「添加供应商 → 导入…」（池空时总览和供应商池顶部直接给入口）多选、一次导入：
+  直连 Codex / Claude Code / Grok 的供应商、OpenCode 保存的 Key 复制进池（已导入的跳过）；
+  聚合供应商搬成「成员进池 + 同名模型组」（故障转移 → 依次，按会话轮换 → 轮换 + 整个会话固定，
+  按请求轮换 → 轮换 + 不固定，加权 → 按权重；按模型聚合不建组），模型路由规则没有对应功能、会在结果里列出；
+  官方登录账号不能复制，列表里直接「去登录」。命令 `import_gateway_providers`，聚合转换见 `apply::import_codex_aggregate`。
+- **订阅额度**：ChatGPT 订阅账号读每次响应的 `x-codex-*` 头，并每 10 分钟查 `wham/usage`；Copilot 查
+  `copilot_internal/user` 的本月高级请求。只在内存（`gateway::quota`），供应商池的账号行显示剩余比例和各窗口重置时间。
+
+## 通用 Agent
+
+Codex / Claude Code / Grok 之外的 Agent 由规格表接入（`gateway/agents/`，`catalog_*.rs` 各一批）：每条规格写明怎么
+探测本机装了、主配置文件在哪、接入时往配置里写什么（供应商统一叫 `codexplus`，地址是 `/gw/<id>`，Key 是这个 Agent
+的网关 token）。写入只在内存文档上改（JSON 容忍注释、TOML、YAML 按顶层键、`.env`、整份文件），由框架统一落盘：
+接入前把每个文件的原文和改到的键存到 `backups/agent-<id>-before-gateway.json`，断开时只把这些键改回去；
+配置里找不到 `/gw/<id>` 时算被别的工具改掉。网关对通用 Agent 同时接受 Chat Completions、Responses、
+Anthropic Messages 与 Gemini（`/v1beta/models/<模型>:streamGenerateContent`，Key 可放 `x-goog-api-key` 或 `?key=`）。
+
+只能用环境变量、数据库或运行中的本地 API 配置的应用（Claude Science、Cursor Private Inference、NewMax、
+OpenHanako、Alma、Cindy、AionUi、Lody），以及不支持自定义地址的（Cursor CLI、Devin CLI）没有接入。
 
 ## 结构
 
@@ -41,7 +69,7 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
                            └─────────────────────► 原样（Grok）
 ```
 
-- 状态文件：`<状态目录>/gateway.json`（接入设置、token、选项、供应商池、路由组），新建时权限 0600。
+- 状态文件：`<状态目录>/gateway.json`（接入设置、token、选项、供应商池、模型组），新建时权限 0600。
 - Codex：开启时在直连模式的供应商列表里放一个托管供应商 `codex-plus-gateway`（地址 `/gw/codex/v1`，Responses），
   用直连模式自己的切换流程写进 `~/.codex`（回填、冲突检测、模型目录照旧）；关闭时切回开启前的供应商并删掉托管供应商。
   被网关接管时，Codex 供应商页里别的供应商不能直接选（前端按钮置灰，后端 `switch_relay_profile` 也会拦下），
@@ -62,9 +90,9 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
 
 ## 接入方式
 
-Agent 打开「接入」后，池里所有打开的供应商的模型和所有路由组都会出现在 Agent 自己的模型列表里
+Agent 打开「接入」后，池里所有打开的供应商的模型和所有模型组都会出现在 Agent 自己的模型列表里
 （Grok 写进 `config.toml` 的模型列表，Claude Code 通过 opus / sonnet / haiku 档位映射）。每个 Agent 可在「挑选」里
-排除某些供应商。池或路由组变化后自动重写开着的 Agent 配置。
+排除某些供应商。池或模型组变化后自动重写开着的 Agent 配置。
 
 ## 界面
 
@@ -72,13 +100,20 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 
 - **智能体**：已接入的 Agent 在上，「未设置」的在下。每行：图标、名字和本机 CLI 版本、状态、档位 / 模型入口、模型下拉、接入开关。
   模型下拉顶部是「默认（不经 Codex++）」和「断开 Codex++（还原配置）」，左侧可切到全部 / 收藏 / 某个供应商；
-  未接入时选一个模型即接入。展开后逐行显示：在 Agent 里怎么切模型、模型列表（可挑选供应商）、Claude 档位、其它选项、
+  未接入时选一个模型即接入。池里的模型之后是一组 Agent 自带的模型，标「直连，不经 Codex++」（`gateway/own_models.rs`）：
+  Codex 列断开后会回到的直连供应商的模型（官方登录读 `models_cache.json`，记为 OpenAI；聚合供应商列它发布给 Codex 的模型目录；别的供应商读它的模型列表），
+  Claude Code 列 opus / sonnet / haiku 等别名（直连 Anthropic，或用户自己配的 `ANTHROPIC_BASE_URL`）。
+  选中 = 断开并还原，再把模型写进 Agent 自己的配置（Codex `config.toml` 根上的 `model`，Claude Code `settings.json`
+  的 `model`，供应商写了 `ANTHROPIC_MODEL` 时一起改）；接入着时先确认。托盘面板的下拉同样列出。
+  展开后的「自带模型」开关可以不列这一组（存在 gateway.json 的 `hideOwnModels`），Agent 现在用着的那个照样显示。展开后逐行显示：在 Agent 里怎么切模型、模型列表（可挑选供应商）、Claude 档位、其它选项、
   改动的配置文件（可在访达中查看）和「断开并还原」。
 - **供应商**：网关池里的供应商一行一个，可拖动排序、开关、展开看模型和 Key 状态、编辑、删除；下面是「添加供应商」目录：
   订阅、供应商（厂商 API）、中转、本机四组内置预设，「导入…」从直连模式复制。
-- **路由**：所有接入的 Agent 共用一张实时卡片：左边 Agent、中间网关、右边池里的供应商，最近一次请求走过的线高亮；
-  下面是请求数、换上游次数、交给 Agent 的错误数，以及「上一个请求是怎么路由的」逐条说明。
-  数据来自 `gateway::activity`（只在内存，重启清零），页面每 2.5 秒刷新。再往下是网关的路由组：新建、编辑、删除。
+- **供应商池「按模型」**：供应商 × 模型矩阵，每个模型一行、每家供应商一列，带各家当前状态和平均耗时；点列头回到列表展开那一家。
+- **路由**：「我的组」和「自动组」两段卡片。卡片上直接改路由方式、会话固定、隐藏成员；成员显示状态、额度、平均耗时，
+  手动模式下点成员锁定。自动组可隐藏 / 恢复 / 恢复默认，顶部是「自动建组」总开关。页面每 2.5 秒刷新状态。
+- **总览「最近请求」**：每个 Agent 最近一次请求，点开逐条说明这次怎么走的（计划、每次尝试、谁回答）。
+  数据来自 `gateway::activity`（只在内存，重启清零）。
 - **会话**：Codex（现有会话库）、Claude Code（`~/.claude/projects/*/*.jsonl`）、Grok（`~/.grok/sessions/session_search.sqlite`）
   的本地会话放在一起，按 Agent 筛选、搜索，一键在终端执行 Agent 自己的恢复命令。只读。
 - **用量**：请求结束时按「日期 × Agent × 供应商 × 模型」累加到 `<状态目录>/gateway-usage.json`（不受请求日志裁剪影响）；
@@ -125,15 +160,20 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
   （Responses 协议，带 Grok CLI 的客户端标识头，版本号被 xAI 提高时会回 426，需要跟着改）；access token 快过期时用
   refresh token 换新。部分 SuperGrok 账号会被 xAI 的白名单拒绝（403），这时只能用 API Key。
 - 账号类凭据都带 `codex_plus_account` / `codex_plus_gateway` 标记，与各 Agent 自己的登录互不影响。
-- 没有接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据）、Gemini CLI（Google 已于 2026-06-18 停止个人账号的
-  Code Assist，且其说明写明第三方使用违反政策）、Antigravity（客户端密钥未公开，只能从客户端里提取）。
+- 不接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据，且不做绕过其第三方流量识别的处理）。
 - **OpenCode Go / Zen**（预设，用 OpenCode 控制台的 Key；也可在「导入…」里用 `opencode auth login` 保存在
   `~/.local/share/opencode/auth.json` 的 Key）：同一个网关里每个模型只在一种协议上提供，网关按 models.dev 目录（与价格表
   共用的缓存）逐个模型切换协议和地址——GPT / Grok / Muse 走 Responses，Claude、MiniMax、部分 Qwen 走 Anthropic，
   其余走 Chat；目录里没有的按模型名推断。每个请求带 `x-opencode-session`（按对话保持不变，缺了上游回 400）。
   Gemini 模型只走 Google 接口、免费模型只对 OpenCode 自己开放，都不列出。
-- 其它订阅（Cursor、Kiro、Devin、Qoder、Zed、WorkBuddy、ZCode、Factory 等）需要模拟各家客户端调用私有接口，
-  暂不内置。
+- **私有接口订阅**（`gateway/subscriptions/`）：Cursor、Kiro、Zed、Command Code、Devin、Factory、
+  Gemini Code Assist、Antigravity。每家实现 `Subscription`（登录、刷新、列模型、发对话），在池里是一个普通的
+  Chat Completions 供应商：请求前地址指到 helper 的 `/sub/<供应商 id>/v1`，适配入口读 gateway.json 里的凭据、
+  快过期时刷新并写回，再按各家协议（protobuf、AWS 事件流、Code Assist、各家 JSON）发出去，答复统一转成
+  Chat SSE；失败按状态码回给管道（401 停用到重新登录、429 冷却）。登录方式按家而定：浏览器、验证码、导入本机
+  官方客户端的登录、粘贴凭据。Gemini Code Assist 只支持 Standard / Enterprise（需要 Google Cloud 项目 id，
+  可在粘贴框里填）；Antigravity 账号有被 Google 停用的风险。
+- 国内厂商的编码套餐（Qoder、WorkBuddy、ZCode、Xiaomi MiMo 等）不内置。
 - 除 ChatGPT API 外，以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
 
 ## 限制

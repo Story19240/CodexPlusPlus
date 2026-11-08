@@ -235,6 +235,28 @@ export const PRESETS: ProviderPreset[] = [
     websiteUrl: "https://apikey.fun",
   },
   {
+    id: "cccccc-api",
+    name: "ccccccAPI",
+    websiteUrl: "https://dzhsmartai.com",
+    apiKeyUrl: "https://dzhsmartai.com/register?promo=CODEXPLUSPLUS",
+    category: "aggregator",
+    baseUrl: "https://dzhsmartai.com/v1",
+    protocol: "responses",
+    // 模型留空：添加时「从上游获取」或手填。
+    model: "",
+  },
+  {
+    id: "tokenmy",
+    name: "TokenMy",
+    websiteUrl: "https://agent.tokenmy.ai",
+    apiKeyUrl: "https://agent.tokenmy.ai",
+    category: "aggregator",
+    baseUrl: "https://agent.tokenmy.ai/v1",
+    protocol: "responses",
+    // 模型留空：添加时「从上游获取」或手填。
+    model: "",
+  },
+  {
     id: "novita",
     name: "Novita AI",
     category: "aggregator",
