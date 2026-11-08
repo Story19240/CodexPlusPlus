@@ -3780,6 +3780,7 @@ async fn open_responses_proxy_request_with_extensions(
 /// 拓展网关中间件拒绝了这一步：回一个 Codex 能显示原因的 400 错误。
 fn extension_rejected_response(reason: &str) -> anyhow::Result<UpstreamProxyResponse> {
     Ok(UpstreamProxyResponse {
+        web_search_context: None,
         status_code: 400,
         content_type: "application/json".to_string(),
         is_stream: false,
@@ -5859,6 +5860,7 @@ async fn non_stream_web_search_orchestration(
             beta_features,
             session_headers,
             None,
+            upstream_stream_header_timeout(),
         )
         .await
         {
@@ -6188,6 +6190,7 @@ async fn send_non_stream_web_search_summary(
         beta_features,
         session_headers,
         None,
+        upstream_stream_header_timeout(),
     )
     .await
     {
@@ -6398,6 +6401,7 @@ pub(crate) async fn send_web_search_followup_request(
         context.beta_features.as_deref(),
         session_headers,
         None,
+        upstream_stream_header_timeout(),
     )
     .await
     {
@@ -14082,6 +14086,7 @@ mod response_compatibility_tests {
             session_id: None,
             thread_id: Some("web-search-non-stream-round-usage"),
             opencode_session: None,
+            client_identity: &[],
         };
         let mut response = execute_web_search_round(
             upstream,
@@ -17062,7 +17067,7 @@ mod parallel_tool_call_pairing_tests {
             "tool_choice": {"type": "image_generation"}
         });
         let run = |relay: crate::settings::RelayProfile, body: Value| async move {
-            upstream_request_parts(&relay, body, "/v1/responses", None, false, None, ProxySessionHeaders::default())
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, false, None, ProxySessionHeaders::default())
                 .await
                 .unwrap()
                 .1
@@ -17131,6 +17136,7 @@ mod parallel_tool_call_pairing_tests {
             "/v1/responses",
             None,
             false,
+            false,
             None,
             ProxySessionHeaders::default(),
         ).await.unwrap();
@@ -17143,6 +17149,7 @@ mod parallel_tool_call_pairing_tests {
             body(),
             "/v1/responses",
             None,
+            false,
             false,
             None,
             ProxySessionHeaders::default(),
@@ -17179,6 +17186,7 @@ mod parallel_tool_call_pairing_tests {
             body,
             "/v1/responses",
             None,
+            false,
             false,
             None,
             ProxySessionHeaders::default(),

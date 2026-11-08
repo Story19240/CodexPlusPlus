@@ -7781,6 +7781,7 @@ mod tests {
         };
         trace.bind_upstream_model(&serde_json::json!({"model":"after-middleware"}));
         let mut upstream = crate::protocol_proxy::UpstreamProxyResponse {
+            web_search_context: None,
             status_code: 200,
             is_stream: true,
             content_type: "text/event-stream".to_string(),
@@ -10178,6 +10179,7 @@ mod proxy_stream_tests {
             session_id: None,
             thread_id: Some("web-search-latest-round-usage"),
             opencode_session: None,
+            client_identity: &[],
         };
         let forwarded = tokio::spawn(async move {
             let failure = forward_web_search_protocol_proxy_stream(
