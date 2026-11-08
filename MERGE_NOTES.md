@@ -40,3 +40,4 @@
 - `protocol_proxy.rs` / `launcher.rs` 中显式构造 `ProxySessionHeaders` 时补齐 `client_identity`；测试点位按 `&[]` 填充，生产点位沿用已有请求头变量。全仓扫描确认没有其它显式初始化缺该字段。
 - `protocol_proxy.rs` 的 4 处 `upstream_request_parts` 测试调用补 `web_search_execution: false`，与函数签名 8 个参数对齐；非 web search 测试不涉及新行为。
 - `watcher.rs` 的 `macos_codex_process_ids_with` 加 `cfg(any(target_os = "macos", test))`：测试代码在非 macOS 也要编译，函数本身无改名；`macos_codex_process_ids_without_debug_port_with` 已是同款 cfg，因此测试可调用。
+- `apps/codex-plus-manager/src-tauri/src/commands.rs`：合并后非测试的 `run_codex_multi_worker` 已改用 `multi_worker` 的新生命周期逻辑，`MultiWorkerExitGrace` 定义随旧实现一起丢失，但三个测试仍引用它。按历史提交 7886f69c 恢复该类型，并放入 `mod tests` 仅供测试使用；未改业务逻辑。

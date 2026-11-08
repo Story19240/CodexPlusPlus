@@ -11007,6 +11007,35 @@ fn default_log_lines() -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// 历史遗留：`run_codex_multi_worker` 合并后已不再使用该宽限类型，
+    /// 这里仅为既有测试保留来源（与提交 7886f69c 的语义一致）。
+    #[derive(Default)]
+    struct MultiWorkerExitGrace {
+        missing_since: Option<std::time::Instant>,
+        missed_probes: u32,
+    }
+
+    impl MultiWorkerExitGrace {
+        fn keep_waiting(
+            &mut self,
+            process_alive: bool,
+            cdp_available: bool,
+            now: std::time::Instant,
+        ) -> bool {
+            if process_alive || cdp_available {
+                self.missing_since = None;
+                self.missed_probes = 0;
+                return true;
+            }
+
+            self.missed_probes = self.missed_probes.saturating_add(1);
+            let missing_since = *self.missing_since.get_or_insert(now);
+            self.missed_probes < 3
+                || now.saturating_duration_since(missing_since)
+                    < std::time::Duration::from_secs(10)
+        }
+    }
+
     #[test]
     fn multi_instance_user_data_respects_explicit_electron_root() {
         let temp = tempfile::tempdir().unwrap();
