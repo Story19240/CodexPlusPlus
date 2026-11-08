@@ -3020,10 +3020,11 @@ pub(crate) async fn handle_protocol_proxy_connection(
 ) -> anyhow::Result<()> {
     let hops_through_gateway =
         matches!(opener, ProxyOpener::Legacy) && crate::gateway::apply::codex_hops_through_gateway();
-    let future = handle_protocol_proxy_connection_inner(
+    // 装箱：合并后的代理 future 很大，debug 构建下内联会把 helper task 栈撑爆。
+    let future = Box::pin(handle_protocol_proxy_connection_inner(
         stream, request_body, request_user_agent, request_beta_features, session_headers,
         method, path, remote_addr_text, opener, hops_through_gateway,
-    );
+    ));
     if hops_through_gateway {
         crate::extension_gateway::with_codex_response_plan(future).await
     } else {

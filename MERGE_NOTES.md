@@ -41,3 +41,5 @@
 - `protocol_proxy.rs` 的 4 处 `upstream_request_parts` 测试调用补 `web_search_execution: false`，与函数签名 8 个参数对齐；非 web search 测试不涉及新行为。
 - `watcher.rs` 的 `macos_codex_process_ids_with` 加 `cfg(any(target_os = "macos", test))`：测试代码在非 macOS 也要编译，函数本身无改名；`macos_codex_process_ids_without_debug_port_with` 已是同款 cfg，因此测试可调用。
 - `apps/codex-plus-manager/src-tauri/src/commands.rs`：合并后非测试的 `run_codex_multi_worker` 已改用 `multi_worker` 的新生命周期逻辑，`MultiWorkerExitGrace` 定义随旧实现一起丢失，但三个测试仍引用它。按历史提交 7886f69c 恢复该类型，并放入 `mod tests` 仅供测试使用；未改业务逻辑。
+- `launcher.rs::handle_protocol_proxy_connection`：把 `handle_protocol_proxy_connection_inner` future 装箱。合并 web search 编排后该 future 显著变大，debug 构建内联时会把 helper task 栈撑爆，导致 exec 完成流测试 `STATUS_STACK_OVERFLOW`；装箱不改 exec 流完成语义。
+- `grok_config.rs`：恢复 `std::io::Write` import，修复云盒 Linux 测试链在两个私有写入函数上的编译错误。
